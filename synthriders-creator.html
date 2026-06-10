@@ -3805,6 +3805,33 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
 
   const result       = [];
   const beatOccupied = new Set();
+
+  // ── [Phase2Probe] instrumentation — Step 0 of the two-phase refactor ───────────────
+  // Snapshots the note population at each pipeline boundary so the restructure can be
+  // checked for PARITY (no unintended add/remove/hand-reassignment) as passes are sorted
+  // into the Phase-1 rhythmic-skeleton / Phase-2 spatial-placement split. Pure logging —
+  // ZERO behavior change. The flow-relevant passes already log their own deltas
+  // ([GreenSweep]/[RhythmCoherence]/[DensityThin]/[HandBalance]/[DedupSameBeat]); this adds
+  // the population + hand/stem/type breakdown at the boundaries those logs don't show.
+  let _probePrev = null;
+  function _probe(label) {
+    let R = 0, L = 0, grn = 0, gld = 0, rail = 0, comp = 0, gap = 0, crs = 0, stemless = 0;
+    for (const n of result) {
+      if      (n.type === 0) R++;
+      else if (n.type === 1) L++;
+      else if (n.type === 2) grn++;
+      else if (n.type === 3) gld++;
+      if (n.railEndBeat != null) rail++;
+      if (n._comp || n._dbComp)  comp++;
+      if (n._gapFill)            gap++;
+      if (n._crossover)          crs++;
+      if (!n.stemSource && !n._gapFill) stemless++;   // companions/synthetic (no stem identity)
+    }
+    const d = _probePrev == null ? 0 : result.length - _probePrev;
+    _probePrev = result.length;
+    console.log(`[Phase2Probe] ${label.padEnd(20)} n=${String(result.length).padStart(4)} (${d >= 0 ? '+' : ''}${d}) R/L=${R}/${L} grn=${grn} gld=${gld} rail=${rail} comp=${comp} gap=${gap} crs=${crs} stemless=${stemless}`);
+  }
+
   const lastHandRow  = [3, 4]; // start hands in mid-high zone (upward-shifted distribution)
   const lastHandCol  = [10, 4]; // right hand starts mid-right, left starts mid-left
   const lastHandBeat = [-Infinity, -Infinity]; // beat of last note per hand (gap-based constraints)
@@ -4753,6 +4780,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // ── Guarantee green and gold are present ────────────────────────────────
   // The probabilistic scatter can legitimately produce 0% green or 0% gold
   // because most beats are disqualified by active rails, burst pairs, etc.
+  _probe('raw-placement');   // [Phase2Probe] skeleton straight out of the main placement loop
+
   // Force-assign minimum counts so the CRITICAL "0% gold / 0% green" never fires.
   // Runs UNCONDITIONALLY now to ensure green target is met even if scatter pass added a few:
   // critic was still flagging "green orbs <1%" because the 1% scatter rate produced 0-3 orbs
@@ -7157,6 +7186,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (was sitting too low in VR; clamped at row ${diffRowMin})`);
   }
+
+  _probe('FINAL');   // [Phase2Probe] final note population leaving onsetsToNotes
 
   return {
     notes: result.sort((a, b) => a.beat - b.beat),
