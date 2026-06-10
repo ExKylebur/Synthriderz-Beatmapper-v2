@@ -13,7 +13,7 @@ Usage (Windows):
 Usage (Mac/Linux):
     python3 server.py
 
-Then open:  http://localhost:8080  (opens automatically on Windows)
+Then open:  http://localhost:8090  (v2 sandbox port; stable build uses 8080) (opens automatically on Windows)
 
 Requirements: Python 3.8+, ffmpeg
   - Windows: winget install ffmpeg
@@ -53,7 +53,7 @@ class _NumpyEncoder(json.JSONEncoder):
 if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-PORT = 8080
+PORT = 8090  # v2 sandbox — distinct from the stable build's 8080 so both can run at once (A/B)
 SCRIPT_DIR = Path(__file__).parent  # serve from the folder server.py lives in
 
 # ── Song metadata library ─────────────────────────────────────────────────────
