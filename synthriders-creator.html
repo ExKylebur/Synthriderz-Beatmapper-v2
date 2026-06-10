@@ -3118,9 +3118,16 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   // the other, rather than rapid L-R alternation mixing both stems together.
   // Ownership flips every STEM_HAND_WINDOW beats so neither hand is permanently
   // dominant across a long song.
-  const STEM_HAND_WINDOW = 8 * beatSec;    // seconds between ownership flips
-  // Randomise starting hand so drums don't always begin on the right — the 8-beat
-  // flip distributes evenly over a full song but the first window was always right-biased.
+  const STEM_HAND_WINDOW = 8 * beatSec;    // seconds between ownership flips (only when !STABLE_STEM_HAND)
+  // [v2 two-phase · increment 3] Keep each stem on ONE consistent hand for the whole song
+  // instead of swapping every 8 beats. The periodic flip was a major source of cross-hand
+  // stem smear — drums jumping sides mid-song. With this on, the drum hand is fixed for the
+  // whole track (bass on the opposite hand). Set false to restore v1's alternating behavior
+  // (A/B toggle). NOTE: this can raise the raw L/R imbalance per-song (drums are usually
+  // denser than bass); [HandBalance] still rebalances the FINAL count by flipping idle-beat
+  // FREE orbs — a later increment will reconcile that against stem purity.
+  const STABLE_STEM_HAND = true;
+  // Randomise starting hand so drums don't always begin on the right.
   let   drumsHand        = Math.random() < 0.5 ? 0 : 1;
   let   bassHand         = 1 - drumsHand; // always opposite to drumsHand
   let   stemWindowStart  = 0;             // when the current ownership window began
@@ -3201,8 +3208,8 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
         });
       } else {
         // ── Free orb: stem-hand ownership ─────────────────────────────────
-        // Flip ownership window every STEM_HAND_WINDOW seconds for variety
-        if (ev.t - stemWindowStart > STEM_HAND_WINDOW) {
+        // [v2] Stable ownership: skip the periodic flip so each stem keeps one hand all song.
+        if (!STABLE_STEM_HAND && ev.t - stemWindowStart > STEM_HAND_WINDOW) {
           drumsHand       = 1 - drumsHand;
           bassHand        = 1 - drumsHand;
           stemWindowStart = ev.t;
