@@ -3126,7 +3126,11 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   // (A/B toggle). NOTE: this can raise the raw L/R imbalance per-song (drums are usually
   // denser than bass); [HandBalance] still rebalances the FINAL count by flipping idle-beat
   // FREE orbs — a later increment will reconcile that against stem purity.
-  const STABLE_STEM_HAND = true;
+  const STABLE_STEM_HAND = false;  // DISABLED per A/B (2026-06): drums are ~75%+ of notes, so
+                                   // pinning a stem to one hand just overloads it — stem-per-hand
+                                   // is NOT the flow fix. The real issue is removal churn (the
+                                   // pipeline strips ~25-44% of the raw skeleton, punching holes in
+                                   // steady drum subdivisions). Kept as a toggle for reference.
   // Randomise starting hand so drums don't always begin on the right.
   let   drumsHand        = Math.random() < 0.5 ? 0 : 1;
   let   bassHand         = 1 - drumsHand; // always opposite to drumsHand
