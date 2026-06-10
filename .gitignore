@@ -1,0 +1,58 @@
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ── Server runtime ───────────────────────────────────────────────────────
+server.log
+*.log
+
+# ── User data — local song library with personal cover art ──────────────
+metadata_library.json
+
+# ── Runtime debug artifacts ──────────────────────────────────────────────
+debug_last_export.synth
+generation_diagnostics.json
+
+# ── Generated outputs ────────────────────────────────────────────────────
+*.synth
+synthfiles/
+
+# ── Audio uploads (local to your machine) ────────────────────────────────
+*.ogg
+*.mp3
+*.wav
+*.flac
+*.m4a
+*.aac
+
+# ── Internal session / dev notes (kept private) ─────────────────────────
+handoff_next_session.md
+PROJECT_NOTES.md
+FEATURES_6_IMPLEMENTATION.md
+CRITIC_PROMPT_UPDATES.md
+
+# ── Backups / old versions ───────────────────────────────────────────────
+*.pre-choreography.html
+*.bak
+*.backup
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets — defensive (these don't live in the repo folder, but just in case) ──
+API*Key*.txt
+*.env
+.env
+secrets.json
+
+# Temp/scratch files from dev tooling
+_combined.js
+_*.py
+_lex.py
+_balance.py
