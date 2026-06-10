@@ -3854,7 +3854,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // [RhythmCoherence]'s two blind spots: (1) it skipped windows with <3 drum hits — exactly
   // where the guitar-gap fallback drops orbs; (2) it only culled off-pulse notes that had a
   // drum hit nearby. A/B toggle vs v1.
-  const V2_CULL_OFFBEAT_SECONDARY = true;
+  const V2_CULL_OFFBEAT_SECONDARY = false;  // REVERTED per A/B: made alignment WORSE, and the
+                                            // real issue is SPATIAL (hectic placement in dense
+                                            // sections), not which notes exist. See [DenseSweep].
+  // [v2] DenseSweep: reshape dense same-hand runs into smooth zigzag sweep paths (like
+  // [GoldSweep]) so tight/dense sections FLOW instead of scattering across the grid. The
+  // core ask: "more behavior like the gold notes when density is high." A/B toggle.
+  const V2_DENSE_SWEEP = true;
 
   const lastHandRow  = [3, 4]; // start hands in mid-high zone (upward-shifted distribution)
   const lastHandCol  = [10, 4]; // right hand starts mid-right, left starts mid-left
@@ -7048,6 +7054,54 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       gi = gj + 1;
     }
     if (gReshaped > 0) console.log(`[GoldSweep] Widened ${gReshaped} clustered gold run(s) into reachable diagonal sweeps`);
+  }
+
+  // ── [DenseSweep] flowing sweep paths for dense same-hand runs (v2) ────────────────────
+  // In tight/dense sections the per-note arc + jitter scatter notes across the grid, which
+  // reads as hectic. This reshapes dense runs of same-hand FREE orbs into a smooth bounded
+  // zigzag within the hand's zone — exactly like [GoldSweep] does for gold — so dense passages
+  // FLOW. Both hands start at the centre boundary (col 7) and sweep OUTWARD (right→14, left→0),
+  // bouncing at the zone edge, rows arcing in sync → a symmetric "breathing" sweep when both
+  // hands are active. Only fires on genuinely dense runs (≤0.5-beat spacing, ≥4 orbs); sparser
+  // sections keep the normal arc flow. Protects rails, rail companions (_comp), gold, green.
+  // Placed by GoldSweep so FinalSweep (C1/C2) + obstacle occlusion still run after; [Crossover]
+  // skips dense passages so it won't fight these sweeps.
+  if (V2_DENSE_SWEEP) {
+    const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_CSTEP = 2;
+    const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
+    let _dswRuns = 0, _dswNotes = 0;
+    for (const hand of [0, 1]) {
+      const zoneLo = hand === 0 ? 7 : 0;
+      const zoneHi = hand === 0 ? 14 : 7;
+      const orbs = result
+        .filter(n => n.type === hand && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
+        .sort((a, b) => a.beat - b.beat);
+      let i = 0;
+      while (i < orbs.length) {
+        let j = i;
+        while (j + 1 < orbs.length && orbs[j + 1].beat - orbs[j].beat <= DSW_MAXGAP) j++;
+        const run = orbs.slice(i, j + 1);
+        if (run.length >= DSW_MINRUN) {
+          let col  = 7;                       // both hands start at the centre boundary
+          let cdir = hand === 0 ? 1 : -1;     // right sweeps out toward 14, left toward 0
+          let row  = dRowLo, rdir = 1;
+          for (const o of run) {
+            o._x  = COL_X[Math.max(zoneLo, Math.min(zoneHi, col))];
+            o.row = Math.max(dRowLo, Math.min(dRowHi, row));
+            o._denseSweep = true;
+            col += DSW_CSTEP * cdir;
+            if      (col >= zoneHi) { col = zoneHi; cdir = -1; }
+            else if (col <= zoneLo) { col = zoneLo; cdir =  1; }
+            row += rdir;
+            if      (row >= dRowHi) { row = dRowHi; rdir = -1; }
+            else if (row <= dRowLo) { row = dRowLo; rdir =  1; }
+          }
+          _dswRuns++; _dswNotes += run.length;
+        }
+        i = j + 1;
+      }
+    }
+    if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense run(s) (${_dswNotes} orbs) into flowing sweeps`);
   }
 
   // ── [DensityThin] energy-scaled off-beat decimation in over-dense windows ───────────
