@@ -3843,6 +3843,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     console.log(`[Phase2Probe] ${label.padEnd(20)} n=${String(result.length).padStart(4)} (${d >= 0 ? '+' : ''}${d}) R/L=${R}/${L} grn=${grn} gld=${gld} rail=${rail} comp=${comp} gap=${gap} crs=${crs} stemless=${stemless}`);
   }
 
+  // [v2 faithful-drums experiment] When true, the most destructive density-thinning pass
+  // ([DensityThin], the #1 note remover ~167/gen) is skipped so the map FOLLOWS THE DRUMS
+  // faithfully instead of halving steady runs to cap NPS. A/B toggle vs v1; set false to
+  // restore v1's thinning. (Per the probe data: raw skeleton ~1100 notes was being cut ~25%
+  // mostly by this pass, which is what made dense drum runs feel inconsistent with the music.)
+  const V2_FAITHFUL_DRUMS = true;
+
   const lastHandRow  = [3, 4]; // start hands in mid-high zone (upward-shifted distribution)
   const lastHandCol  = [10, 4]; // right hand starts mid-right, left starts mid-left
   const lastHandBeat = [-Infinity, -Infinity]; // beat of last note per hand (gap-based constraints)
@@ -7027,7 +7034,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // function-call spread (`push(...arr)` / `fn(...arr)`) anywhere — that overflows V8's
   // argument stack on large maps and was the cause of the earlier expandSections fallback.
   // `[...result]` (array-literal spread) is safe: it iterates, with no arg-count limit.
-  {
+  //
+  // [v2] Gated by V2_FAITHFUL_DRUMS: this is the #1 note remover and it halves steady drum
+  // runs to cap NPS, which is what made the map stop tracking the music. Off by default in v2.
+  if (V2_FAITHFUL_DRUMS) console.log('[DensityThin] SKIPPED — v2 faithful-drums mode (steady runs kept intact)');
+  if (!V2_FAITHFUL_DRUMS) {
     const _dtWin  = 2.0;                  // localization window (beats) — matches the 2-beat NPS spikes
     const _dtBPS  = bpm / 60;
     const _dtBase = diff >= 9 ? 8.0 : diff >= 8 ? 6.5 : diff >= 6 ? 5.0 : 4.0;  // base NPS ceiling by diff
