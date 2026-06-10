@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableDelayedExpansion
-title Upload to GitHub - Synthriderz-Beatmapper
+title Upload to GitHub - Synthriderz-Beatmapper-v2
 
 REM ===========================================================================
 REM  upload_to_github.bat
-REM  Re-runnable sync script for https://github.com/ExKylebur/Synthriderz-Beatmapper
+REM  Re-runnable sync script for https://github.com/ExKylebur/Synthriderz-Beatmapper-v2
 REM
 REM  First run:   initializes repo, sets remote, makes initial commit, pushes.
 REM  Subsequent:  stages changes, commits with timestamp, pushes.
@@ -13,7 +13,7 @@ REM  Optional commit message: pass as argument, e.g.
 REM    upload_to_github.bat "fix rail head zone enforcement"
 REM ===========================================================================
 
-set REPO_URL=https://github.com/ExKylebur/Synthriderz-Beatmapper.git
+set REPO_URL=https://github.com/ExKylebur/Synthriderz-Beatmapper-v2.git
 set BRANCH=main
 
 echo ============================================================
@@ -136,7 +136,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo   Upload complete.
-echo   View at: https://github.com/ExKylebur/Synthriderz-Beatmapper
+echo   View at: https://github.com/ExKylebur/Synthriderz-Beatmapper-v2
 echo ============================================================
 echo.
 pause
