@@ -7054,6 +7054,31 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
   }
 
+  // ── [Phase1Clear] C2-family clearance at end of Phase 1 (two-phase Step 3) ──────────
+  // The three beat/type-domain clearers (green-rail conflicts, gold C2, green C2) decide
+  // POPULATION, so they belong in Phase 1. Previously their first run was [FinalSweep] —
+  // inside the spatial zone — which (a) made the skeleton diff read −50…−75/gen (measured,
+  // 4-gen baseline 2026-06-11: all R/L removals, gold accents added in Phase 1 but their
+  // clearance deferred), and (b) let [GoldSweep]/[DenseSweep] shape groups around notes
+  // that FinalSweep then deleted → holes in the flowing groups. Running them here is
+  // population-equivalent: nothing between here and [FinalSweep] adds/removes notes or
+  // changes beats/types (verified: baseline adds=0), the clearers are beat/type-domain and
+  // idempotent, and nothing in between reads beatOccupied. Same relative order as
+  // runFinalSweep, minus fixC1 (spatial-domain — rail-path geometry must be judged on
+  // FINAL positions, so it stays in the spatial zone). [FinalSweep] stays as the safety
+  // net: its GRC/C2 counts should now log 0, and the skeleton diff should show only
+  // fixC1-family removals. KNOWN EDGE (rule-consistent): a single-hand rail demoted to an
+  // orb here (gold inside its window) can be REMOVED by the FinalSweep re-run if it sits
+  // within ±1 beat of a gold orb — that orb was a latent C2 violation the old single run
+  // left behind.
+  {
+    const _p1grc   = clearGreenRailConflicts(result, beatOccupied);
+    const _p1gold  = clearGoldC2(result, beatOccupied);
+    const _p1green = clearGreenC2(result, beatOccupied);
+    if (_p1grc + _p1gold + _p1green > 0)
+      console.log(`[Phase1Clear] GRC=${_p1grc} goldC2=${_p1gold} greenC2=${_p1green} — C2 population clearance now in Phase 1 ([FinalSweep] should log 0s for these)`);
+  }
+
   // ── [Phase2Probe] PHASE BOUNDARY — skeleton lock (two-phase refactor, Step 1) ─────────
   // Everything ABOVE this line decides the note POPULATION — which beats get a note, on
   // which hand/type (the Phase-1 "rhythmic skeleton": placement loop, sweep conversions,

@@ -70,15 +70,23 @@ geometry), because Phase-2 passes can move an orb off its same-hand rail path.
 ## Roadmap (one step per session, play-test gated)
 
 1. **DONE** — boundary + skeleton lock + FINAL diff instrumentation; [DensityThin] relocated.
-2. **Collect baselines** (user batch + console): record `phase-boundary` vs `FINAL` probe lines
-   and the skeleton-diff numbers for ~5 songs. Expected: removals ≈ [FinalSweep] C1-removed +
-   C2 gold + C2 green + GRC + [ObstacleFinal] post-occlusion C1-removed; adds = 0. If adds ≠ 0
-   something un-mapped is creating notes in the spatial zone — find it first.
-3. **Move C2-family clearance to end of Phase 1**: run GRC + goldC2 + greenC2 just before the
-   skeleton lock (population-neutral by the observation above — verify `[FinalSweep] C2 gold/
-   green: 0, GRC: 0` afterward; keep FinalSweep as a safety net/assertion). Check first that
-   nothing between boundary and FinalSweep reads `beatOccupied` in a way early clearance skews.
-   After this, the skeleton diff should show ONLY fixC1 removals.
+2. **DONE (2026-06-11)** — baseline collected, 4 generations of one song:
+   `adds = 0 in all four` (pass map is complete — nothing creates notes in the spatial zone);
+   removals −75/−50/−62/−73 (~7–10% of population!), ALL R/L singles + a few rails
+   (rail 24→20 etc.), grn/gld = 0. Fingerprint: **gold C2 clearance** — gold accents are added
+   in Phase 1 (gld 21→59 by the boundary) but the single-hand orbs around them were only
+   cleared in [FinalSweep]. Side-finding: [DenseSweep]/[GoldSweep] were shaping groups around
+   notes FinalSweep then deleted → holes in the flowing groups.
+3. **DONE (2026-06-11) — pending play-test verification**: `[Phase1Clear]` runs GRC + goldC2 +
+   greenC2 at the end of Phase 1 (just before the skeleton lock), same relative order as
+   runFinalSweep minus fixC1 (spatial-domain, stays in the spatial zone). Verified before
+   landing: clearers are pure beat/type-domain + idempotent; NOTHING between the boundary and
+   [FinalSweep] reads `beatOccupied`; baseline adds=0 ⇒ population-equivalent. Known edge
+   (rule-consistent, documented in code): a rail demoted to an orb by goldC2 can be removed by
+   the FinalSweep re-run if within ±1 beat of a gold — that was a latent C2 violation before.
+   **Verify on next batch**: `[Phase1Clear]` prints ~50–75; `[FinalSweep]` GRC/C2 read 0;
+   skeleton diff drops to fixC1-only (expect single digits); flow FEEL of dense sections equal
+   or better (groups no longer get holes punched in them).
 4. **Make fixC1's remove step unnecessary**: constrain Phase-2 movers ([GoldSweep],
    [DenseSweep], [Crossover], [ObstacleFinal], [GreenClamp]) to keep same-hand orbs on the
    rail path during rail windows (they mostly already skip rail windows — audit each). fixC1's
