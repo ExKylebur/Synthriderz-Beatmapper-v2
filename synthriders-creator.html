@@ -6993,6 +6993,82 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
   }
 
+  // ── [DensityThin] energy-scaled off-beat decimation in over-dense windows ───────────
+  // (Two-phase refactor: MOVED here from after [DenseSweep] — it removes notes, so it is a
+  // Phase-1 POPULATION pass and must run before the phase boundary below. Zero behavior
+  // change while FAITHFUL_DRUMS=true keeps it skipped.)
+  // Some passages (often light intros) get flurries of two-hand-parallel 0.25-beat notes
+  // that spike to 10-12 NPS regardless of the section's energy. This pass removes whole
+  // OFF-BEAT time-slots (the .25/.75 subdivisions) of FREE orbs in windows that exceed an
+  // energy-scaled NPS cap, keeping the on-beat (.0/.5) two-hand backbone intact. Removing
+  // whole slots (both hands together) preserves two-hand parallelism and avoids jagged
+  // single-hand paths (which would tank arc_coherence). Protects rails, rail companions
+  // (_comp), gold, green, and EVERY on-beat note.
+  //
+  // SAFETY: builds a removal Set then rebuilds result via filter + per-element push. NO
+  // function-call spread (`push(...arr)` / `fn(...arr)`) anywhere — that overflows V8's
+  // argument stack on large maps and was the cause of the earlier expandSections fallback.
+  // `[...result]` (array-literal spread) is safe: it iterates, with no arg-count limit.
+  //
+  // Gated by FAITHFUL_DRUMS: this is the #1 note remover and it halves steady drum runs to
+  // cap NPS, which made the map stop tracking the music. Skipped by default so dense drum
+  // runs survive ([DenseSweep] then makes them flow).
+  if (FAITHFUL_DRUMS) console.log('[DensityThin] SKIPPED — faithful-drums mode (steady runs kept intact)');
+  if (!FAITHFUL_DRUMS) {
+    const _dtWin  = 2.0;                  // localization window (beats) — matches the 2-beat NPS spikes
+    const _dtBPS  = bpm / 60;
+    const _dtBase = diff >= 9 ? 8.0 : diff >= 8 ? 6.5 : diff >= 6 ? 5.0 : 4.0;  // base NPS ceiling by diff
+    const _isOnBeat = b => Math.round(b * 4) % 2 === 0;            // .0 / .5 are on-beat (protected)
+    const _removable = n =>
+      n.railEndBeat == null && n.type !== 3 && n.type !== 2 && !n._comp && !n._underSquatRail
+      && (n._dbComp || n._gapFill || n.stemSource === 'bass' || n.stemSource === 'vocals' || n.stemSource === 'other');
+    const _dtSorted = [...result].sort((a, b) => a.beat - b.beat);  // safe array-literal spread
+    const _dtRemove = new Set();
+    for (let wi = 0; wi < _dtSorted.length; wi++) {
+      const wStart = _dtSorted[wi].beat;
+      const win = [];
+      for (let k = wi; k < _dtSorted.length && _dtSorted[k].beat < wStart + _dtWin; k++)
+        if (!_dtRemove.has(_dtSorted[k])) win.push(_dtSorted[k]);
+      const energy = Math.max(0, Math.min(1, energyAt(wStart + _dtWin / 2)));
+      const cap = Math.round(_dtBase * (0.65 + 0.35 * energy) * _dtWin / _dtBPS);
+      if (win.length <= cap) continue;
+      // Group removable OFF-BEAT candidates into whole time-slots (preserve hand pairs).
+      const slots = new Map();   // beat -> [notes] (insertion order = ascending beat, win is sorted)
+      for (const n of win) {
+        if (_isOnBeat(n.beat) || !_removable(n)) continue;
+        if (!slots.has(n.beat)) slots.set(n.beat, []);
+        slots.get(n.beat).push(n);
+      }
+      let need = win.length - cap;
+      for (const [, ns] of slots) {
+        if (need <= 0) break;
+        for (const n of ns) _dtRemove.add(n);
+        need -= ns.length;
+      }
+    }
+    if (_dtRemove.size > 0) {
+      const _kept = result.filter(n => !_dtRemove.has(n));   // filter is spread-free
+      result.length = 0;
+      for (let i = 0; i < _kept.length; i++) result.push(_kept[i]);  // single-arg push, no spread
+      console.log(`[DensityThin] Removed ${_dtRemove.size} off-beat orb(s) from over-dense windows (base ≤${_dtBase} NPS, energy-scaled ${_dtWin}b window, on-beat backbone preserved)`);
+    }
+  }
+
+  // ── [Phase2Probe] PHASE BOUNDARY — skeleton lock (two-phase refactor, Step 1) ─────────
+  // Everything ABOVE this line decides the note POPULATION — which beats get a note, on
+  // which hand/type (the Phase-1 "rhythmic skeleton": placement loop, sweep conversions,
+  // gap-fill, thinning, hand balance, dedup). Everything BELOW is intended to be purely
+  // SPATIAL (rows/cols/_x/rail geometry) and should never add/remove notes, flip hands, or
+  // change types. That is NOT fully true yet: [FinalSweep] and [ObstacleFinal]'s fixC1
+  // still REMOVE notes to resolve spatial conflicts (C1/C2 clearance). The skeleton diff
+  // logged at FINAL quantifies exactly what the spatial zone still mutates, so migrating
+  // those removals into Phase 1 — or converting them to move-instead-of-remove placement —
+  // is data-driven instead of guessed. Pure logging — ZERO behavior change.
+  const _skelKey = n => Math.round(n.beat * 64) + '|' + n.type;
+  const _skel = new Map();
+  for (const n of result) _skel.set(_skelKey(n), (_skel.get(_skelKey(n)) || 0) + 1);
+  _probe('phase-boundary');
+
   // ── [GoldSweep] widen clustered gold runs into reachable sweeps (Fix-2) ──────────────
   // Gold orbs (both-hands) are placed at dead centre (x=0), so a run of them stacks on the
   // centre column → "T-Rex arms" (no lateral travel). Reshape each run of 3+ consecutive gold
@@ -7093,64 +7169,6 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       i = j + 1;
     }
     if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense region(s) (${_dswNotes} orbs) into flowing groups`);
-  }
-
-  // ── [DensityThin] energy-scaled off-beat decimation in over-dense windows ───────────
-  // Some passages (often light intros) get flurries of two-hand-parallel 0.25-beat notes
-  // that spike to 10-12 NPS regardless of the section's energy. This pass removes whole
-  // OFF-BEAT time-slots (the .25/.75 subdivisions) of FREE orbs in windows that exceed an
-  // energy-scaled NPS cap, keeping the on-beat (.0/.5) two-hand backbone intact. Removing
-  // whole slots (both hands together) preserves two-hand parallelism and avoids jagged
-  // single-hand paths (which would tank arc_coherence). Protects rails, rail companions
-  // (_comp), gold, green, and EVERY on-beat note.
-  //
-  // SAFETY: builds a removal Set then rebuilds result via filter + per-element push. NO
-  // function-call spread (`push(...arr)` / `fn(...arr)`) anywhere — that overflows V8's
-  // argument stack on large maps and was the cause of the earlier expandSections fallback.
-  // `[...result]` (array-literal spread) is safe: it iterates, with no arg-count limit.
-  //
-  // Gated by FAITHFUL_DRUMS: this is the #1 note remover and it halves steady drum runs to
-  // cap NPS, which made the map stop tracking the music. Skipped by default so dense drum
-  // runs survive ([DenseSweep] then makes them flow).
-  if (FAITHFUL_DRUMS) console.log('[DensityThin] SKIPPED — faithful-drums mode (steady runs kept intact)');
-  if (!FAITHFUL_DRUMS) {
-    const _dtWin  = 2.0;                  // localization window (beats) — matches the 2-beat NPS spikes
-    const _dtBPS  = bpm / 60;
-    const _dtBase = diff >= 9 ? 8.0 : diff >= 8 ? 6.5 : diff >= 6 ? 5.0 : 4.0;  // base NPS ceiling by diff
-    const _isOnBeat = b => Math.round(b * 4) % 2 === 0;            // .0 / .5 are on-beat (protected)
-    const _removable = n =>
-      n.railEndBeat == null && n.type !== 3 && n.type !== 2 && !n._comp && !n._underSquatRail
-      && (n._dbComp || n._gapFill || n.stemSource === 'bass' || n.stemSource === 'vocals' || n.stemSource === 'other');
-    const _dtSorted = [...result].sort((a, b) => a.beat - b.beat);  // safe array-literal spread
-    const _dtRemove = new Set();
-    for (let wi = 0; wi < _dtSorted.length; wi++) {
-      const wStart = _dtSorted[wi].beat;
-      const win = [];
-      for (let k = wi; k < _dtSorted.length && _dtSorted[k].beat < wStart + _dtWin; k++)
-        if (!_dtRemove.has(_dtSorted[k])) win.push(_dtSorted[k]);
-      const energy = Math.max(0, Math.min(1, energyAt(wStart + _dtWin / 2)));
-      const cap = Math.round(_dtBase * (0.65 + 0.35 * energy) * _dtWin / _dtBPS);
-      if (win.length <= cap) continue;
-      // Group removable OFF-BEAT candidates into whole time-slots (preserve hand pairs).
-      const slots = new Map();   // beat -> [notes] (insertion order = ascending beat, win is sorted)
-      for (const n of win) {
-        if (_isOnBeat(n.beat) || !_removable(n)) continue;
-        if (!slots.has(n.beat)) slots.set(n.beat, []);
-        slots.get(n.beat).push(n);
-      }
-      let need = win.length - cap;
-      for (const [, ns] of slots) {
-        if (need <= 0) break;
-        for (const n of ns) _dtRemove.add(n);
-        need -= ns.length;
-      }
-    }
-    if (_dtRemove.size > 0) {
-      const _kept = result.filter(n => !_dtRemove.has(n));   // filter is spread-free
-      result.length = 0;
-      for (let i = 0; i < _kept.length; i++) result.push(_kept[i]);  // single-arg push, no spread
-      console.log(`[DensityThin] Removed ${_dtRemove.size} off-beat orb(s) from over-dense windows (base ≤${_dtBase} NPS, energy-scaled ${_dtWin}b window, on-beat backbone preserved)`);
-    }
   }
 
   // ── FINAL C1/C2 SWEEP — runs last, after every pass that could touch result ──
@@ -7282,6 +7300,27 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         for (const s of n.railSegments) if (typeof s.row === 'number') s.row = _lift(s.row);
     }
     console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (was sitting too low in VR; clamped at row ${diffRowMin})`);
+  }
+
+  // ── [Phase2Probe] skeleton diff — what the spatial zone did to the population ─────────
+  // Compares the note population at FINAL against the skeleton locked at phase-boundary.
+  // Target end-state of the two-phase refactor: "+0 −0 clean" on every generation — then
+  // Phase 2 is provably pure spatial and the boundary can become a hard interface.
+  // A hand-flip or type-change shows up as a paired +1/−1 at the same beat. Removals are
+  // attributable via the pass logs above ([FinalSweep] C1/C2 counts, [ObstacleFinal] C1).
+  {
+    const _cur = new Map();
+    for (const n of result) _cur.set(_skelKey(n), (_cur.get(_skelKey(n)) || 0) + 1);
+    let _added = 0, _removed = 0;
+    const _remByType = [0, 0, 0, 0];
+    for (const [k, c] of _cur) { const p = _skel.get(k) || 0; if (c > p) _added += c - p; }
+    for (const [k, p] of _skel) {
+      const c = _cur.get(k) || 0;
+      if (p > c) { _removed += p - c; _remByType[+k.split('|')[1]] += p - c; }
+    }
+    console.log(_added === 0 && _removed === 0
+      ? '[Phase2Probe] skeleton diff: +0 −0 clean — spatial zone preserved the population ✓'
+      : `[Phase2Probe] skeleton diff: +${_added} −${_removed} (removed R=${_remByType[0]} L=${_remByType[1]} grn=${_remByType[2]} gld=${_remByType[3]}) — spatial zone still mutates the skeleton`);
   }
 
   _probe('FINAL');   // [Phase2Probe] final note population leaving onsetsToNotes
