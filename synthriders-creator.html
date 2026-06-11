@@ -680,7 +680,7 @@
     SynthRiders Beatmap Creator
   </div>
   <span class="badge">V2 Format</span>
-  <span title="Experimental two-phase refactor build. The stable build runs on localhost:8080." style="margin-left:8px;background:#d63c3c;color:#fff;border-radius:4px;padding:3px 9px;font-size:11px;font-weight:700;letter-spacing:.3px;">🧪 SANDBOX v2 · localhost:8090</span>
+  <span title="Experimental sandbox build. The stable build runs on localhost:8080." style="margin-left:8px;background:#d63c3c;color:#fff;border-radius:4px;padding:3px 9px;font-size:11px;font-weight:700;letter-spacing:.3px;">🧪 SANDBOX v2 · localhost:8090</span>
 </header>
 
 <div class="main">
@@ -3118,19 +3118,7 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   // the other, rather than rapid L-R alternation mixing both stems together.
   // Ownership flips every STEM_HAND_WINDOW beats so neither hand is permanently
   // dominant across a long song.
-  const STEM_HAND_WINDOW = 8 * beatSec;    // seconds between ownership flips (only when !STABLE_STEM_HAND)
-  // [v2 two-phase · increment 3] Keep each stem on ONE consistent hand for the whole song
-  // instead of swapping every 8 beats. The periodic flip was a major source of cross-hand
-  // stem smear — drums jumping sides mid-song. With this on, the drum hand is fixed for the
-  // whole track (bass on the opposite hand). Set false to restore v1's alternating behavior
-  // (A/B toggle). NOTE: this can raise the raw L/R imbalance per-song (drums are usually
-  // denser than bass); [HandBalance] still rebalances the FINAL count by flipping idle-beat
-  // FREE orbs — a later increment will reconcile that against stem purity.
-  const STABLE_STEM_HAND = false;  // DISABLED per A/B (2026-06): drums are ~75%+ of notes, so
-                                   // pinning a stem to one hand just overloads it — stem-per-hand
-                                   // is NOT the flow fix. The real issue is removal churn (the
-                                   // pipeline strips ~25-44% of the raw skeleton, punching holes in
-                                   // steady drum subdivisions). Kept as a toggle for reference.
+  const STEM_HAND_WINDOW = 8 * beatSec;    // seconds between ownership flips
   // Randomise starting hand so drums don't always begin on the right.
   let   drumsHand        = Math.random() < 0.5 ? 0 : 1;
   let   bassHand         = 1 - drumsHand; // always opposite to drumsHand
@@ -3212,8 +3200,8 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
         });
       } else {
         // ── Free orb: stem-hand ownership ─────────────────────────────────
-        // [v2] Stable ownership: skip the periodic flip so each stem keeps one hand all song.
-        if (!STABLE_STEM_HAND && ev.t - stemWindowStart > STEM_HAND_WINDOW) {
+        // Flip ownership window every STEM_HAND_WINDOW seconds for variety
+        if (ev.t - stemWindowStart > STEM_HAND_WINDOW) {
           drumsHand       = 1 - drumsHand;
           bassHand        = 1 - drumsHand;
           stemWindowStart = ev.t;
@@ -3843,24 +3831,14 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     console.log(`[Phase2Probe] ${label.padEnd(20)} n=${String(result.length).padStart(4)} (${d >= 0 ? '+' : ''}${d}) R/L=${R}/${L} grn=${grn} gld=${gld} rail=${rail} comp=${comp} gap=${gap} crs=${crs} stemless=${stemless}`);
   }
 
-  // [v2 faithful-drums experiment] When true, the most destructive density-thinning pass
-  // ([DensityThin], the #1 note remover ~167/gen) is skipped so the map FOLLOWS THE DRUMS
-  // faithfully instead of halving steady runs to cap NPS. A/B toggle vs v1; set false to
-  // restore v1's thinning. (Per the probe data: raw skeleton ~1100 notes was being cut ~25%
-  // mostly by this pass, which is what made dense drum runs feel inconsistent with the music.)
-  const V2_FAITHFUL_DRUMS = true;
-  // [v2] Cull bass/guitar ORBS that fall off the drum pulse — even in drum-quiet windows —
-  // so secondary stems reinforce the beat instead of interjecting between drum hits. Closes
-  // [RhythmCoherence]'s two blind spots: (1) it skipped windows with <3 drum hits — exactly
-  // where the guitar-gap fallback drops orbs; (2) it only culled off-pulse notes that had a
-  // drum hit nearby. A/B toggle vs v1.
-  const V2_CULL_OFFBEAT_SECONDARY = false;  // REVERTED per A/B: made alignment WORSE, and the
-                                            // real issue is SPATIAL (hectic placement in dense
-                                            // sections), not which notes exist. See [DenseSweep].
-  // [v2] DenseSweep: reshape dense same-hand runs into smooth zigzag sweep paths (like
-  // [GoldSweep]) so tight/dense sections FLOW instead of scattering across the grid. The
-  // core ask: "more behavior like the gold notes when density is high." A/B toggle.
-  const V2_DENSE_SWEEP = true;
+  // When true, the most destructive density-thinning pass ([DensityThin], the #1 note
+  // remover ~167/gen) is skipped so the map FOLLOWS THE DRUMS faithfully instead of halving
+  // steady runs to cap NPS. Set false to restore the old NPS-capped thinning.
+  const FAITHFUL_DRUMS = true;
+  // [DenseSweep]: reshape dense runs into smooth gold-style flowing groups (short rotating
+  // horizontal/vertical/diagonal segments, both hands parallel) so tight/dense sections FLOW
+  // instead of scattering across the grid.
+  const DENSE_SWEEP = true;
 
   const lastHandRow  = [3, 4]; // start hands in mid-high zone (upward-shifted distribution)
   const lastHandCol  = [10, 4]; // right hand starts mid-right, left starts mid-left
@@ -5846,52 +5824,29 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       .map(n => n.beat)
       .sort((a, b) => a - b);
 
-    // [v2] Song-wide drum pulse + anchor — fallback for drum-quiet windows so the cadence
-    // gate can still reach sparse sections (where the guitar-gap orbs hide). 0 = unavailable.
-    let _gPulse = 0, _gAnchor = 0;
-    if (V2_CULL_OFFBEAT_SECONDARY && drumBeats.length >= 4) {
-      const gd = [];
-      for (let i = 1; i < drumBeats.length; i++) gd.push(drumBeats[i] - drumBeats[i - 1]);
-      gd.sort((a, b) => a - b);
-      const gMed = gd[Math.floor(gd.length / 2)];
-      let gErr = Infinity;
-      for (const s of SUBDIVS) { const e = Math.abs(s - gMed); if (e < gErr) { gErr = e; _gPulse = s; } }
-      if (gErr > _gPulse * 0.5) _gPulse = 0;   // song pulse ambiguous → no fallback
-      _gAnchor = drumBeats[0];
-    }
-
     let _rcRemoved = 0;
     if (drumBeats.length >= RC_MIN_DRUM_HITS) {
       const removeSet = new Set();
       for (let w = 0; w < totalBeats; w += RC_WINDOW_BEATS) {
         const wEnd = w + RC_WINDOW_BEATS;
         const winDrums = drumBeats.filter(b => b >= w && b < wEnd);
+        if (winDrums.length < RC_MIN_DRUM_HITS) continue;
 
         // Dominant pulse = median consecutive interval, snapped to nearest subdivision.
-        let pulse, anchor;
-        if (winDrums.length >= RC_MIN_DRUM_HITS) {
-          const diffs = [];
-          for (let i = 1; i < winDrums.length; i++) diffs.push(winDrums[i] - winDrums[i - 1]);
-          diffs.sort((a, b) => a - b);
-          const medianDiff = diffs[Math.floor(diffs.length / 2)];
-          pulse = SUBDIVS[0];
-          let bestErr = Infinity;
-          for (const s of SUBDIVS) {
-            const e = Math.abs(s - medianDiff);
-            if (e < bestErr) { bestErr = e; pulse = s; }
-          }
-          // Require the chosen pulse to actually fit the drum spacing — if the median
-          // interval is wildly off every subdivision, the pulse is ambiguous: skip.
-          if (bestErr > pulse * 0.5) continue;
-          anchor = winDrums[0];
-        } else if (V2_CULL_OFFBEAT_SECONDARY && _gPulse) {
-          // [v2] Drum-quiet window: fall back to the song-wide pulse + anchor so the
-          // off-beat guitar/bass orbs that hide here still get cadence-checked.
-          pulse  = _gPulse;
-          anchor = _gAnchor;
-        } else {
-          continue;   // v1: no usable local pulse → leave the window alone
+        const diffs = [];
+        for (let i = 1; i < winDrums.length; i++) diffs.push(winDrums[i] - winDrums[i - 1]);
+        diffs.sort((a, b) => a - b);
+        const medianDiff = diffs[Math.floor(diffs.length / 2)];
+        let pulse = SUBDIVS[0];
+        let bestErr = Infinity;
+        for (const s of SUBDIVS) {
+          const e = Math.abs(s - medianDiff);
+          if (e < bestErr) { bestErr = e; pulse = s; }
         }
+        // Require the chosen pulse to actually fit the drum spacing — if the median
+        // interval is wildly off every subdivision, the pulse is ambiguous: skip.
+        if (bestErr > pulse * 0.5) continue;
+        const anchor = winDrums[0];
         const tol = pulse * RC_GRID_TOL_FRAC;
 
         for (const n of result) {
@@ -5907,11 +5862,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           const gridBeat = anchor + k * pulse;
           const off = Math.abs(n.beat - gridBeat);
           if (off <= tol) continue;                        // on the pulse → keep
-          // Off the pulse → an interjection between the beats. v1 only culled when a drum
-          // hit sat nearby; [v2] culls regardless, closing the "note carries rhythm on its
-          // own in a gap" hole that let off-beat bass/guitar survive in sparse sections.
+          // Off the pulse. Only cull if a drum hit is actively near (interjection
+          // over a live pulse) rather than the note carrying rhythm on its own.
           const nearDrum = winDrums.some(db => Math.abs(db - n.beat) < pulse * 1.1);
-          if (nearDrum || V2_CULL_OFFBEAT_SECONDARY) removeSet.add(n);
+          if (nearDrum) removeSet.add(n);
         }
       }
       if (removeSet.size > 0) {
@@ -7067,7 +7021,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // over >=3 beats); sparser sections keep the normal arc flow. Protects rails, rail companions
   // (_comp), gold, green. Placed by GoldSweep so FinalSweep (C1/C2) + occlusion run after;
   // [Crossover] skips dense passages so it won't fight these.
-  if (V2_DENSE_SWEEP) {
+  if (DENSE_SWEEP) {
     const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_CSTEP = 2, DSW_SEG = 3;
     const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
     const orbs = result
@@ -7128,10 +7082,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // argument stack on large maps and was the cause of the earlier expandSections fallback.
   // `[...result]` (array-literal spread) is safe: it iterates, with no arg-count limit.
   //
-  // [v2] Gated by V2_FAITHFUL_DRUMS: this is the #1 note remover and it halves steady drum
-  // runs to cap NPS, which is what made the map stop tracking the music. Off by default in v2.
-  if (V2_FAITHFUL_DRUMS) console.log('[DensityThin] SKIPPED — v2 faithful-drums mode (steady runs kept intact)');
-  if (!V2_FAITHFUL_DRUMS) {
+  // Gated by FAITHFUL_DRUMS: this is the #1 note remover and it halves steady drum runs to
+  // cap NPS, which made the map stop tracking the music. Skipped by default so dense drum
+  // runs survive ([DenseSweep] then makes them flow).
+  if (FAITHFUL_DRUMS) console.log('[DensityThin] SKIPPED — faithful-drums mode (steady runs kept intact)');
+  if (!FAITHFUL_DRUMS) {
     const _dtWin  = 2.0;                  // localization window (beats) — matches the 2-beat NPS spikes
     const _dtBPS  = bpm / 60;
     const _dtBase = diff >= 9 ? 8.0 : diff >= 8 ? 6.5 : diff >= 6 ? 5.0 : 4.0;  // base NPS ceiling by diff
