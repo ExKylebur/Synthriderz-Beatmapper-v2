@@ -746,7 +746,7 @@
       </div>
       <div class="field">
         <label title="Beats per minute of the song. Auto-detected from audio on upload. Use 'Look up BPM' for a more accurate value.">BPM</label>
-        <input type="number" id="bpm" value="120" min="60" max="300" step="0.5"
+        <input type="number" id="bpm" value="120" min="60" max="300" step="any"
           title="Beats per minute. This controls note timing. Use the tools below to verify accuracy." />
       </div>
       <div id="bpmSuggestBanner" style="display:none;align-items:center;gap:8px;background:rgba(98,84,192,0.09);border:1px solid rgba(98,84,192,0.25);border-radius:6px;padding:7px 10px;margin-bottom:6px;font-size:12px;">
@@ -2168,7 +2168,7 @@ async function lookupBPM() {
     if (!jsonMatch) throw new Error('Could not parse BPM from response');
 
     const parsed = JSON.parse(jsonMatch[0]);
-    const bpm    = parseInt(parsed.bpm);
+    const bpm    = parseFloat(parsed.bpm);
     const source = parsed.source || 'web';
     const note   = parsed.note  || '';
     if (!bpm || isNaN(bpm)) throw new Error('BPM not found');
@@ -2631,12 +2631,12 @@ async function detectBPM(buffer) {
   // Always compare within the 60–200 BPM window the user expects
   const TARGET_MIN = 60, TARGET_MAX = 200;
   const multipliers = [1, 2, 0.5, 1.5, 3, 0.33, 0.67];
-  let finalBpm = 0, finalScore = -Infinity;
+  let finalLag = 0, finalScore = -Infinity;
 
   for (const m of multipliers) {
     const lag = Math.round(bestLag * m);
     if (lag < minLag || lag > maxLag) continue;
-    const bpm = Math.round(TARGET_SR * 60 / lag);
+    const bpm = TARGET_SR * 60 / lag;
     if (bpm < TARGET_MIN || bpm > TARGET_MAX) continue;
 
     // Score the candidate lag directly
@@ -2645,11 +2645,38 @@ async function detectBPM(buffer) {
     const preference = 1 - Math.abs(bpm - 120) / 200;
     const adjusted = s * (1 + preference * 0.05);
 
-    if (adjusted > finalScore) { finalScore = adjusted; finalBpm = bpm; }
+    if (adjusted > finalScore) { finalScore = adjusted; finalLag = lag; }
   }
 
-  // Last resort: if nothing found in 60–200, return raw best
-  if (!finalBpm) finalBpm = Math.round(TARGET_SR * 60 / bestLag);
+  // Last resort: if nothing found in 60–200, take the raw best
+  if (!finalLag) finalLag = bestLag;
+
+  // Fractional refinement — integer-lag resolution is coarse (~1.7 BPM at 144 BPM).
+  // Re-measure the period at a higher harmonic k·lag (k× finer lag resolution), then
+  // parabolic-interpolate the autocorrelation peak for sub-sample precision.
+  const acAt = lag => { let v = 0; for (let i = 0; i < dsLen - lag; i++) v += onset[i] * onset[i + lag]; return v; };
+  let fracLag = finalLag;
+  const k = Math.min(8, Math.floor((dsLen / 2) / finalLag));
+  if (k >= 1) {
+    const centre = k * finalLag;
+    const win = Math.max(2, Math.ceil(k / 2)); // « finalLag, so we stay on this harmonic
+    const cache = new Map();
+    const val = l => { if (!cache.has(l)) cache.set(l, acAt(l)); return cache.get(l); };
+    let pk = centre;
+    for (let l = centre - win; l <= centre + win; l++) {
+      if (val(l) > val(pk)) pk = l;
+    }
+    const y0 = val(pk - 1), y1 = val(pk), y2 = val(pk + 1);
+    const denom = y0 - 2 * y1 + y2;
+    const shift = denom !== 0 ? 0.5 * (y0 - y2) / denom : 0;
+    if (Math.abs(shift) <= 1) fracLag = (pk + shift) / k;
+  }
+
+  let finalBpm = TARGET_SR * 60 / fracLag;
+  // Most studio tracks ARE integer BPM — within measurement noise, snap to it.
+  // Outside that, keep one decimal (true fractional tempo, e.g. live recordings).
+  const snapped = Math.round(finalBpm);
+  finalBpm = Math.abs(finalBpm - snapped) <= 0.15 ? snapped : Math.round(finalBpm * 10) / 10;
   return Math.max(60, Math.min(200, finalBpm));
 }
 
@@ -7450,7 +7477,7 @@ document.getElementById('audioFile').addEventListener('change', async e => {
         const looked = await lookupBPMProgrammatic(_t, _a);
         if (!looked || _bpmProtected) return;
         const cur = parseFloat(document.getElementById('bpm').value) || detectedBpm;
-        if (cur > 0 && Math.abs(looked - cur) / cur > 0.03) showBpmLookupBanner(Math.round(cur), looked);
+        if (cur > 0 && Math.abs(looked - cur) / cur > 0.03) showBpmLookupBanner(+cur.toFixed(2), looked);
       })().catch(() => {});
     }
 
@@ -13062,7 +13089,7 @@ async function lookupBPMProgrammatic(title, artist) {
     const raw = (textBlock?.text || '').replace(/```json|```/g, '').trim();
     const match = raw.match(/\{[^}]+\}/);
     if (!match) return null;
-    const bpm = parseInt(JSON.parse(match[0]).bpm);
+    const bpm = parseFloat(JSON.parse(match[0]).bpm);
     return (!bpm || isNaN(bpm)) ? null : bpm;
   } catch { return null; }
 }
