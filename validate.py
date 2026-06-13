@@ -36,6 +36,16 @@ GOLD_BEATS = 1.0           # gold/green C2 clearance window (beats)
 # soft stat, reported not failed unless egregiously exceeded).
 NPS_SOFT = {'Easy': 4, 'Normal': 5, 'Hard': 6, 'Expert': 8, 'Master': 10, 'Custom': 10}
 
+# Playability limits reverse-engineered by synth_mapping_helper (adosikas/analysis.py). Objects
+# simultaneously on-screen are capped by the renderer; EXCEEDING the cap despawns them — notes
+# literally vanish mid-play. Quest is the strict platform (the user's target is Quest 3).
+RENDER_WINDOW_NOTES   = 3.5   # s — how far ahead notes/rails are rendered
+QUEST_RENDER_LIMIT    = 500   # combined objects on screen before a hard despawn
+QUEST_WIREFRAME_LIMIT = 200   # combined objects before the Quest wireframe fallback
+PC_TYPE_DESPAWN       = 80    # per-type objects before that type despawns (PC)
+RAIL_NODE_DIST        = 2.0   # beats — max gap between rail nodes before rendering breaks
+END_PADDING           = 1.0   # s — minimum object clearance before the song ends
+
 
 def _load_meta(path):
     z = zipfile.ZipFile(path)
@@ -43,6 +53,41 @@ def _load_meta(path):
     if raw.startswith(b'\xef\xbb\xbf'):
         raw = raw[3:]
     return json.loads(raw.decode('utf-8', errors='replace'))
+
+
+def _walls_for(meta, diff):
+    """Wall object clock-times (seconds) from Crouchs+Slides — for the render-window count.
+    Walls share the z clock (Position[2] = seconds*20), same as notes."""
+    out = []
+    for key in ('Crouchs', 'Slides'):
+        wd = meta.get(key, {})
+        arr = wd.get(diff, []) if isinstance(wd, dict) else []
+        for w in arr:
+            pos = w.get('position')
+            if pos and len(pos) >= 3:
+                out.append(float(pos[2]) / 20.0)
+    return out
+
+
+def _song_duration(path):
+    """Song length (seconds) from track.data.json, for the END_PADDING check. None if absent.
+    `duration` is stored as a "mm:ss" (or "h:mm:ss") string, not a number."""
+    try:
+        raw = zipfile.ZipFile(path).read('track.data.json')
+        for bom in (b'\xef\xbb\xbf', b'\xff\xfe', b'\xfe\xff'):
+            if raw.startswith(bom):
+                raw = raw[len(bom):]
+                break
+        enc = 'utf-16' if b'\x00' in raw[:40] else 'utf-8'
+        dur = json.loads(raw.decode(enc, errors='replace')).get('duration')
+        if isinstance(dur, str) and ':' in dur:
+            sec = 0.0
+            for part in dur.split(':'):
+                sec = sec * 60 + float(part)
+            return sec or None
+        return float(dur or 0) or None
+    except Exception:
+        return None
 
 
 def _row_of(y):
@@ -86,7 +131,7 @@ def _rail_x_at(note, t):
     return pts[-1][1]
 
 
-def validate_diff(meta, diff):
+def validate_diff(meta, diff, walls=None, song_dur=None):
     notes, bps = _notes_for(meta, diff)
     n = len(notes)
     hard, soft, stats = [], [], {}
@@ -179,9 +224,23 @@ def validate_diff(meta, diff):
     ceil_pct  = round(100 * sum(1 for x in notes if x['row'] == 0) / n, 1)
     floor_pct = round(100 * sum(1 for x in notes if x['row'] == 7) / n, 1)
 
+    # Render-window object count (synth_mapping_helper limits): peak objects simultaneously
+    # on-screen = max in any forward RENDER_WINDOW_NOTES-second window (notes+rails+walls).
+    def _max_in_window(times, win):
+        ts2 = sorted(times); mx = jj = 0
+        for ii in range(len(ts2)):
+            while ts2[ii] - ts2[jj] > win:
+                jj += 1
+            mx = max(mx, ii - jj + 1)
+        return mx
+    note_times   = [x['t'] / 20.0 for x in notes]
+    max_window   = _max_in_window(note_times + (walls or []), RENDER_WINDOW_NOTES)
+    max_type_win = max((_max_in_window([x['t'] / 20.0 for x in notes if x['type'] == ty],
+                                       RENDER_WINDOW_NOTES) for ty in (0, 1, 2, 3)), default=0)
+
     stats = {'notes': n, 'rails': len(rails), 'R/L': f"{R}/{L}", 'balance%': bal,
              'gold%': gold_pct, 'green%': green_pct, 'crossover%': cross_pct,
-             'maxNPS': max_nps, 'maxGap_s': round(max_gap, 1),
+             'maxNPS': max_nps, 'maxWin': max_window, 'maxGap_s': round(max_gap, 1),
              'ceil%': ceil_pct, 'floor%': floor_pct}
 
     # Pathological gold (≫ favorites' 9-11% and the 8% cap) with no rails is the classic
@@ -195,6 +254,33 @@ def validate_diff(meta, diff):
     if max_nps > NPS_SOFT.get(diff, 10): soft.append(f"maxNPS {max_nps} (>{NPS_SOFT.get(diff,10)} for {diff})")
     if max_gap > 6:      soft.append(f"noteless gap {round(max_gap,1)}s (>6 — dead air)")
     if ceil_pct > 4:     soft.append(f"ceiling {ceil_pct}% (>4 — too many top-row)")
+
+    # ── Render/despawn limits (synth_mapping_helper analysis.py) ──────────────────────────
+    if max_window > QUEST_RENDER_LIMIT:
+        hard.append(f"DESPAWN: {max_window} objects within {RENDER_WINDOW_NOTES}s "
+                    f"(> Quest render cap {QUEST_RENDER_LIMIT} — objects vanish in-game)")
+    elif max_window > QUEST_WIREFRAME_LIMIT:
+        soft.append(f"density {max_window} obj/{RENDER_WINDOW_NOTES}s (> Quest wireframe {QUEST_WIREFRAME_LIMIT})")
+    if max_type_win > PC_TYPE_DESPAWN:
+        soft.append(f"{max_type_win} same-type obj/{RENDER_WINDOW_NOTES}s (> PC per-type despawn {PC_TYPE_DESPAWN})")
+
+    # Rail node spacing: nodes farther apart than RAIL_NODE_DIST beats can render incorrectly.
+    rail_node_bad = 0
+    for r in rails:
+        bs = [r['beat']] + [(s[0] / 20.0) * bps for s in r['segs']]
+        if any(b2 - b1 > RAIL_NODE_DIST + 1e-6 for b1, b2 in zip(bs, bs[1:])):
+            rail_node_bad += 1
+    if rail_node_bad:
+        soft.append(f"{rail_node_bad} rail(s) with a node gap >{RAIL_NODE_DIST} beats (may render wrong)")
+
+    # Endpoint clearance: flag objects scheduled PAST the audio end (unhittable). The
+    # track.data.json duration is mm:ss (±1s rounding) and songs legitimately end on the last
+    # beat, so a "within 1s of end" check is almost all normal endings — only a clear overrun
+    # (> END_PADDING beyond the rounded duration) is a real cut-off defect.
+    if song_dur:
+        overrun = [x['t'] / 20.0 for x in notes if x['t'] / 20.0 > song_dur + END_PADDING]
+        if overrun:
+            soft.append(f"{len(overrun)} object(s) past song end ({song_dur:.0f}s, last @ {max(overrun):.0f}s) — unhittable")
     return hard, soft, stats
 
 
@@ -211,8 +297,9 @@ def validate_file(path):
         print(f"· {name}: no populated difficulty (skipped)")
         return 0
     file_bad = 0
+    song_dur = _song_duration(path)
     for diff in sorted(populated, key=lambda d: -len(populated[d])):
-        hard, soft, stats = validate_diff(meta, diff)
+        hard, soft, stats = validate_diff(meta, diff, _walls_for(meta, diff), song_dur)
         mark = "✗" if hard else ("⚠" if soft else "✓")
         statline = " ".join(f"{k}={v}" for k, v in stats.items())
         print(f"{mark} {name} [{diff}]  {statline}")

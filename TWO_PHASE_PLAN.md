@@ -134,9 +134,19 @@ mechanically instead of only in a play-test (the failure mode that bit us 3×).
   (same-hand rails overlapping in time), C2-GREEN-RAIL (green inside a rail window), C2-GOLD
   (single-hand within 1 beat of gold / inside a gold-rail window), C1 (same-hand orb off its
   rail's X path), ZONE (note ≥3 cols into the wrong hand's field — past crossover reach),
-  GOLD-RUNAWAY (gold >25% = the expandSections-fallback signature).
+  GOLD-RUNAWAY (gold >25% = the expandSections-fallback signature), DESPAWN (>500 objects in a
+  3.5s render window — they vanish in-game on Quest).
 - **soft (advisory stats):** hand balance, gold%, green%, crossover%, maxNPS-vs-difficulty,
-  noteless-gap, ceiling/floor row %.
+  maxWin (peak objects in the 3.5s render window), noteless-gap, ceiling/floor row %, density
+  vs Quest wireframe (200) / PC per-type despawn (80), rail node-gap >2 beats, objects past
+  song end (unhittable — the legacy stray-trailing-note / inflated-totalBeats signature).
+- **Quest playability checks (from `synth_mapping_helper`/adosikas `analysis.py`, 2026-06-11):**
+  render/despawn limits (`QUEST_RENDER_LIMIT=500`, `QUEST_WIREFRAME_LIMIT=200`,
+  `PC_TYPE_DESPAWN=80`, `RENDER_WINDOW=3.5s`), `RAIL_NODE_DIST=2.0` beats, `END_PADDING=1.0s`.
+  That tool's reverse-engineered constants also INDEPENDENTLY CONFIRMED our coordinate handling
+  (`GRID_SCALE=0.1365`, `TIME_SCALE=20`, `INDEX_SCALE=64`, X/Y offsets, types 0–3 all match).
+  NOT ported: head/vision-keepout (`HEAD_POSITION`/`HEAD_RADIUS`) — coordinate frame unclear
+  from the summary; needs the actual source before porting or it'll add noise.
 - **Calibrated 2026-06-11 against the corpus:** fresh `debug_last_export.synth` = ✓ clean;
   `victoria massive errors` (41% gold, 0 rails) and `zero-to-hero` (34%) correctly HARD-fail;
   favorites pass with only soft outro-silence notes. ~40/81 of the historical corpus HARD-fail
