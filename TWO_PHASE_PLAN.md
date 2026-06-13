@@ -119,3 +119,27 @@ mid-phrase hand switches.
   fallback, the [DensityClip] failure mode).
 - No `fn(...largeArray)` / `push(...largeArray)` — V8 arg-stack overflow inside the try/catch
   masks the throw as a generator fallback.
+- **`validate.py` on the exported `.synth`** (regression harness — see below). Export the map,
+  then `py -3.12 validate.py debug_last_export.synth` (or point it at the saved file). HARD
+  violations = a regression to fix before the step lands; exit code = #files with HARD issues.
+
+## Regression harness — `validate.py`
+
+Standalone checker for the FINAL playable artifact (parses `beatmap.meta.bin` inside the
+`.synth` ZIP; works purely in export coordinates — `z = sec×20` is the universal clock, no JS
+engine needed). Mirrors the in-browser `_finalize` invariants so a regression shows up
+mechanically instead of only in a play-test (the failure mode that bit us 3×).
+
+- **HARD (must be 0 — gate the exit code):** DEDUP (same-type same-beat orbs), RAIL-OVERLAP
+  (same-hand rails overlapping in time), C2-GREEN-RAIL (green inside a rail window), C2-GOLD
+  (single-hand within 1 beat of gold / inside a gold-rail window), C1 (same-hand orb off its
+  rail's X path), ZONE (note ≥3 cols into the wrong hand's field — past crossover reach),
+  GOLD-RUNAWAY (gold >25% = the expandSections-fallback signature).
+- **soft (advisory stats):** hand balance, gold%, green%, crossover%, maxNPS-vs-difficulty,
+  noteless-gap, ceiling/floor row %.
+- **Calibrated 2026-06-11 against the corpus:** fresh `debug_last_export.synth` = ✓ clean;
+  `victoria massive errors` (41% gold, 0 rails) and `zero-to-hero` (34%) correctly HARD-fail;
+  favorites pass with only soft outro-silence notes. ~40/81 of the historical corpus HARD-fail
+  because they predate the C1/C2 refactor + DedupSameBeat — expected; the gate's real job is
+  per-fresh-export, not the back-catalogue.
+- Run with no args to sweep `../synthfiles` + the local debug export.
