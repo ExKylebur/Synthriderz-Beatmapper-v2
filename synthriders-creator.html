@@ -13367,7 +13367,27 @@ async function _processBatchItem(file, i) {
     const entry = Object.values(lib).find(e => e.audioHash === hash);
     if (entry) {
       _bpmProtected = true;
-      applyBPM(entry.bpm || 120);
+      // BPM reconciliation (library hit): run librosa and snap its octave to the catalogued
+      // BPM as the trusted reference. If librosa CONFIRMS the catalogued octave (within 5%),
+      // keep the verified catalogued value; if librosa's tempo grid genuinely DISAGREES
+      // (non-octave), the catalogued value is suspect → use librosa + warn. librosa unavailable
+      // (server down / 503) → trust catalogued. Catches stale wrong catalogued BPMs (e.g.
+      // drag-me-down stored 103 when the audio is 144) without discarding hand-corrected ones.
+      const _cat = entry.bpm || 120;
+      updateBatchItem(i, { status: 'Reconciling BPM…' });
+      const _srvCat = await detectBPMServer(bytes, filename);
+      if (_srvCat && Array.isArray(_srvCat.candidates) && _srvCat.candidates.length) {
+        const _snap = pickBpmCandidate(_srvCat.candidates, _cat);
+        if (Math.abs(_snap - _cat) / _cat <= 0.05) {
+          applyBPM(_cat);                                  // librosa confirms catalogued octave → keep verified value
+        } else {
+          const _libPick = pickBpmCandidate(_srvCat.candidates, null);
+          console.warn(`[Batch] "${entry.title || filename}" catalogued BPM ${_cat} disagrees with librosa (raw ${_srvCat.raw_bpm}, cands [${_srvCat.candidates}]) → using librosa ${_libPick}`);
+          applyBPM(_libPick);                              // catalogued is suspect → prefer librosa
+        }
+      } else {
+        applyBPM(_cat);                                    // librosa unavailable → trust catalogued
+      }
       if (entry.title)  document.getElementById('title').value  = entry.title;
       if (entry.artist) document.getElementById('artist').value = entry.artist;
       if (entry.genre) {
