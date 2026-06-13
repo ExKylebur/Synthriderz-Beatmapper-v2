@@ -932,6 +932,31 @@ def convert_to_ogg(input_bytes: bytes, input_ext: str, silence_secs: float = 0.0
             return f.read()
 
 
+def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict:
+    """Robust tempo estimate for one audio file via librosa's beat tracker (MIR standard).
+
+    Runs on the FULL clip (vs the browser's first-20s autocorrelation) and returns the raw
+    estimate plus an OCTAVE-CANDIDATE FAMILY — the multiples of the raw tempo that fall in a
+    musical range. Octave error (x2 / x0.5) is the known failure mode of every tempo tracker,
+    so we don't try to pick the "true" octave from audio alone: we hand the family back and let
+    the browser reconcile it against the online lookup (authoritative human value). With no
+    lookup the browser picks the in-band candidate nearest 120. Lazy imports so the server
+    still starts if librosa is absent (the endpoint returns 503 and the browser falls back).
+
+    Returns {duration, raw_bpm, candidates:[...]} — all floats rounded to 2 dp.
+    """
+    import numpy as np
+    import librosa
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
+    duration = float(len(y) / sr) if sr else 0.0
+    raw = float(np.atleast_1d(librosa.beat.beat_track(y=y, sr=sr)[0])[0])
+    cands = sorted({round(raw * m, 2) for m in (0.25, 0.5, 1, 2, 4)
+                    if lo * 0.95 <= raw * m <= hi * 1.05})
+    if not cands:
+        cands = [round(raw, 2)]
+    return {'duration': round(duration, 3), 'raw_bpm': round(raw, 2), 'candidates': cands}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -1043,6 +1068,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/analyse_stems":
             self._handle_analyse_stems()
+            return
+        if path == "/detect_bpm":
+            self._handle_detect_bpm()
             return
         if path != "/convert":
             self.send_response(404)
@@ -1401,6 +1429,82 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(msg_bytes)
             print(f'  /analyse_stems ERROR: {ex}')
+
+    def _handle_detect_bpm(self):
+        """POST /detect_bpm — multipart with an 'audio' file.
+
+        Robust tempo estimate via librosa (the MIR-standard beat tracker) on the FULL clip —
+        replaces the browser's first-20s JS autocorrelation, which produced octave errors
+        (e.g. a 144-BPM song stored as 103). Returns the raw estimate PLUS an octave-candidate
+        family so the browser can reconcile against the online lookup (snap to the candidate
+        nearest the looked-up value); with no lookup it picks the in-band candidate near 120.
+        Returns 503 if librosa isn't installed (browser then falls back to its JS detector)."""
+        try:
+            bpm_info = None  # set after we know librosa is importable
+            import librosa  # noqa: F401  (presence check; real work in detect_bpm_librosa)
+        except Exception as ex:
+            payload = json.dumps({'error': f'librosa unavailable: {ex}'}).encode('utf-8')
+            self.send_response(503)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(payload))
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        content_type   = self.headers.get('Content-Type', '')
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        try:
+            boundary_match = re.search(r'boundary=([^;\r\n]+)', content_type)
+            if not boundary_match:
+                raise ValueError('No multipart boundary in Content-Type')
+            boundary = boundary_match.group(1).strip().encode()
+            audio_bytes, audio_ext = None, '.mp3'
+            for part in body.split(b'--' + boundary)[1:]:
+                if part.strip() in (b'', b'--', b'--\r\n'):
+                    continue
+                sep = b'\r\n\r\n' if b'\r\n\r\n' in part else b'\n\n'
+                if sep not in part:
+                    continue
+                header_block, _, part_body = part.partition(sep)
+                headers  = header_block.decode('utf-8', errors='replace')
+                fn_match = re.search(r'filename=["\']?([^"\';\r\n]+)', headers)
+                name     = re.search(r'name=["\']([^"\']+)["\']', headers)
+                part_body = re.sub(rb'\r?\n$', b'', part_body)
+                if name and name.group(1) == 'audio' and part_body:
+                    audio_bytes = part_body
+                    if fn_match:
+                        audio_ext = os.path.splitext(fn_match.group(1).strip())[1].lower() or '.mp3'
+            if audio_bytes is None:
+                raise ValueError("No 'audio' field found in multipart body")
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = os.path.join(tmpdir, 'clip' + audio_ext)
+                with open(tmp, 'wb') as f:
+                    f.write(audio_bytes)
+                bpm_info = detect_bpm_librosa(tmp)
+            print(f"  /detect_bpm — {len(audio_bytes)//1024} KB {audio_ext} → "
+                  f"raw={bpm_info['raw_bpm']} cands={bpm_info['candidates']}")
+
+            payload = json.dumps(bpm_info, separators=(',', ':')).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(payload))
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(payload)
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            msg_bytes = json.dumps({'error': str(ex)}).encode('utf-8')
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(msg_bytes))
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(msg_bytes)
+            print(f'  /detect_bpm ERROR: {ex}')
 
     def _handle_export(self):
         """Receive multipart form with track JSON + audio file, return .synth ZIP.

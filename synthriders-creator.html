@@ -7389,6 +7389,36 @@ function parseFilename(filename) {
 // Detect if running via local server (enables ffmpeg conversion + Demucs)
 const SERVER_MODE = location.protocol === 'http:' && (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
 
+// ── Server-side librosa BPM detection ─────────────────────────────────────────
+// librosa (MIR-standard beat tracker) on the FULL clip replaces the browser's first-20s JS
+// autocorrelation, which produced octave errors (e.g. a 144-BPM song detected/stored as 103).
+// Returns {duration, raw_bpm, candidates:[octave family]} or null when unavailable (no server,
+// librosa not installed → 503, or any failure) so the caller transparently falls back to the
+// JS detectBPM(). Octave selection is deferred to pickBpmCandidate (reconciled vs the lookup).
+async function detectBPMServer(bytes, filename) {
+  if (!SERVER_MODE) return null;
+  try {
+    const fd = new FormData();
+    fd.append('audio', new Blob([bytes]), filename || 'audio.mp3');
+    const r = await fetch('/detect_bpm', { method: 'POST', body: fd });
+    if (!r.ok) return null;                       // 503 = librosa absent → JS fallback
+    const d = await r.json();
+    return (d && Array.isArray(d.candidates) && d.candidates.length) ? d : null;
+  } catch { return null; }
+}
+
+// Pick a BPM from librosa's octave-candidate family. WITH a reference (online lookup / library)
+// snap to the nearest candidate — librosa fixes the tempo grid, the reference fixes the octave.
+// WITHOUT one, prefer the in-band candidate nearest the felt 120 (same bias the JS detector had;
+// the online-lookup step then reconciles when title/artist are known).
+function pickBpmCandidate(cands, ref) {
+  if (!cands || !cands.length) return null;
+  if (ref) return +cands.reduce((a, b) => Math.abs(b - ref) < Math.abs(a - ref) ? b : a).toFixed(2);
+  const inBand = cands.filter(c => c >= 60 && c <= 200);
+  const pool = inBand.length ? inBand : cands;
+  return +pool.reduce((a, b) => Math.abs(b - 120) < Math.abs(a - 120) ? b : a).toFixed(2);
+}
+
 // ── Demucs availability flag ──────────────────────────────────────────────
 // Set at page load by probing /check_demucs. Used by expandToNotes to decide
 // whether to call analyseAudioServer (Demucs) or analyseAudio (JS fallback).
@@ -7490,10 +7520,21 @@ document.getElementById('audioFile').addEventListener('change', async e => {
     document.getElementById('clipStart').value = '0:00';
     document.getElementById('clipEnd').value   = secsToMmss(musicDur);
 
-    // Parse filename + detect BPM
+    // Parse filename + detect BPM. Prefer server-side librosa (full-clip, MIR-standard);
+    // fall back to the JS autocorrelation when the server/librosa is unavailable.
     const parsed = parseFilename(filename);
     statusEl.textContent = 'Detecting BPM…';
-    const detectedBpm = await detectBPM(audioBuffer);
+    let detectedBpm;
+    window._bpmCandidates = null;
+    const _srvBpm = await detectBPMServer(bytes, filename);
+    if (_srvBpm) {
+      window._bpmCandidates = _srvBpm.candidates;
+      detectedBpm = pickBpmCandidate(_srvBpm.candidates, null);
+      console.log(`[BPM] librosa raw=${_srvBpm.raw_bpm} cands=[${_srvBpm.candidates}] → ${detectedBpm} (octave reconciled vs lookup if title/artist known)`);
+    } else {
+      detectedBpm = await detectBPM(audioBuffer);
+      console.log(`[BPM] JS autocorrelation → ${detectedBpm}${SERVER_MODE ? ' (librosa unavailable — fell back)' : ''}`);
+    }
 
     const bpmEl = document.getElementById('bpm');
     window._detectedBpm = detectedBpm;
@@ -7541,6 +7582,22 @@ document.getElementById('audioFile').addEventListener('change', async e => {
         const looked = await lookupBPMProgrammatic(_t, _a);
         if (!looked || _bpmProtected) return;
         const cur = parseFloat(document.getElementById('bpm').value) || detectedBpm;
+        // Octave reconciliation: when we have librosa's candidate family, trust its tempo grid
+        // and let the lookup choose the octave — snap to the candidate nearest the looked-up
+        // value. This auto-fixes the half/double errors (e.g. 72↔144) without bothering the
+        // user. Only fall through to the manual Use/Keep banner if even the best candidate
+        // still disagrees with the lookup (genuine conflict, not just an octave).
+        const cands = window._bpmCandidates;
+        if (cands && cands.length) {
+          const snapped = cands.reduce((a, b) => Math.abs(b - looked) < Math.abs(a - looked) ? b : a);
+          if (Math.abs(snapped - looked) / looked <= 0.05) {
+            if (Math.abs(snapped - cur) > 0.01) {
+              applyBPM(+snapped.toFixed(2));
+              console.log(`[BPM] reconciled librosa↔lookup → ${snapped} (lookup said ${looked}, was ${cur})`);
+            }
+            return;
+          }
+        }
         if (cur > 0 && Math.abs(looked - cur) / cur > 0.03) showBpmLookupBanner(+cur.toFixed(2), looked);
       })().catch(() => {});
     }
@@ -13302,15 +13359,31 @@ async function _processBatchItem(file, i) {
   // 5. If not from library: detect BPM + look up online + fetch cover/genre
   if (!fromLib) {
     updateBatchItem(i, { status: 'Detecting BPM…' });
-    const detectedBpm = await detectBPM(audioBuffer);
-    applyBPM(detectedBpm);
+    // Server-side librosa first (full-clip), JS autocorrelation as fallback — same as upload.
+    const _srvBpm = await detectBPMServer(bytes, filename);
+    let _cands = null;
+    if (_srvBpm) {
+      _cands = _srvBpm.candidates;
+      applyBPM(pickBpmCandidate(_cands, null));
+    } else {
+      applyBPM(await detectBPM(audioBuffer));
+    }
 
     const title  = document.getElementById('title').value.trim();
     const artist = document.getElementById('artist').value.trim();
     if (title && artist) {
       updateBatchItem(i, { status: 'Looking up BPM…' });
       const onlineBpm = await lookupBPMProgrammatic(title, artist);
-      if (onlineBpm) applyBPM(onlineBpm);
+      if (onlineBpm) {
+        // Octave reconciliation: snap librosa's tempo grid to the looked-up octave when close;
+        // otherwise defer to the lookup value (its own authority) as before.
+        if (_cands && _cands.length) {
+          const snapped = _cands.reduce((a, b) => Math.abs(b - onlineBpm) < Math.abs(a - onlineBpm) ? b : a);
+          applyBPM(Math.abs(snapped - onlineBpm) / onlineBpm <= 0.05 ? +snapped.toFixed(2) : onlineBpm);
+        } else {
+          applyBPM(onlineBpm);
+        }
+      }
 
       updateBatchItem(i, { status: 'Fetching cover art…' });
       await fetchAppleCoverArt(title, artist, { silent: true });
