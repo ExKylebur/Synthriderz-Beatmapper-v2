@@ -5467,22 +5467,25 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           }
         }
       } else if (w.wallType === 'slide') {
-        // slideType 0 = Slide Right → box LEFT (cols 0-4 blocked)
-        // slideType 4 = Slide Left  → box RIGHT (cols 10-14 blocked)
+        // slideType 0 = Slide Right → box on the RIGHT (cols 10-14 blocked)
+        // slideType 4 = Slide Left  → box on the LEFT  (cols 0-4 blocked)
         // slideType 3 = Center      → full-width low barrier
+        // Calibrated to the 3D renderer + play-test: slideType 0 uses boxX=-1.9 (same as
+        // leanLeft), which the P3D.x=-3.5 flip renders on the screen-RIGHT — so clear the
+        // RIGHT side. (Was inverted; right-hand notes landed buried inside the box.)
         const sType = w.slideType ?? 0;
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
-          if (sType === 0) {
-            if (n.type === 1 && col < 4) n._x = COL_X[4 + Math.floor(Math.random() * 4)]; // cols 4–7
-            if (n.type === 2 && col < 4) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
-            if (n.type === 3 && col < 5) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
-          } else if (sType === 4) {
+          if (sType === 0) {            // box on RIGHT — clear right-side notes
             if (n.type === 0 && col > 10) n._x = COL_X[7 + Math.floor(Math.random() * 4)]; // cols 7–10
             if (n.type === 2 && col > 10) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
             if (n.type === 3 && col > 9)  n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
+          } else if (sType === 4) {     // box on LEFT — clear left-side notes
+            if (n.type === 1 && col < 4) n._x = COL_X[4 + Math.floor(Math.random() * 4)]; // cols 4–7
+            if (n.type === 2 && col < 4) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
+            if (n.type === 3 && col < 5) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
           } else if (sType === 3) {
             if (n.row >= 4 && n.row <= 6) n.row = Math.random() < 0.5
               ? Math.max(diffRowMin, n.row - 3)
@@ -6880,8 +6883,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     //   right-side obstacle blocks right hand from far-right (cols 11-14) → maxCol 10
     //   left-side  obstacle blocks left  hand from far-left  (cols 0-3)   → minCol 4
     const railLimit = (hand, w) => {
-      const rightObs = w.wallType === 'leanLeft'  || (w.wallType === 'slide' && (w.slideType ?? 0) === 4);
-      const leftObs  = w.wallType === 'leanRight' || (w.wallType === 'slide' && (w.slideType ?? 0) === 0);
+      // slideType 0 (Slide Right) renders box on the RIGHT, slideType 4 (Slide Left) on the LEFT
+      // — matches applyObstacleOcclusion's slide mapping (calibrated to the renderer + play-test).
+      const rightObs = w.wallType === 'leanLeft'  || (w.wallType === 'slide' && (w.slideType ?? 0) === 0);
+      const leftObs  = w.wallType === 'leanRight' || (w.wallType === 'slide' && (w.slideType ?? 0) === 4);
       if (rightObs && hand === 0) return { maxCol: 10 };
       if (leftObs  && hand === 1) return { minCol: 4 };
       return null;
