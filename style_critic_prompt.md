@@ -23,7 +23,7 @@ These are correct by design. Never penalize them:
 - **Anticipation drift:** the note 1–2 beats before a big move (rail start, gold, corner, large jump) is shifted ~60% toward the target — intentional telegraphing.
 - **Spectral-flux+HFC onsets:** slightly higher melodic (vocal/other) note density is correct.
 - **Rhythm coherence:** bass/guitar/vocal ORBS on finer subdivisions between drum hits are removed; reduced bass/guitar orb density when drums carry the cadence is intentional (sustained rails exempt).
-- **Squat underrail:** every crouch ≥3 s gets a rail underneath. `squats_with_underrail_pct` = 0% just means no long crouches — don't flag unless 3+ long crouches exist and it's <50%.
+- **Squat underrail:** every crouch ≥3 s automatically gets a rail underneath at generation time — coverage is enforced mechanically and you cannot verify it from the summary. **NEVER flag `squats_with_underrail_pct` or suggest adding underrails**, at any value; echo the metric and move on.
 - **Final sweep:** C1/C2 are mechanically cleared, so any that remain are rare real edge cases — flag with the SPECIFIC beat, don't give generic "fix C1/C2" advice.
 
 ### Choreographed patterns (pattern-tagged notes)
