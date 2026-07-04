@@ -921,9 +921,9 @@
             gameplay-breaking violations (C1–C5). Preserves musical structure more faithfully.
           </div>
           <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;"
-            title="By default, the generator fetches section labels (Chorus, Verse, Bridge, etc.) from the song's lyrics and uses them as precise timing anchors for the section map. Check this to ignore lyric structure and rely only on audio analysis — useful for songs with inaccurate or missing online lyrics.">
-            <input type="checkbox" id="settIgnoreLyricSections" style="accent-color:var(--accent);" />
-            <span>Ignore lyric section anchors</span>
+            title="When enabled, the generator fetches section labels (Chorus, Verse, Bridge, etc.) from the song's lyrics via web search and uses them as precise timing anchors. This is OFF by default because web search pulls in large page content that counts as input tokens — a single search can exceed a low per-minute rate limit and block generation. Uncheck ONLY if your API tier has a high input-tokens/min limit; otherwise leave it checked and the generator relies on audio analysis (still works well).">
+            <input type="checkbox" id="settIgnoreLyricSections" style="accent-color:var(--accent);" checked />
+            <span>Ignore lyric section anchors (web search — off by default)</span>
           </label>
           <div style="font-size:10px;color:var(--muted);margin-top:-4px;padding-left:24px;line-height:1.4;">
             By default, section boundaries (Chorus, Verse, Bridge…) are anchored to<br>
@@ -935,8 +935,8 @@
             <select id="settModel" style="width:100%;background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:11px;"
               title="Haiku 4.5: fast &amp; cheap. Sonnet 3.5: better quality, ~3× cost. Opus 3: highest quality, ~15× cost.">
               <option value="claude-haiku-4-5-20251001" selected>Haiku 4.5 — fast, low cost (default)</option>
-              <option value="claude-3-5-sonnet-20241022">Sonnet 3.5 — better flow &amp; scoring (~3× cost)</option>
-              <option value="claude-3-opus-20240229">Opus 3 — highest quality (~15× cost)</option>
+              <option value="claude-sonnet-5">Sonnet 5 &mdash; better flow &amp; scoring (~3&times; cost)</option>
+              <option value="claude-opus-4-8">Opus 4.8 &mdash; highest quality (~5&times; cost)</option>
             </select>
             <div style="font-size:10px;color:var(--muted);margin-top:3px;line-height:1.4;">
               Applies to section generation and style critique passes only.<br>
@@ -2153,7 +2153,7 @@ async function lookupBPM() {
     const data = await callAnthropic(apiKey, {
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 300,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
       messages: [{
         role: 'user',
         content: 'What is the exact BPM of "' + title + '" by ' + artist + '? Search for it. Respond ONLY with JSON: {"bpm": 120, "source": "site name", "note": "any useful context"} — no other text, no markdown.'
@@ -2406,12 +2406,14 @@ Return ONLY a JSON array, no markdown:
 
 Aim for 4–16 cues. beat must be 0–${beats}. If unfamiliar with this song, return [].`;
 
-    // First attempt: web search for actual lyrics
+    // Rate-limit-safe path: web search pulls large page content into the request as INPUT
+    // tokens and a single search can exceed a low per-minute limit, blocking generation.
+    // LRCLIB above already handled the accurate (synced-timestamp) case; here we fall back to
+    // the model's own knowledge (no web_search) rather than risk a 429 that aborts the map.
     let data = await callAnthropic(apiKey, {
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1200,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages: [{ role: 'user', content: promptWithSearch }],
+      messages: [{ role: 'user', content: promptFallback }],
     });
 
     // Fallback: content filter blocked the lyrics output — retry without web search
@@ -2540,7 +2542,7 @@ Rules:
   const data = await callAnthropic(apiKey, {
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 800,
-    tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
     messages: [{ role: 'user', content: prompt }],
   });
   if (data.error) throw new Error(data.error.message);
@@ -3493,76 +3495,100 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   if (colMaxConstraint !== null) colMax = Math.min(colMax, colMaxConstraint);
   const startCol = colIdxOf(xStart);
 
-  // ── Circular arc parametrization ────────────────────────────────────────────
-  // The rail traces an elliptical arc in col × row space.  totalRotation controls
-  // how much of the circle is swept — from a gentle quarter-arc on short rails up
-  // to a full rotation (2π) or spiral (>2π) on long rails.
-  //
-  // Rotation bands by rail length (in beats):
-  //   < 2.5  →  45°–135°  (gentle sway)
-  //   2.5–5  →  120°–240° (quarter to two-thirds arc)
-  //   5–8    →  210°–315° (three-quarter arc)
-  //   8–12   →  300°–360° (near-full or full circle)
-  //   12+    →  360°–450° (full circle + spiral overlap)
+  // ── Rail path parametrization — shape palette ───────────────────────────────
+  // The rail traces a path in col x row space parametrized over t in [0,1]. The classic
+  // shape is an elliptical arc (totalRotation bands by length, up to a full spiral); it
+  // stays DOMINANT (50%), with three new shapes for variety on medium/long rails, same
+  // philosophy as [DenseSweep]'s move library:
+  //   wave     — lateral travel across the zone with a sine row contour (S-curve)
+  //   zigzag   — lateral travel with a triangle row contour (sawtooth; sharper feel)
+  //   pendulum — side-to-side sway around the start col, dipping at the extremes
+  // All shapes are anchored at (startCol, rowStart) at t=0, clamped per-waypoint to the
+  // zone [colMin,colMax] and rows [1,8] (same band the ellipse centre-constraint enforced,
+  // keeping companions/fixC1 and the C4 floor budget safe), and share the waypoint cadence
+  // (node gaps stay renderable). Short rails (<2.5 beats) always use the ellipse — the new
+  // shapes need travel room to read.
   const rng = Math.random();
-  let totalRotation;
-  // Short rails get more aggressive curvature so they feel like distinct curves
-  // rather than mild bends. Minimum rotation increased for short/medium rails.
-  if      (len < 2.5)  totalRotation = Math.PI * (0.75 + rng * 0.75);   // 135–270° (was 45–135°)
-  else if (len < 5)    totalRotation = Math.PI * (1.00 + rng * 0.75);   // 180–315° (was 120–240°)
-  else if (len < 8)    totalRotation = Math.PI * (1.25 + rng * 0.75);   // 225–360° (was 210–315°)
-  else if (len < 12)   totalRotation = Math.PI * (1.75 + rng * 0.25);   // 315–360° (unchanged)
-  else                 totalRotation = Math.PI * (2.00 + rng * 0.50);   // 360–450° (unchanged)
+  const _shapeRoll = Math.random();
+  const railShape = (len < 2.5 || _shapeRoll < 0.50) ? 'ellipse'
+                  : _shapeRoll < 0.75 ? 'wave'
+                  : _shapeRoll < 0.90 ? 'zigzag'
+                  :                     'pendulum';
+  let posAt;                                       // t in [0,1] -> { col, row } (unclamped)
+  if (railShape === 'ellipse') {
+    // Rotation bands by rail length (beats): short rails get aggressive curvature so they
+    // feel like distinct curves; long rails sweep up to a full circle + spiral overlap.
+    let totalRotation;
+    if      (len < 2.5)  totalRotation = Math.PI * (0.75 + rng * 0.75);   // 135-270 deg
+    else if (len < 5)    totalRotation = Math.PI * (1.00 + rng * 0.75);   // 180-315 deg
+    else if (len < 8)    totalRotation = Math.PI * (1.25 + rng * 0.75);   // 225-360 deg
+    else if (len < 12)   totalRotation = Math.PI * (1.75 + rng * 0.25);   // 315-360 deg
+    else                 totalRotation = Math.PI * (2.00 + rng * 0.50);   // 360-450 deg
+    if (Math.random() < 0.5) totalRotation = -totalRotation;              // random CW/CCW
+    // Ellipse radii — capped so the arc stays within a playable reach envelope;
+    // swayBoost (critic hint) amplifies for more dramatic arcs.
+    const zoneHalf  = (colMax - colMin) / 2;
+    const radiusCol = Math.min(zoneHalf * 0.55, Math.max(1, (1 + Math.floor(rng * 3)) * swayBoost));
+    // Cap radiusRow at 4 so centerRow constraint [1+r, 8-r] always has a valid range.
+    const radiusRow = Math.min(4, Math.max(1, (1 + Math.floor(Math.random() * 3)) * swayBoost));
+    const startAngle = Math.random() * 2 * Math.PI;
+    // Centre derived from start position + angle; centerRow constrained so the whole arc
+    // (centerRow +/- radiusRow) stays within rows 1-8 (row 9/10 = C4 floor group).
+    const centerCol = startCol - radiusCol * Math.cos(startAngle);
+    const centerRow = Math.max(1 + radiusRow, Math.min(8 - radiusRow,
+                        rowStart - radiusRow * Math.sin(startAngle)));
+    posAt = t => {
+      const a = startAngle + t * totalRotation;
+      return { col: centerCol + radiusCol * Math.cos(a), row: centerRow + radiusRow * Math.sin(a) };
+    };
+  } else if (railShape === 'wave' || railShape === 'zigzag') {
+    // Lateral travel from startCol toward the far side of the zone, with a row contour.
+    const target = startCol < (colMin + colMax) / 2 ? colMax - 1 : colMin + 1;
+    const amp    = Math.min(3, Math.max(1.5, 1.5 * swayBoost));
+    if (railShape === 'wave') {
+      const cyc = Math.max(1, Math.round(len / 4));          // one sine cycle per ~4 beats
+      posAt = t => ({ col: startCol + (target - startCol) * t,
+                      row: rowStart + amp * Math.sin(t * cyc * 2 * Math.PI) });
+    } else {
+      const zigs = Math.max(2, Math.round(len / 1.5));       // direction change per ~1.5 beats
+      const triS = u => { const ph = ((u % 1) + 1) % 1;      // signed triangle: 0 -> 1 -> -1 -> 0
+        return ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4; };
+      posAt = t => ({ col: startCol + (target - startCol) * t,
+                      row: rowStart + amp * triS(t * zigs / 2) });
+    }
+  } else {
+    // Pendulum: sway around the start col, dipping (rows increase) at the swing extremes.
+    const zoneHalf = (colMax - colMin) / 2;
+    const swing = Math.min(zoneHalf * 0.8, 2 + 2 * swayBoost);
+    const cyc   = Math.max(1, Math.round(len / 5));
+    posAt = t => {
+      const s = Math.sin(t * cyc * 2 * Math.PI);
+      return { col: startCol + swing * s, row: rowStart + 2 * Math.abs(s) };
+    };
+  }
 
-  // Random CW (negative) or CCW (positive)
-  if (Math.random() < 0.5) totalRotation = -totalRotation;
-
-  // Ellipse radii — capped so arc stays within a playable reach envelope
-  // swayBoost (from critic hints) amplifies radii for more dramatic arcs
-  const zoneHalf  = (colMax - colMin) / 2;
-  const radiusCol = Math.min(zoneHalf * 0.55, Math.max(1, (1 + Math.floor(rng * 3)) * swayBoost));
-  // Cap radiusRow at 4 so centerRow constraint [1+r, 9-r] always has a valid range.
-  // With radiusRow=4: center must be 5 (tight but valid). radiusRow=5 would break the guarantee.
-  const radiusRow = Math.min(4, Math.max(1, (1 + Math.floor(Math.random() * 3)) * swayBoost));
-
-  // startAngle: choose so the arc begins at (startCol, rowStart).
-  // We randomise it so the arc shape varies even when start/end positions repeat.
-  const startAngle = Math.random() * 2 * Math.PI;
-
-  // Centre of the ellipse derived from start position + start angle.
-  // Constrain centerRow so the arc (centerRow ± radiusRow) stays entirely
-  // within rows 1–8.  Row 9 and row 10 are in the C4 "floor group" (limit 1%);
-  // letting arcs reach row 9 causes companions snapped there to push floor% over
-  // the threshold. Capping at 8-radiusRow guarantees all waypoints/endpoints ≤ 8.
-  const centerCol = startCol - radiusCol * Math.cos(startAngle);
-  const centerRow = Math.max(1 + radiusRow, Math.min(8 - radiusRow,
-                      rowStart - radiusRow * Math.sin(startAngle)));
-
-  // Natural endpoint of the arc — no clamping needed; center constraint guarantees in-range
-  const endAngle   = startAngle + totalRotation;
-  const arcEndCol  = Math.max(colMin, Math.min(colMax, Math.round(centerCol + radiusCol * Math.cos(endAngle))));
-  const arcEndRow  = Math.round(centerRow + radiusRow * Math.sin(endAngle));
-
-  // Waypoints: short rails get more per beat so tight curves render smoothly;
-  // longer rails scale by arc angle as before.
+  // Waypoints: short rails get more per beat so tight curves render smoothly; zigzag needs
+  // nodes at its direction changes; everything else scales with length. Cap 12 (render limit).
   const numWP = Math.min(12, Math.max(2,
-    len < 3 ? Math.round(len * 3)                                // 3 waypoints/beat for short
-            : Math.round(Math.abs(totalRotation) / Math.PI * 3) // arc-angle scaling for longer
+    railShape === 'zigzag' ? Math.max(Math.round(len / 1.5) * 2, Math.round(len))
+    : len < 3              ? Math.round(len * 3)
+                           : Math.round(len * 1.2)
   ));
 
   const waypoints = [];
   for (let i = 1; i <= numWP; i++) {
-    const t     = i / (numWP + 1);
-    const angle = startAngle + t * totalRotation;
-
-    // Center constraint guarantees wpRow stays within [1,9] — no hard clamp needed
-    const wpCol = Math.max(colMin, Math.min(colMax, Math.round(centerCol + radiusCol * Math.cos(angle))));
-    const wpRow = Math.round(centerRow + radiusRow * Math.sin(angle));
+    const t   = i / (numWP + 1);
+    const p   = posAt(t);
+    const wpCol = Math.max(colMin, Math.min(colMax, Math.round(p.col)));
+    const wpRow = Math.max(1, Math.min(8, Math.round(p.row)));
     const beat  = Math.round((startBeat + len * t) / snapSz) * snapSz;
     waypoints.push({ beat, row: wpRow, _x: COL_X[wpCol] });
   }
 
-  // Return arc-determined endpoint so callers can store the true end position
+  // Path-determined endpoint so callers can store the true end position
+  const pEnd = posAt(1);
+  const arcEndCol = Math.max(colMin, Math.min(colMax, Math.round(pEnd.col)));
+  const arcEndRow = Math.max(1, Math.min(8, Math.round(pEnd.row)));
   return { waypoints, xEnd: COL_X[arcEndCol], rowEnd: arcEndRow };
 }
 
@@ -3827,7 +3853,16 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   }
 
   const events = extractNoteEvents(analysis, bpm, diff, { ...hints, _sections: sections });
-  if (events.length < 10) return { notes: [], walls: [] };
+  if (events.length < 10) {
+    // Loud diagnostic: this is the ONLY silent zero-notes path. If a song ever generates
+    // "0 notes", this line says whether the analysis fed us an empty/near-empty event list
+    // (bad stems / server fail / disabled stems) vs a downstream problem.
+    console.error(`[Generator] extractNoteEvents produced only ${events.length} event(s) (<10) — returning empty map. ` +
+      `analysis: bass=${analysis?.bassOnsets?.length ?? 'n/a'} mid=${analysis?.midOnsets?.length ?? 'n/a'} ` +
+      `high=${analysis?.highOnsets?.length ?? 'n/a'} regions=${analysis?.sustainedRegions?.length ?? 'n/a'} ` +
+      `duration=${analysis?.duration ?? 'n/a'} bpm=${bpm}`);
+    return { notes: [], walls: [] };
+  }
 
   const result       = [];
   const beatOccupied = new Set();
@@ -5431,39 +5466,43 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (n.row <= 3) n.row = 4 + Math.floor(Math.random() * 4); // rows 4-7
         }
       } else if (w.wallType === 'leanLeft') {
-        // LeanLeft: obstacle on the RIGHT side. Player leans left.
-        // Obstructed zone: far-right columns (11–14) for right hand.
-        //   Right hand → cols 8–10 · Left hand → cols 2–5 · Green → 8–11 · Gold → 6–9
+        // LeanLeft: obstacle on the RIGHT side. Player leans LEFT (AWAY from the obstacle).
+        // Unlike a slide (player translates TOWARD the cleared zone), a lean shifts the
+        // reachable zone toward the OFF-obstacle side — so the obstacle-side hand (right) +
+        // green/gold must be pulled in to CENTER, not just off the extreme. The triangular
+        // wall is also widest at the top, so leaving notes at cols 8–10 sat them under it.
+        //   Right hand → cols 6–8 · Left hand → cols 2–5 (reachable, leaned into) · Green/Gold → 5–8
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 0) {
-            if (col > 10) n._x = COL_X[8 + Math.floor(Math.random() * 3)]; // cols 8–10
+            if (col > 8) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 8–10)
           } else if (n.type === 1) {
             if (col > 5 || col < 2) n._x = COL_X[2 + Math.floor(Math.random() * 4)]; // cols 2–5
           } else if (n.type === 2) {
-            if (col < 8 || col > 10) n._x = COL_X[8 + Math.floor(Math.random() * 3)]; // cols 8–10 (blocks 11-14)
+            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
           } else if (n.type === 3) {
-            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
+            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
           }
         }
       } else if (w.wallType === 'leanRight') {
-        // LeanRight: obstacle on the LEFT side. Player leans right.
-        // Obstructed zone: far-left columns (0–3) for left hand.
-        //   Left hand → cols 4–6 · Right hand → cols 9–12 · Green → 3–6 · Gold → 5–8
+        // LeanRight: obstacle on the LEFT side. Player leans RIGHT (AWAY from the obstacle).
+        // Mirror of leanLeft: the obstacle-side hand (left) + green/gold are pulled in to
+        // CENTER (the lean direction); the off-obstacle hand (right) stays out — reachable.
+        //   Left hand → cols 6–8 · Right hand → cols 9–12 (reachable, leaned into) · Green/Gold → 6–9
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 1) {
-            if (col < 4 || col > 6) n._x = COL_X[4 + Math.floor(Math.random() * 3)]; // cols 4–6
+            if (col < 6) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 4–6)
           } else if (n.type === 0) {
             if (col < 9) n._x = COL_X[9 + Math.floor(Math.random() * 4)]; // cols 9–12
           } else if (n.type === 2) {
-            if (col < 4 || col > 6) n._x = COL_X[4 + Math.floor(Math.random() * 3)]; // cols 4–6 (blocks 0-3)
+            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
           } else if (n.type === 3) {
-            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
+            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
           }
         }
       } else if (w.wallType === 'slide') {
@@ -7099,17 +7138,27 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   for (const n of result) _skel.set(_skelKey(n), (_skel.get(_skelKey(n)) || 0) + 1);
   _probe('phase-boundary');
 
-  // ── [GoldSweep] widen clustered gold runs into reachable sweeps (Fix-2) ──────────────
+  // ── [GoldSweep] choreograph clustered gold runs (Fix-2, extended) ────────────────────
   // Gold orbs (both-hands) are placed at dead centre (x=0), so a run of them stacks on the
-  // centre column → "T-Rex arms" (no lateral travel). Reshape each run of 3+ consecutive gold
-  // ORBS into a lateral sweep across cols 3–11, stepping 2 cols per orb and bouncing at the
-  // edges, so both hands always reach the next orb. Rows ALSO arc (band rows 2–8, ±1 per orb —
-  // off ceiling/floor; a ≤1-row step keeps every hop reachable; a face-zone guard keeps rows 0–3
-  // off the centre cols), giving a DIAGONAL sweep with real height. Gold rails / single golds untouched.
-  // Runs AFTER GoldCap (only surviving gold swept) and before ObstacleFinal (lean can override).
+  // centre column ("T-Rex arms"). Reshape each run of 3+ consecutive gold ORBS along ONE of a
+  // small palette of paths — rotating per run, same philosophy as [DenseSweep]'s move library
+  // (gold is one orb hit by BOTH hands, so its "move" is a single path, not a two-hand pattern):
+  //   0 diagonal — lateral bounce cols 3-11 with rising/falling rows (the original sweep)
+  //   1 circle   — orbit around the band centre (gold spiral)
+  //   2 pendulum — side-to-side swing, dropping low at the extremes
+  //   3 wave     — lateral travel with a sine row contour
+  //   4 valley   — high at the edges, low through the centre (face-guard-friendly)
+  // Every applied step is capped at <=3 Manhattan (both hands travel together — same cap as
+  // the old 2-col+1-row diagonal), the face-zone guard keeps rows 0-3 off centre cols 6-8,
+  // and rows stay in the 2-8 band. Gold rails / single golds untouched. Runs AFTER GoldCap
+  // (only surviving gold swept) and before ObstacleFinal (lean can override).
   if (!hints.noGold) {
-    const GS_STEP = 2, GS_LO = 3, GS_HI = 11, GS_GAP = 1.5; // GS_GAP: max beat gap within one run
-    const rLo = Math.max(diffRowMin, 2), rHi = Math.min(diffRowMax, 8); // vertical sweep band: rows 2–8 (high reach, off ceiling/floor)
+    const GS_LO = 3, GS_HI = 11, GS_GAP = 1.5, GS_MAXSTEP = 3, GOLD_SHAPES = 5;
+    const rLo = Math.max(diffRowMin, 2), rHi = Math.min(diffRowMax, 8);
+    const cMid = (GS_LO + GS_HI) / 2, cRad = (GS_HI - GS_LO) / 2;
+    const rMid = (rLo + rHi) / 2, rRad = Math.max(1, (rHi - rLo) / 2);
+    // tri(k, p): triangle wave 0..1..0 with half-period p (peak at k=p)
+    const tri = (k, p) => { const ph = ((k % (2 * p)) + 2 * p) % (2 * p); return ph < p ? ph / p : (2 * p - ph) / p; };
     const golds = result.filter(n => n.type === 3 && n.railEndBeat === undefined)
                         .sort((a, b) => a.beat - b.beat);
     let gi = 0, gReshaped = 0;
@@ -7118,60 +7167,94 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       while (gj + 1 < golds.length && golds[gj + 1].beat - golds[gj].beat <= GS_GAP) gj++;
       const run = golds.slice(gi, gj + 1);
       if (run.length >= 3) {
-        let col = (gReshaped % 2 === 0) ? GS_LO : GS_HI;   // alternate start side per run for variety
-        let cdir = (col === GS_LO) ? 1 : -1;
-        let row = rLo, rdir = 1;
-        for (const g of run) {
-          const _gc = Math.max(GS_LO, Math.min(GS_HI, col));
-          g._x = COL_X[_gc];
-          if (rHi > rLo) {
-            let _gr = Math.max(rLo, Math.min(rHi, row));
-            if (_gc >= 6 && _gc <= 8 && _gr < 4) _gr = 4;   // face-zone guard: no high gold at the centre cols (6–8)
-            g.row = _gr;
+        const shape = gReshaped % GOLD_SHAPES;
+        const flip  = gReshaped % 2 === 0 ? 0 : 4;          // alternate start side per run
+        let prevC = null, prevR = null;
+        for (let k = 0; k < run.length; k++) {
+          let c, r;
+          if (shape === 0) {                                 // diagonal bounce (original feel)
+            c = GS_LO + (GS_HI - GS_LO) * tri(k + flip, 4);
+            r = rLo + (rHi - rLo) * tri(k, 6);
+          } else if (shape === 1) {                          // circle: 45 deg per orb, 8-orb orbit
+            const a = ((flip ? -1 : 1) * k * 45 + 180) * Math.PI / 180;
+            c = cMid + cRad * Math.cos(a);
+            r = rMid + rRad * Math.sin(a);
+          } else if (shape === 2) {                          // pendulum: swing wide, drop at extremes
+            const s = Math.sin((flip ? -1 : 1) * k * 36 * Math.PI / 180);
+            c = cMid + cRad * s;
+            r = rMid + (rHi - rMid) * Math.abs(s);
+          } else if (shape === 3) {                          // wave: travel with sine rows
+            c = GS_LO + (GS_HI - GS_LO) * tri(k + flip, 4);
+            r = rMid + rRad * Math.sin(k * 60 * Math.PI / 180);
+          } else {                                           // valley: high edges, low centre
+            c = GS_LO + (GS_HI - GS_LO) * tri(k + flip, 4);
+            r = rLo + (rHi - rLo) * (1 - Math.abs(c - cMid) / cRad);
           }
-          col += GS_STEP * cdir;
-          if (col >= GS_HI) { col = GS_HI; cdir = -1; }
-          else if (col <= GS_LO) { col = GS_LO; cdir = 1; }
-          row += rdir;
-          if (row >= rHi) { row = rHi; rdir = -1; }
-          else if (row <= rLo) { row = rLo; rdir = 1; }
+          c = Math.max(GS_LO, Math.min(GS_HI, Math.round(c)));
+          r = Math.max(rLo,  Math.min(rHi,  Math.round(r)));
+          if (prevC !== null) {                              // reachability cap: both hands travel together
+            const dC = c - prevC, dR = r - prevR, manh = Math.abs(dC) + Math.abs(dR);
+            if (manh > GS_MAXSTEP) {
+              const sc = GS_MAXSTEP / manh;
+              c = Math.round(prevC + dC * sc);
+              r = Math.round(prevR + dR * sc);
+            }
+          }
+          if (c >= 6 && c <= 8 && r < 4) r = 4;              // face-zone guard: no high gold at centre cols
+          prevC = c; prevR = r;
+          const g = run[k];
+          g._x = COL_X[c];
+          if (rHi > rLo) g.row = r;
+          g._goldSweep = true;                               // tag choreographed gold so the critic can distinguish pattern vs loose placement
         }
         gReshaped++;
       }
       gi = gj + 1;
     }
-    if (gReshaped > 0) console.log(`[GoldSweep] Widened ${gReshaped} clustered gold run(s) into reachable diagonal sweeps`);
+    if (gReshaped > 0) console.log(`[GoldSweep] Choreographed ${gReshaped} gold run(s) across ${GOLD_SHAPES} path shapes`);
   }
 
   // ── [DenseSweep] flowing groups for dense runs (v2) ───────────────────────────────────
   // In tight/dense sections the per-note arc + jitter scatter notes across the grid (hectic).
-  // This reshapes dense runs of FREE orbs into smooth, readable GROUPS -- like [GoldSweep] --
-  // built from SHORT segments of varied motion (left/right, up/down, diagonal, plus SPIRAL and
-  // SPIKE shapes from synth_mapping_helper's pattern_generation), rotated through DSW_PALETTE
-  // for variety rather than one long diagonal. BOTH hands move in PARALLEL ("same
-  // fashion"): a single lateral `offset` (0..7) + `row` cursor advances once per beat, so a
-  // simultaneous red/blue pair lands at the same offset within each hand's zone (right = 7+off,
-  // left = 0+off) and travels together. Only fires on dense runs (<=0.5-beat spacing, >=4 orbs
-  // over >=3 beats); sparser sections keep the normal arc flow. Protects rails, rail companions
-  // (_comp), gold, green. Placed by GoldSweep so FinalSweep (C1/C2) + occlusion run after;
-  // [Crossover] skips dense passages so it won't fight these.
+  // This reshapes dense runs of FREE orbs into smooth, readable GROUPS built from a LIBRARY of
+  // choreographed TWO-HAND MOVES (parallel/mirror spirals, scissors, staccato punches, jabs,
+  // stairs, accordion, wings, DNA helix, pendulum, bloom, box step, heartbeat + a controlled
+  // cross-body). A dense run walks ONE move, one step per beat, then rotates to the next when
+  // the move ends (~6-8 beats), so a long run reads as varied choreography instead of one
+  // motion. Reds take the move's right-hand spot, blues the left; a null hand holds its last
+  // spot. Each applied step is reachability-capped. Only fires on dense runs (<=0.5-beat
+  // spacing, >=4 orbs over >=3 beats); sparser sections keep the normal arc flow. Protects
+  // rails, rail companions (_comp), gold, green. Placed by GoldSweep so FinalSweep (C1/C2) +
+  // occlusion run after; [Crossover] skips dense passages so it won't fight these. The same
+  // shapes are previewed in move_playbook.html.
   if (DENSE_SWEEP) {
-    const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_CSTEP = 2, DSW_SEG = 3;
+    const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_MAXSTEP = 3;
     const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
-    // Motion palette — linear backbone (0=horiz 1=vert 2=diag) plus spiral(3) + spike(4) "spice"
-    // ported from synth_mapping_helper's pattern_generation (spiral = rotate offset+row around a
-    // centre; spike = dart out-and-back), for target variety. Linear stays dominant (6/8); set
-    // DENSE_SHAPES=false (palette [0,1,2]) to restore the original linear-only behaviour.
-    const DENSE_SHAPES = true;
-    const DSW_PALETTE  = DENSE_SHAPES ? [0, 1, 2, 3, 0, 1, 2, 4] : [0, 1, 2];
-    const DSW_ASTEP    = 45;                            // spiral degrees/beat (≈8-beat circle)
-    const DSW_OFF_CTR  = 3.5, DSW_OFF_RAD = 3.0;        // spiral lateral centre/radius (within offset 0..7)
-    const DSW_MAXSTEP  = 3;                             // max Manhattan move/beat (reachability cap; = diagonal baseline)
-    const dRowCtr = (dRowLo + dRowHi) / 2, dRowRad = (dRowHi - dRowLo) / 2;
+    const clRow = r => Math.max(dRowLo, Math.min(dRowHi, Math.round(r)));
+    const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
+    // Move library — each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null }
+    // steps (col 0-14, row 1-9, 5 = centre). `cross` lets a move reach across the centre line.
+    const MOVES = [];
+    const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
+    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
+    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
+    { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
+    { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
+    { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
+    { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
+    { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
+    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const t = k / (N - 1), row = cc(5 - 3 * Math.sin(t * 2 * Math.PI), 1, 9); s.push({ l: [cc(1 + 5 * t, 0, 7), row], r: [cc(13 - 5 * t, 7, 14), row] }); } addMove('mirrorWings', false, s); }
+    { const a = [3, 5, 7, 9, 7, 5, 3], b = [11, 9, 7, 5, 7, 9, 11]; addMove('crossReturn', true, a.map((v, k) => ({ l: [v, 4], r: [b[k], 6] }))); }  // hands cross at DIFFERENT rows (4/6) — same-cell collision guard
+    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const a = k / (N - 1) * 2 * Math.PI, t = k / (N - 1); s.push({ l: [cc(2 + 4 * t, 0, 7), cc(5 - 3 * Math.sin(a), 1, 9)], r: [cc(8 + 4 * t, 7, 14), cc(5 - 3 * Math.sin(a + Math.PI), 1, 9)] }); } addMove('dnaHelix', false, s); }
+    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const p = Math.sin(k / (N - 1) * 2 * Math.PI), sh = Math.round(3 * p), row = cc(4 + 1.8 * Math.abs(p), 1, 9); s.push({ l: [cc(4 + sh, 0, 7), row], r: [cc(10 + sh, 7, 14), row] }); } addMove('pendulum', false, s); }
+    { addMove('outwardBloom', false, [{ l: [6, 5], r: [8, 5] }, { l: [3, 3], r: [11, 3] }, { l: [1, 1], r: [13, 1] }, { l: [3, 3], r: [11, 3] }, { l: [6, 5], r: [8, 5] }, { l: [3, 7], r: [11, 7] }, { l: [1, 9], r: [13, 9] }, { l: [3, 7], r: [11, 7] }]); }
+    { const Ls = [[2, 3], [5, 3], [5, 6], [2, 6]], Rs = [[9, 3], [12, 3], [12, 6], [9, 6]]; let s = []; for (let k = 0; k < 8; k++) { const ix = k % 4; s.push({ l: Ls[ix], r: Rs[ix] }); } addMove('boxStep', false, s); }
+    { const rw = [8, 2, 8, 2, 7, 3]; addMove('heartbeat', false, rw.map(v => ({ l: [4, v], r: [10, v] }))); }
+
     const orbs = result
       .filter(n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
       .sort((a, b) => a.beat - b.beat);
-    let _dswRuns = 0, _dswNotes = 0, _pat = 0;
+    let _dswRuns = 0, _dswNotes = 0, _reg = 0;
     let i = 0;
     while (i < orbs.length) {
       let j = i;
@@ -7179,64 +7262,71 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const region = orbs.slice(i, j + 1);
       const beatKeys = new Set(region.map(o => Math.round(o.beat * 64)));
       if (region.length >= DSW_MINRUN && beatKeys.size >= 3) {
-        let offset = (_pat % 2 === 0) ? 0 : 7;       // start side alternates per region
-        let odir   = offset === 0 ? 1 : -1;
-        let row    = dRowLo, rdir = 1;
-        let palIdx = _pat % DSW_PALETTE.length;
-        let motion = DSW_PALETTE[palIdx];            // 0=horiz 1=vert 2=diag 3=spiral 4=spike
-        let angle  = (_pat % 4) * 90;                // spiral start phase varies per region
-        let spikeOut = false;
-        let prevOff = offset, prevRow = row;         // last APPLIED position (reachability cap)
-        let seg = 0, lastBk = null;
+        let mvIdx = _reg % MOVES.length, mv = MOVES[mvIdx], k = 0, lastBk = null;
+        let prevL = null, prevR = null;
         for (const o of region) {
           const bk = Math.round(o.beat * 64);
-          if (lastBk !== null && bk !== lastBk) {    // new beat -> advance the shared cursor
-            if (motion === 0 || motion === 2) {      // horizontal / diagonal: bounce laterally
-              offset += DSW_CSTEP * odir;
-              if      (offset >= 7) { offset = 7; odir = -1; }
-              else if (offset <= 0) { offset = 0; odir =  1; }
-            }
-            if (motion === 1 || motion === 2) {      // vertical / diagonal: bounce vertically
-              row += rdir;
-              if      (row >= dRowHi) { row = dRowHi; rdir = -1; }
-              else if (row <= dRowLo) { row = dRowLo; rdir =  1; }
-            }
-            if (motion === 3) {                      // spiral: rotate offset+row around the centre
-              angle += DSW_ASTEP;
-              offset = Math.round(DSW_OFF_CTR + Math.cos(angle * Math.PI / 180) * DSW_OFF_RAD);
-              row    = Math.round(dRowCtr     + Math.sin(angle * Math.PI / 180) * dRowRad);
-            }
-            if (motion === 4) {                      // spike: pure lateral dart out (5) and back (2)
-              spikeOut = !spikeOut;
-              offset = spikeOut ? 5 : 2;
-            }
-            if (++seg >= DSW_SEG) { seg = 0; palIdx = (palIdx + 1) % DSW_PALETTE.length; motion = DSW_PALETTE[palIdx]; }  // rotate -> short segments
+          if (lastBk !== null && bk !== lastBk) {            // new beat -> step the move (rotate when it ends)
+            k++;
+            if (k >= mv.steps.length) { mvIdx = (mvIdx + 1) % MOVES.length; mv = MOVES[mvIdx]; k = 0; }
           }
-          if (bk !== lastBk) lastBk = bk;
-          // Reachability cap: limit the APPLIED move to DSW_MAXSTEP Manhattan/beat. Linear
-          // motions already step ≤3 (no-op for them); this tames the spiral/spike entry jumps
-          // and keeps every dense hop playable. The motion state (angle/spike phase) keeps
-          // advancing independently, so the shape still emerges — just speed-limited.
-          let aOff = offset, aRow = row;
-          const dO = aOff - prevOff, dR = aRow - prevRow, manh = Math.abs(dO) + Math.abs(dR);
-          if (manh > DSW_MAXSTEP) {
-            const s = DSW_MAXSTEP / manh;
-            aOff = Math.round(prevOff + dO * s);
-            aRow = Math.round(prevRow + dR * s);
+          lastBk = bk;
+          const st = mv.steps[k];
+          const isR = o.type === 0;
+          let want = isR ? st.r : st.l;
+          if (!want) want = isR ? (prevR || [10, 5]) : (prevL || [4, 5]);  // rest beat -> hold last spot
+          let col = want[0], rowv = want[1];
+          const prev = isR ? prevR : prevL;                  // reachability cap: <= DSW_MAXSTEP Manhattan/beat per hand
+          if (prev) {
+            const dC = col - prev[0], dR = rowv - prev[1], manh = Math.abs(dC) + Math.abs(dR);
+            if (manh > DSW_MAXSTEP) { const sc = DSW_MAXSTEP / manh; col = Math.round(prev[0] + dC * sc); rowv = Math.round(prev[1] + dR * sc); }
           }
-          aOff = Math.max(0, Math.min(7, aOff));                           // keep within the shared lateral band
-          aRow = Math.max(dRowLo, Math.min(dRowHi, aRow));
-          prevOff = aOff; prevRow = aRow;
-          const lo = o.type === 0 ? 7 : 0, hi = o.type === 0 ? 14 : 7;     // hand zone
-          o._x  = COL_X[Math.max(lo, Math.min(hi, lo + aOff))];            // parallel: same offset both hands
-          o.row = aRow;
+          rowv = clRow(rowv);
+          if (mv.cross) col = Math.max(0, Math.min(14, col));             // crossover move: may pass the centre line
+          else if (isR) col = Math.max(7, Math.min(14, col));             // otherwise keep each hand in its zone
+          else          col = Math.max(0, Math.min(7, col));
+          o._x = COL_X[col];
+          o.row = rowv;
           o._denseSweep = true;
+          if (mv.cross && ((isR && col < 7) || (!isR && col > 7))) o._crossover = true;
+          if (isR) prevR = [col, rowv]; else prevL = [col, rowv];
         }
-        _dswRuns++; _dswNotes += region.length; _pat++;
+        _dswRuns++; _dswNotes += region.length; _reg++;
       }
       i = j + 1;
     }
-    if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense region(s) (${_dswNotes} orbs) into flowing groups`);
+    if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense region(s) (${_dswNotes} orbs) using ${MOVES.length} two-hand move types`);
+
+    // ── [DenseSweep] boundary smoothing ─────────────────────────────────────
+    // Reshaping moves pattern notes, but their LOOSE same-hand neighbours (region
+    // entry/exit) were placed with no knowledge of the new positions — leaking
+    // just-over-limit C3 jumps (consistently 8 cols) at recurring region-boundary
+    // timestamps (confirmed via nonpattern_big_jumps). Where exactly one of a
+    // consecutive same-hand pair is pattern-tagged and the jump exceeds C3 limits
+    // (>7 cols or >5 rows), nudge the LOOSE note just enough to get back under —
+    // the pattern choreography stays intact and the loose note barely moves
+    // (an 8-col jump = a 1-col nudge).
+    {
+      const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+      let _dswClamped = 0;
+      for (let h = 0; h <= 1; h++) {
+        const hn = orbs.filter(n => n.type === h);          // beat-sorted free orbs only
+        for (let k = 1; k < hn.length; k++) {
+          const a = hn[k - 1], b = hn[k];
+          if (!!a._denseSweep === !!b._denseSweep) continue; // need exactly one pattern note
+          const loose = a._denseSweep ? b : a, anchor = a._denseSweep ? a : b;
+          const dC = xCol(loose._x) - xCol(anchor._x), dR = (loose.row || 0) - (anchor.row || 0);
+          if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
+          let nc = xCol(anchor._x) + Math.max(-7, Math.min(7, dC));  // clamp to exactly the C3 limit
+          let nr = (anchor.row || 0) + Math.max(-5, Math.min(5, dR)); // → minimal displacement
+          nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc)); // keep hand zone
+          loose._x = COL_X[nc];
+          loose.row = Math.max(0, Math.min(10, nr));
+          _dswClamped++;
+        }
+      }
+      if (_dswClamped) console.log(`[DenseSweep] Boundary-clamped ${_dswClamped} loose neighbour(s) at region edges`);
+    }
   }
 
   // ── FINAL C1/C2 SWEEP — runs last, after every pass that could touch result ──
@@ -7350,6 +7440,15 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     if (_gClamped > 0) console.log(`[GreenClamp] Smoothed ${_gClamped} green column jump(s) (>3 cols within 2 beats)`);
   }
+
+  // ── [C3Clamp] final unreachable-jump clamp — catch-all, any source ──────────────
+  // The DenseSweep boundary clamp only covers pattern edges, but later passes
+  // (obstacle occlusion, gap-fill, crossovers) can still create >7-col / >5-row
+  // same-hand jumps. clampC3Jumps (module-level, shared with runFinalSweep so the
+  // expandSections / section-splice / mutateMap paths get it too) clamps them to
+  // exactly the limit. Runs before [RowLift] (a constant shift that cannot
+  // increase jump deltas).
+  clampC3Jumps(result);
 
   // ── [RowLift] shift the whole map up by ROW_LIFT rows — the final spatial word ───────
   // Row 0 = top (physically highest in VR); a higher row index = lower. In-game the note
@@ -8560,16 +8659,36 @@ async function callAnthropic(apiKey, body) {
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (data.error?.type === 'overloaded_error') {
+    const _errType = data.error?.type;
+    if (_errType === 'overloaded_error' || _errType === 'rate_limit_error') {
+      // BOTH are transient. rate_limit_error (429) previously fell through un-retried —
+      // one burst over a per-minute budget instantly failed the whole song in batch.
+      // Log the ratelimit headers — they name WHICH budget is exhausted and when it resets.
+      if (_errType === 'rate_limit_error') {
+        const _rlHdrs = {};
+        for (const h of ['requests', 'input-tokens', 'output-tokens', 'tokens']) {
+          const rem = res.headers.get(`anthropic-ratelimit-${h}-remaining`);
+          const rst = res.headers.get(`anthropic-ratelimit-${h}-reset`);
+          if (rem !== null || rst !== null) _rlHdrs[h] = { remaining: rem, reset: rst };
+        }
+        console.warn('[API] 429 rate_limit_error —', data.error?.message || '(no message)',
+          Object.keys(_rlHdrs).length ? _rlHdrs : '(ratelimit headers not exposed to browser)');
+      }
       if (attempt < MAX_RETRIES) {
-        const wait = BASE_DELAY * Math.pow(2, attempt);
-        console.warn(`[API] Overloaded — retrying in ${wait / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        // Honor the server's retry-after (seconds) when readable; else exponential backoff.
+        const _ra   = parseFloat(res.headers.get('retry-after'));
+        const wait  = Number.isFinite(_ra) && _ra > 0
+          ? Math.min(_ra * 1000 + 500, 120000)
+          : BASE_DELAY * Math.pow(2, attempt);
+        console.warn(`[API] ${_errType} — retrying in ${Math.round(wait / 1000)}s (attempt ${attempt + 1}/${MAX_RETRIES})`, data.error?.message || '');
         const statusEl = document.getElementById('status');
-        if (statusEl) statusEl.textContent = `Anthropic API overloaded — retrying in ${wait / 1000}s…`;
+        if (statusEl) statusEl.textContent = `${_errType === 'rate_limit_error' ? 'API rate-limited' : 'Anthropic API overloaded'} — retrying in ${Math.round(wait / 1000)}s…`;
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      throw new Error('overloaded_error: Overloaded — Anthropic API is at capacity. Try again in a minute.');
+      // Preserve the API's own message — it names WHICH per-minute budget was exceeded
+      // (requests vs input-tokens vs output-tokens), which is the actionable detail.
+      throw new Error(`${_errType}: ${data.error?.message || 'API unavailable after retries'}`);
     }
     return data;
   }
@@ -9219,12 +9338,63 @@ function clearGreenRailConflicts(notes, beatOccupied = null) {
 // is single-source like the helper bodies — call sites no longer hand-roll the order and
 // can't drift apart. Pass a diff-aware `clampFn` (e.g. clampRow) where one is in scope;
 // omit it to use fixC1's default [0,10] clamp. Returns per-step counts for logging.
+// C3 clamp — shared. Walks the SAME per-hand sequences the critic's C3 detector
+// checks (all type-0/1 notes incl. rail starts) and clamps >7-col / >5-row jumps to
+// exactly the limit (minimal displacement). Only FREE orbs move (rails, _comp, and
+// notes inside a same-hand/gold rail window are position-locked — moving them breaks
+// C1/C2); prefers moving a loose note over a pattern-tagged one. Two passes to settle
+// cascades. Module-level because maps are finished by FOUR paths (onsetsToNotes,
+// expandSections, section-splice, mutateMap) and violations recurred at fixed
+// timestamps whenever a path lacked the clamp. Mutates `notes`; returns counts.
+function clampC3Jumps(notes) {
+  const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  const _railsByHand = [[], []];
+  for (const r of notes) {
+    if (r.railEndBeat == null) continue;
+    if (r.type === 0)      _railsByHand[0].push(r);
+    else if (r.type === 1) _railsByHand[1].push(r);
+    else if (r.type === 3) { _railsByHand[0].push(r); _railsByHand[1].push(r); } // gold rail pins both
+  }
+  const _movable = (n, h) => n.railEndBeat == null && !n._comp &&
+    !_railsByHand[h].some(r => n !== r && n.beat >= r.beat && n.beat <= r.railEndBeat);
+  let clamped = 0, stuck = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    for (let h = 0; h <= 1; h++) {
+      const hn = notes.filter(n => n.type === h).sort((a, b) => a.beat - b.beat);
+      for (let k = 1; k < hn.length; k++) {
+        const a = hn[k - 1], b = hn[k];
+        const dC = _c3col(b._x) - _c3col(a._x), dR = (b.row || 0) - (a.row || 0);
+        if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
+        // pick the note to move: prefer loose (non-pattern) movable, then any movable
+        let mv = null;
+        if      (!b._denseSweep && _movable(b, h)) mv = b;
+        else if (!a._denseSweep && _movable(a, h)) mv = a;
+        else if (_movable(b, h))                   mv = b;
+        else if (_movable(a, h))                   mv = a;
+        if (!mv) { if (pass === 1) stuck++; continue; }
+        const anchor = mv === b ? a : b;
+        const sC = _c3col(mv._x) - _c3col(anchor._x), sR = (mv.row || 0) - (anchor.row || 0);
+        let nc = _c3col(anchor._x) + Math.max(-7, Math.min(7, sC));   // clamp to exactly the
+        const nr = (anchor.row || 0) + Math.max(-5, Math.min(5, sR)); // limit → minimal move
+        if (mv._crossover) nc = Math.max(0, Math.min(14, nc));        // crossovers may sit past centre
+        else nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc));
+        mv._x  = COL_X[nc];
+        mv.row = Math.max(0, Math.min(10, nr));
+        clamped++;
+      }
+    }
+  }
+  if (clamped || stuck) console.log(`[C3Clamp] Clamped ${clamped} unreachable jump(s)${stuck ? `, ${stuck} unresolvable (both notes rail-bound)` : ''}`);
+  return { clamped, stuck };
+}
+
 function runFinalSweep(notes, { beatOccupied = null, clampFn } = {}) {
   const grc   = clearGreenRailConflicts(notes, beatOccupied);
   const c1    = fixC1(notes, { beatOccupied, clampFn });
   const gold  = clearGoldC2(notes, beatOccupied);
   const green = clearGreenC2(notes, beatOccupied);
-  return { grc, c1, gold, green };
+  const c3    = clampC3Jumps(notes);   // last — C1/C2 deletions above can join distant neighbours
+  return { grc, c1, gold, green, c3 };
 }
 
 async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
@@ -9419,6 +9589,9 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       rail_dur: n.railEndBeat != null
         ? parseFloat(((n.railEndBeat - n.beat) / bps).toFixed(1))
         : null,
+      // pattern: which choreography pass placed this note ('dense'/'gold'), else omitted.
+      // Lets the critic accept intended in-pattern movement while still judging loose sections.
+      ...(n._denseSweep ? { pattern: 'dense' } : n._goldSweep ? { pattern: 'gold' } : {}),
     }));
 
   // Row distribution across 11 layers (Ceiling … Floor)
@@ -9554,6 +9727,31 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     };
   })();
 
+  // ── Non-pattern outlier jumps ────────────────────────────────────────────────
+  // mean_jump is an average over hundreds of notes, so a handful of ugly jumps in
+  // LOOSE (non-choreographed) sections wash out — the aggregate reads clean while the
+  // map plays badly. This surfaces same-hand jumps that exceed the C3 reach limits
+  // (col>7 OR row>5) where NOT both endpoints are pattern-tagged, so intended in-pattern
+  // sweeps are excluded but region-boundary + loose-section jumps show up with beats.
+  flowMetrics.nonpattern_big_jumps = (() => {
+    const xToColF = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+    const worst = [];
+    for (let h = 0; h <= 1; h++) {
+      const hn = currentNotes.filter(n => n.type === h).sort((a, b) => a.beat - b.beat);
+      for (let i = 1; i < hn.length; i++) {
+        const a = hn[i - 1], b = hn[i];
+        if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
+        const dCol = Math.abs(xToColF(b._x) - xToColF(a._x));
+        const dRow = Math.abs((b.row || 0) - (a.row || 0));
+        if (dCol > 7 || dRow > 5) {
+          worst.push({ t: parseFloat((b.beat / bps).toFixed(1)), hand: h === 0 ? 'R' : 'L', cols: dCol, rows: dRow });
+        }
+      }
+    }
+    worst.sort((a, b) => (b.cols + b.rows) - (a.cols + a.rows));
+    return { count: worst.length, max: worst.length ? worst[0].cols + worst[0].rows : 0, worst: worst.slice(0, 5) };
+  })();
+
   const mapSummary = {
     note_count: total,
     avg_notes_per_sec: avgNPS,
@@ -9683,6 +9881,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     flowJump: mapSummary.flow_metrics?.mean_jump,
     flowFlat: mapSummary.flow_metrics?.flat_run_max,
     crossoverPct: mapSummary.flow_metrics?.crossover_pct,
+    nonpatternBigJumps: mapSummary.flow_metrics?.nonpattern_big_jumps,
   });
 
   // [FlowProbe] one compact line per critique for batch calibration — filter the console
@@ -9759,6 +9958,29 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     const total = currentNotes.length || 1;
     const injected = [];
 
+    // ── Strip LLM-authored mechanical CRITICALs (C1/C2/C3) ────────────────
+    // The LLM infers these from aggregate statistics ("9% gold in drum windows must
+    // lack a free hand") or from jumps between NON-consecutive note_sample entries —
+    // routinely fabricating auto-fails the geometry doesn't support. Worse, the
+    // "already present" guards below then SKIP the ground-truth JS checks entirely
+    // (observed: a hallucinated C3 blocked verification of a possibly-clean map).
+    // Strip them here; the detectors below re-inject any violation that actually
+    // exists. C4–C6 are left untouched (C4 is deterministic from layer stats;
+    // C5/C6 have no JS detector yet, so an LLM flag is better than nothing).
+    const _mechCrit = i => {
+      if (!/^CRITICAL:/i.test(i)) return false;
+      if (/\bC[123]\b/.test(i)) return true;
+      if (/off active rail path/i.test(i)) return true;                    // C1 (token-less form)
+      if (/clearance|gold rail window|beat of gold/i.test(i)) return true; // C2
+      if (/green orb.*rail window/i.test(i)) return true;                  // C2-green
+      return /unreachable (spatial )?jump/i.test(i);                       // C3 ("unreachable during X" = C6, kept)
+    };
+    const _llmMechCount = result.issues.filter(_mechCrit).length;
+    if (_llmMechCount) {
+      result.issues = result.issues.filter(i => !_mechCrit(i));
+      console.log(`[Critic] Stripped ${_llmMechCount} LLM-authored mechanical CRITICAL(s) — C1/C2/C3 are JS-verified below`);
+    }
+
     // ── C1: same-hand note off active rail path ──────────────────────────
     const c1 = _detectC1Count(currentNotes);
     if (c1 > 0 && !result.issues.some(i => i.startsWith('CRITICAL: C1'))) {
@@ -9812,15 +10034,34 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     // shows up as a 11-col jump but is physically a both-hands transition).
     if (!result.issues.some(i => i.startsWith('CRITICAL: C3'))) {
       let c3 = 0;
+      const _c3Detail = [];
+      // tag string for diagnosis: which pass owns each offending note
+      const _tags = n => [n.railEndBeat != null && 'rail', n._comp && 'comp',
+        n._denseSweep && 'dsw', n._goldSweep && 'gsw', n._crossover && 'xover',
+        n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
       for (let h = 0; h <= 1; h++) {
         const hn = currentNotes.filter(n => n.type === h).sort((a,b) => a.beat - b.beat);
         for (let i = 1; i < hn.length; i++) {
-          if (Math.abs(hn[i].row - hn[i-1].row) > 5 ||
-              Math.abs(xToColFin(hn[i]._x ?? 0) - xToColFin(hn[i-1]._x ?? 0)) > 7) c3++;
+          const dR = Math.abs(hn[i].row - hn[i-1].row);
+          const dCl = Math.abs(xToColFin(hn[i]._x ?? 0) - xToColFin(hn[i-1]._x ?? 0));
+          if (dR > 5 || dCl > 7) {
+            c3++;
+            _c3Detail.push(`${(hn[i].beat / bps).toFixed(1)}s ${h === 0 ? 'R' : 'L'} ${dCl}c/${dR}r [${_tags(hn[i-1])}→${_tags(hn[i])}]`);
+          }
         }
       }
+      // Source-diagnosis dump: the tags name which pass placed each endpoint, so a
+      // recurring violation identifies the leaking pass without reproduction work.
+      if (c3 > 0) console.warn('[C3Detail]', _c3Detail.join(' | '));
       if (c3 > 0) {
-        result.issues.push(`CRITICAL: C3 — ${c3} unreachable spatial jump(s)`);
+        // Append the worst offender locations (from the nonpattern outlier metric) so
+        // the section-splice / mutation passes can target the actual beats instead of
+        // regenerating blind against a bare count.
+        const _np  = flowMetrics?.nonpattern_big_jumps;
+        const _loc = _np?.worst?.length
+          ? ` — worst: ${_np.worst.map(w => `${w.t}s ${w.hand}(${w.cols}c/${w.rows}r)`).join(', ')}`
+          : '';
+        result.issues.push(`CRITICAL: C3 — ${c3} unreachable spatial jump(s)${_loc}`);
         injected.push(`C3(${c3})`);
       }
     }
@@ -12185,7 +12426,9 @@ Rules:
     const errBox = document.getElementById('generateError');
     let msg = err.message;
     if (msg.includes('rate') || msg.includes('429') || msg.includes('limit')) {
-      msg = 'Rate limit hit. Wait 30–60 seconds and try again. If this keeps happening, your API key may be on a free tier with low limits.';
+      // Keep the API's own message — it names WHICH per-minute budget was exceeded
+      // (requests / input tokens / output tokens). Paid keys hit these too in batch.
+      msg = `Rate limit hit — ${err.message}. Retries were already attempted; this is a per-minute budget on the key's tier, not necessarily a free-tier key.`;
     } else if (msg.includes('401') || msg.includes('auth') || msg.includes('key')) {
       msg = 'API key rejected. Double-check your key at console.anthropic.com/settings/keys.';
     } else if (msg.includes('fetch') || msg.includes('network') || msg.includes('Failed')) {
@@ -12194,10 +12437,18 @@ Rules:
     errBox.textContent = msg;
     errBox.style.display = 'block';
     toast('Generation failed', 'error');
+    // Batch hook: propagate the REAL failure reason. Previously the finally below fired
+    // _cb(lastGenScore ?? 0), so a thrown generation (rate limit, network, auth) reached the
+    // batch as a bogus "completed, score=0" and surfaced as "Generation produced 0 notes
+    // (score=0)" — hiding the actual error, which only sat in this UI error box.
+    if (_onGenerateComplete) {
+      const _cb = _onGenerateComplete; _onGenerateComplete = null; _cb({ error: msg });
+    }
   } finally {
     btn.disabled = false;
     btn.textContent = '✦ Generate Beatmap';
-    // Batch hook: notify batch processor that generation finished
+    // Batch hook: notify batch processor that generation finished (no-op if the catch
+    // above already fired it with the error)
     if (_onGenerateComplete) {
       const _cb = _onGenerateComplete; _onGenerateComplete = null; _cb(lastGenScore ?? 0);
     }
@@ -12946,6 +13197,9 @@ async function saveToLibrary() {
     // Persist lyric cues so they're auto-applied on next load without re-fetching.
     // null = cues never fetched; [] = fetched but none found; array = cues ready.
     lyricCues:    lastLyricCues ?? null,
+    // Persist lyric section structure too — re-generating this song then skips the
+    // fetchLyricSections web_search call, a heavy input-token consumer (rate-limit relief).
+    lyricSections: lastLyricSections ?? null,
     savedAt:       new Date().toISOString(),
   };
 
@@ -13023,6 +13277,7 @@ async function loadLibraryEntry(entry) {
   // [] means they were fetched and none were found (skip auto-fetch, no cues to apply).
   // array means cues are ready — update status label so user sees them without re-fetching.
   lastLyricCues = entry.lyricCues ?? null;
+  lastLyricSections = entry.lyricSections ?? null;   // cached structure → skip the web_search fetch at generation time
   const lyricStatusEl = document.getElementById('lyricStatus');
   const lyricBtnEl    = document.getElementById('lyricBtn');
   if (lastLyricCues && lastLyricCues.length > 0) {
@@ -13242,7 +13497,7 @@ async function lookupBPMProgrammatic(title, artist) {
     const data = await callAnthropic(apiKey, {
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 200,
-      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 1 }],
       messages: [{
         role: 'user',
         content: `What is the exact BPM of "${title}" by ${artist}? Search for it. Respond ONLY with JSON: {"bpm": 120} — no other text.`
@@ -13413,6 +13668,7 @@ async function _processBatchItem(file, i) {
       // Restore lyric cues so they're injected at generation time without re-fetching.
       // null = never fetched (auto-fetch will run); [] = fetched, none found (skip).
       lastLyricCues = entry.lyricCues ?? null;
+      lastLyricSections = entry.lyricSections ?? null;   // cached structure → skip web_search fetch
       if (lastLyricCues?.length)
         console.log(`[Batch] Restored ${lastLyricCues.length} lyric cue(s) from library for "${entry.title}"`);
       fromLib = true;
@@ -13469,11 +13725,13 @@ async function _processBatchItem(file, i) {
   if (!_genApiKey) throw new Error('No API key — enter it before running batch');
 
   updateBatchItem(i, { status: 'Generating…' });
-  const _genScore = await new Promise((resolve, reject) => {
-    _onGenerateComplete = score => {
+  const _runGenerate = () => new Promise((resolve, reject) => {
+    _onGenerateComplete = result => {
       clearInterval(_statusPoll);
-      if (score === null) reject(new Error('Generate bailed — check title/artist'));
-      else resolve(score);
+      if (result === null) reject(new Error('Generate bailed — check title/artist'));
+      // Generate handler threw (rate limit / network / auth) — real reason propagated
+      else if (result && typeof result === 'object' && result.error) reject(new Error(result.error));
+      else resolve(result);
     };
     document.getElementById('generateBtn').click();
 
@@ -13486,6 +13744,20 @@ async function _processBatchItem(file, i) {
     // No hard timeout — long songs + Demucs on slower hardware can exceed any fixed limit.
     // The batch cancel button (_batchCancelled flag) is the user's escape hatch.
   });
+  let _genScore;
+  try {
+    _genScore = await _runGenerate();
+  } catch (genErr) {
+    // Transient API failure (rate limit / overload): cool down once and retry the song.
+    // Back-to-back batch songs fire many consecutive LLM calls — a 429/529 here does not
+    // mean the song is bad. A second failure propagates as the song's real error.
+    if (/rate|429|529|overload/i.test(String(genErr.message || ''))) {
+      updateBatchItem(i, { status: 'Rate-limited — cooling down 60s, then retrying…' });
+      await new Promise(r => setTimeout(r, 60000));
+      if (_batchCancelled) throw genErr;
+      _genScore = await _runGenerate();
+    } else throw genErr;
+  }
   if (!notes.length) throw new Error(`Generation produced 0 notes (score=${_genScore})`);
 
   // 8. Export to output folder
