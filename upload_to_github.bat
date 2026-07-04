@@ -82,14 +82,14 @@ echo.
 echo   Staging changes...
 git add -A
 
-REM ── Exit cleanly if nothing changed ───────────────────────────────────────
+REM ── Nothing new to commit? Still push. ────────────────────────────────────
+REM    Commits made outside this script (git commit directly) would otherwise
+REM    never reach GitHub — the old version exited here and skipped the push.
 git diff --cached --quiet
 if not errorlevel 1 (
     echo.
-    echo   No changes to commit. Repository is already up to date.
-    echo.
-    pause
-    exit /b 0
+    echo   No new changes to commit — pushing any unpushed local commits...
+    goto :push
 )
 
 REM ── Show what is about to be committed ────────────────────────────────────
@@ -118,6 +118,7 @@ if errorlevel 1 (
 )
 
 REM ── Push (set upstream on first push) ─────────────────────────────────────
+:push
 echo.
 echo   Pushing to %BRANCH% on origin...
 git push -u origin %BRANCH%
