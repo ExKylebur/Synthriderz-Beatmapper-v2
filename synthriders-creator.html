@@ -7703,10 +7703,13 @@ async function fetchFromYouTube() {
     let fname = (vArtist ? vArtist + ' - ' : '') + (vTitle || 'youtube_audio');
     fname = fname.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim() + '.ogg';
 
-    // Prefill Title/Artist BEFORE ingest — the change handler only fills EMPTY fields,
-    // so this lets the (better) video metadata win over filename parsing.
-    if (vTitle)  { const t = document.getElementById('title');  if (!t.value.trim()) { t.value = vTitle;  scheduleLibSuggestCheck(); } }
-    if (vArtist) { const a = document.getElementById('artist'); if (!a.value.trim()) { a.value = vArtist; scheduleLibSuggestCheck(); } }
+    // Set Title/Artist from the video BEFORE ingest. A fresh YouTube pull is an explicit
+    // new-song action, so OVERWRITE any existing values (e.g. the previous link's song) —
+    // otherwise a second link in the same session keeps the first song's metadata. Setting
+    // them non-empty here also makes the change handler's filename parse defer to these.
+    if (vTitle)  document.getElementById('title').value  = vTitle;
+    if (vArtist) document.getElementById('artist').value = vArtist;
+    if (vTitle || vArtist) scheduleLibSuggestCheck();
 
     // Route the OGG through the normal upload path.
     const file = new File([buf], fname, { type: 'audio/ogg' });
