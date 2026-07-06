@@ -9449,6 +9449,22 @@ function clearGreenRailConflicts(notes, beatOccupied = null) {
 // cascades. Module-level because maps are finished by FOUR paths (onsetsToNotes,
 // expandSections, section-splice, mutateMap) and violations recurred at fixed
 // timestamps whenever a path lacked the clamp. Mutates `notes`; returns counts.
+// Notes a given hand physically travels through, for reachability (C3) checks: its own
+// orbs (type h) + GOLD (type 3 — both hands hit it) + GREENS in that hand's zone (type 2
+// is either-hand, but a green in cols 0-7 is taken by the left, 7-14 by the right). Gold
+// and greens are ANCHORS here — the clamp moves the red/blue neighbour, never the shared/
+// either-hand note. This catches lateral jumps TO/FROM gold & green that the old same-type-
+// only walk (type === h) never saw — the confirmed cause of "passed clean but feels jumpy".
+const _htCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+function handTrajectory(notes, h) {
+  return notes.filter(n => {
+    if (n.type === h) return true;              // 0 = right, 1 = left
+    if (n.type === 3) return true;              // gold — both hands travel to it
+    if (n.type === 2) { const c = _htCol(n._x); return h === 0 ? c >= 7 : c <= 7; }
+    return false;
+  }).sort((a, b) => a.beat - b.beat);
+}
+
 function clampC3Jumps(notes) {
   const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
   const _railsByHand = [[], []];
@@ -9458,12 +9474,14 @@ function clampC3Jumps(notes) {
     else if (r.type === 1) _railsByHand[1].push(r);
     else if (r.type === 3) { _railsByHand[0].push(r); _railsByHand[1].push(r); } // gold rail pins both
   }
-  const _movable = (n, h) => n.railEndBeat == null && !n._comp &&
+  // Only FREE red/blue orbs move. Gold (3) / green (2) are anchors (moving a both-hands or
+  // either-hand note to satisfy one hand would break the other hand / GoldSweep shape).
+  const _movable = (n, h) => n.type !== 2 && n.type !== 3 && n.railEndBeat == null && !n._comp &&
     !_railsByHand[h].some(r => n !== r && n.beat >= r.beat && n.beat <= r.railEndBeat);
   let clamped = 0, stuck = 0;
   for (let pass = 0; pass < 2; pass++) {
     for (let h = 0; h <= 1; h++) {
-      const hn = notes.filter(n => n.type === h).sort((a, b) => a.beat - b.beat);
+      const hn = handTrajectory(notes, h);  // own orbs + gold + zone-matched green
       for (let k = 1; k < hn.length; k++) {
         const a = hn[k - 1], b = hn[k];
         const dC = _c3col(b._x) - _c3col(a._x), dR = (b.row || 0) - (a.row || 0);
@@ -9474,7 +9492,9 @@ function clampC3Jumps(notes) {
         else if (!a._denseSweep && _movable(a, h)) mv = a;
         else if (_movable(b, h))                   mv = b;
         else if (_movable(a, h))                   mv = a;
-        if (!mv) { if (pass === 1) stuck++; continue; }
+        // Count as "stuck" only when a red/blue endpoint existed but was rail-locked — a
+        // gold→gold / gold→green pair (both anchors) is an intended shape, not a failure.
+        if (!mv) { if (pass === 1 && (a.type === h || b.type === h)) stuck++; continue; }
         const anchor = mv === b ? a : b;
         const sC = _c3col(mv._x) - _c3col(anchor._x), sR = (mv.row || 0) - (anchor.row || 0);
         let nc = _c3col(anchor._x) + Math.max(-7, Math.min(7, sC));   // clamp to exactly the
@@ -9840,7 +9860,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     const xToColF = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
     const worst = [];
     for (let h = 0; h <= 1; h++) {
-      const hn = currentNotes.filter(n => n.type === h).sort((a, b) => a.beat - b.beat);
+      const hn = handTrajectory(currentNotes, h);  // own orbs + gold + zone-matched green (matches clampC3Jumps)
       for (let i = 1; i < hn.length; i++) {
         const a = hn[i - 1], b = hn[i];
         if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
