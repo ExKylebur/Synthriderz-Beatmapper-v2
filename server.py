@@ -95,6 +95,15 @@ def append_diagnostic(entry: dict) -> None:
         runs = runs[-DIAG_MAX:]
     DIAG_PATH.write_text(json.dumps(runs, ensure_ascii=False, indent=2), encoding='utf-8')
 
+# ── YouTube audio download (yt-dlp) ───────────────────────────────────────────
+# A pasted YouTube link is fetched with yt-dlp, converted to OGG in a SINGLE encode
+# (no MP3 intermediate — YouTube's source is already lossy, so one re-encode keeps
+# the most quality), and a copy is saved to YT_DOWNLOAD_DIR. The same OGG is streamed
+# back to the browser and loaded directly by the mapper.
+# Requires:  py -3.12 -m pip install -U yt-dlp   (reuses the existing ffmpeg).
+YT_DOWNLOAD_DIR = SCRIPT_DIR.parent / 'MP3'   # …\Synthriderz mapper\MP3 (beside the app folder)
+YT_MAX_DURATION = 900   # seconds — reject videos longer than 15 min (safety / not a playlist)
+
 # ── Demucs stem separation support ───────────────────────────────────────────
 # Demucs splits a song into 4 stems: drums, bass, vocals, other.
 # Requires:  pip install demucs
@@ -932,6 +941,127 @@ def convert_to_ogg(input_bytes: bytes, input_ext: str, silence_secs: float = 0.0
             return f.read()
 
 
+def check_ytdlp():
+    """Return (available: bool, message: str) for yt-dlp importability."""
+    try:
+        import yt_dlp  # noqa: F401
+        return True, f'yt-dlp ready (v{yt_dlp.version.__version__})'
+    except Exception:
+        return False, ('yt-dlp not installed — YouTube import disabled. '
+                       'Run:  py -3.12 -m pip install -U yt-dlp')
+
+
+def _safe_filename(name: str) -> str:
+    """Strip characters illegal in Windows filenames; cap length."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', name or '').strip().strip('.')
+    return (name or 'youtube_audio')[:120]
+
+
+def _ensure_deno_on_path() -> bool:
+    """Make sure a Deno JS runtime is reachable for yt-dlp.
+
+    yt-dlp needs a JS runtime + the EJS solver to solve YouTube's signature / n
+    challenges reliably (without it some videos are slow or missing formats). winget
+    installs Deno but only updates the *user* PATH — a server process that was already
+    running won't have picked that up. So if 'deno' isn't resolvable, glob the winget
+    package dir (its name is version-independent) and prepend it to THIS process's PATH.
+    Returns True if deno is now resolvable."""
+    import shutil, glob as _glob
+    if shutil.which('deno'):
+        return True
+    local = os.environ.get('LOCALAPPDATA', '')
+    if local:
+        hits = _glob.glob(os.path.join(local, 'Microsoft', 'WinGet', 'Packages',
+                                       'DenoLand.Deno_*', 'deno.exe'))
+        if hits:
+            os.environ['PATH'] = os.path.dirname(hits[0]) + os.pathsep + os.environ.get('PATH', '')
+            return True
+    return False
+
+
+def download_youtube_audio(url: str):
+    """Fetch the best audio track for a YouTube (or yt-dlp-supported) URL, convert to
+    OGG once via convert_to_ogg (the SAME tested encoder /convert uses), and save a
+    copy to YT_DOWNLOAD_DIR.
+
+    yt-dlp downloads the raw bestaudio stream (no re-encode); convert_to_ogg does the
+    single encode to OGG Vorbis (q4 / 44.1k / stereo) — so the file is byte-identical in
+    format to an uploaded-and-converted song, and the rest of the pipeline / Quest loader
+    sees exactly what they already handle.
+
+    Returns (ogg_bytes: bytes, title: str, artist: str, saved_path: str).
+    Raises RuntimeError on any download/convert failure.
+    """
+    import glob as _glob
+    _ensure_deno_on_path()  # let yt-dlp find Deno for reliable challenge solving
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out_tmpl = os.path.join(tmpdir, 'dl.%(ext)s')
+        cmd = [
+            sys.executable, '-m', 'yt_dlp',
+            '--no-playlist', '--no-progress',
+            # EJS challenge solver (needs a JS runtime, i.e. Deno) — clears YouTube's
+            # signature/n-challenge warnings so no audio formats go missing. Downloaded
+            # once from the yt-dlp GitHub then cached. Harmless if Deno is absent.
+            '--remote-components', 'ejs:github',
+            '-f', 'bestaudio/best',
+            '--write-info-json',
+            '-o', out_tmpl,
+            url,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace')
+        if result.returncode != 0:
+            tail = (result.stderr or result.stdout or '')[-1500:]
+            raise RuntimeError(
+                f'yt-dlp failed:\n{tail}\n\n'
+                'If this is a format/"video unavailable" error, YouTube may have changed '
+                '— update yt-dlp:  py -3.12 -m pip install -U yt-dlp')
+
+        # Read the info JSON (metadata) and locate the downloaded audio file.
+        info = {}
+        info_path = os.path.join(tmpdir, 'dl.info.json')
+        if os.path.exists(info_path):
+            try:
+                info = json.loads(Path(info_path).read_text('utf-8'))
+            except Exception:
+                info = {}
+
+        audio_files = [p for p in _glob.glob(os.path.join(tmpdir, 'dl.*'))
+                       if not p.endswith('.info.json')]
+        if not audio_files:
+            raise RuntimeError('yt-dlp produced no audio file (unexpected).')
+        src     = audio_files[0]
+        src_ext = os.path.splitext(src)[1].lower() or '.webm'
+
+        duration = float(info.get('duration') or 0)
+        if duration and duration > YT_MAX_DURATION:
+            raise RuntimeError(
+                f'Video is {int(duration // 60)}m {int(duration % 60)}s — exceeds the '
+                f'{YT_MAX_DURATION // 60}-minute limit. Trim it or raise YT_MAX_DURATION in server.py.')
+
+        # Single encode: raw stream → OGG Vorbis (same path as an uploaded file).
+        raw = Path(src).read_bytes()
+        ogg_bytes = convert_to_ogg(raw, src_ext)
+
+        # Metadata — prefer YouTube Music's structured track/artist, fall back to
+        # title/uploader. Strip the " - Topic" suffix YT auto-channels append.
+        title  = (info.get('track') or info.get('title') or 'YouTube Audio').strip()
+        artist = (info.get('artist') or info.get('uploader') or '').strip()
+        artist = re.sub(r'\s*-\s*Topic$', '', artist).strip()
+
+        # Save a copy to the user's archive folder (created if missing), avoiding overwrite.
+        YT_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        base  = _safe_filename(f'{artist} - {title}' if artist else title)
+        saved = YT_DOWNLOAD_DIR / f'{base}.ogg'
+        n = 1
+        while saved.exists():
+            saved = YT_DOWNLOAD_DIR / f'{base} ({n}).ogg'
+            n += 1
+        saved.write_bytes(ogg_bytes)
+
+        return ogg_bytes, title, artist, str(saved)
+
+
 def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict:
     """Robust tempo estimate for one audio file via librosa's beat tracker (MIR standard).
 
@@ -1071,6 +1201,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/detect_bpm":
             self._handle_detect_bpm()
+            return
+        if path == "/youtube":
+            self._handle_youtube()
             return
         if path != "/convert":
             self.send_response(404)
@@ -1506,6 +1639,63 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(msg_bytes)
             print(f'  /detect_bpm ERROR: {ex}')
 
+    def _handle_youtube(self):
+        """POST /youtube — JSON body { "url": "..." }.
+
+        Downloads the best audio via yt-dlp, converts to OGG once (same encoder as
+        /convert), saves a copy to YT_DOWNLOAD_DIR, and streams the OGG back so the
+        browser can load it through the normal upload path. Title/artist are returned
+        in X-Video-Title / X-Video-Artist headers (percent-encoded for non-ASCII).
+
+        Returns 503 if yt-dlp isn't installed, 500 on any download/convert failure.
+        """
+        available, yt_msg = check_ytdlp()
+        if not available:
+            payload = json.dumps({'error': yt_msg}).encode('utf-8')
+            self.send_response(503)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(payload))
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body   = self.rfile.read(length)
+            req    = json.loads(body.decode('utf-8')) if body else {}
+            url    = (req.get('url') or '').strip()
+            if not re.match(r'^https?://', url, re.I):
+                raise ValueError('A valid http(s) URL is required.')
+
+            print(f'  /youtube — downloading {url}')
+            ogg_bytes, title, artist, saved = download_youtube_audio(url)
+            print(f'  /youtube — "{title}" by "{artist or "?"}" — '
+                  f'saved {saved} ({len(ogg_bytes)//1024} KB OGG)')
+
+            out_name = _safe_filename(f'{artist} - {title}' if artist else title) + '.ogg'
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/ogg')
+            self.send_header('Content-Length', len(ogg_bytes))
+            self.send_header('Content-Disposition', f'attachment; filename="{out_name}"')
+            self.send_header('X-Video-Title',  urllib.parse.quote(title))
+            self.send_header('X-Video-Artist', urllib.parse.quote(artist))
+            self.send_header('Access-Control-Expose-Headers',
+                             'X-Video-Title, X-Video-Artist, Content-Disposition')
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(ogg_bytes)
+
+        except Exception as ex:
+            msg = json.dumps({'error': str(ex)}).encode('utf-8')
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(msg))
+            self.send_cors()
+            self.end_headers()
+            self.wfile.write(msg)
+            print(f'  /youtube ERROR: {ex}')
+
     def _handle_export(self):
         """Receive multipart form with track JSON + audio file, return .synth ZIP.
 
@@ -1898,6 +2088,15 @@ def main():
         print(f"  \u2713  {demucs_msg}")
     else:
         print(f"  \u2717  {demucs_msg}")
+
+    yt_ok, yt_msg = check_ytdlp()
+    print(f"  {'\u2713' if yt_ok else '\u2717'}  {yt_msg}")
+    if yt_ok:
+        import shutil
+        deno = _ensure_deno_on_path()
+        print(f"     {'\u2713' if deno else '\u00b7'}  JS runtime: "
+              + ("Deno found \u2014 reliable YouTube extraction"
+                 if deno else "no Deno (downloads still work; some videos may be slow/miss formats)"))
 
     print(f"  \u2713  Serving from: {SCRIPT_DIR}")
     print()

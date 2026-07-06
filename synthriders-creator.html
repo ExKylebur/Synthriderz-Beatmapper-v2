@@ -728,6 +728,19 @@
       style="width:100%;font-size:12px;margin-bottom:8px;">
       📦 Batch Upload
     </button>
+    <!-- YouTube import: paste a link → server downloads audio via yt-dlp, converts to OGG,
+         saves a copy to …\Synthriderz mapper\MP3, and loads it like a normal upload. -->
+    <div style="display:flex;gap:6px;margin-bottom:8px;">
+      <input type="text" id="ytUrl" placeholder="Paste a YouTube link…"
+        title="Paste a YouTube (or yt-dlp-supported) URL. The local server downloads the audio, converts it to OGG (single conversion, no MP3), saves a copy to the MP3 folder, and loads it here."
+        onkeydown="if(event.key==='Enter'){event.preventDefault();fetchFromYouTube();}"
+        style="flex:1;min-width:0;background:var(--surface);color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px;" />
+      <button class="btn btn-outline" id="ytFetchBtn" onclick="fetchFromYouTube()"
+        title="Download the audio from the pasted link and load it (requires the local server + yt-dlp)."
+        style="font-size:12px;padding:0 10px;white-space:nowrap;">
+        ⬇️ YouTube
+      </button>
+    </div>
     <div id="audioName" style="font-size:12px;color:var(--muted);text-align:center;min-height:16px;margin-bottom:2px;"></div>
     <div id="audioConvertStatus" style="color:var(--amber);font-size:11px;text-align:center;min-height:14px;"></div>
     <div id="convertNote" style="display:none;font-size:10px;color:var(--muted);text-align:center;margin-top:2px;">Non-OGG files auto-converted when running via server.py</div>
@@ -7624,6 +7637,96 @@ async function loadAudioBytes(f, statusEl) {
   const bytes = await res.arrayBuffer();
   const outName = f.name.replace(/\.[^.]+$/, '') + '.ogg';
   return { bytes, filename: outName };
+}
+
+// ── YouTube import ───────────────────────────────────────────────────────────
+// Paste a link → POST /youtube → server downloads audio (yt-dlp), converts to OGG
+// once, saves a copy to the MP3 folder, and streams the OGG back. We wrap those bytes
+// in a File and feed them through the SAME change-handler below as a normal upload, so
+// decode / hash-library / librosa-BPM / cover-art all "just work" with no duplication.
+async function fetchFromYouTube() {
+  const input    = document.getElementById('ytUrl');
+  const btn      = document.getElementById('ytFetchBtn');
+  const statusEl = document.getElementById('audioConvertStatus');
+  const url      = (input.value || '').trim();
+
+  if (!/^https?:\/\//i.test(url)) {
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = 'Enter a valid link (https://…).';
+    return;
+  }
+  if (!SERVER_MODE) {
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = 'YouTube import needs the local server — run launch.bat.';
+    return;
+  }
+
+  const oldLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ …';
+  document.getElementById('audioName').textContent = '';
+
+  // Live elapsed-time ticker so the (30–60s) download never looks frozen.
+  const t0 = Date.now();
+  statusEl.style.color = 'var(--amber)';
+  const tick = () => {
+    const s = Math.round((Date.now() - t0) / 1000);
+    statusEl.textContent = `⏳ Downloading & converting from YouTube… ${s}s`;
+  };
+  tick();
+  const ticker = setInterval(tick, 1000);
+
+  try {
+    const res = await fetch('/youtube', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ url }),
+    });
+    if (res.status === 404) {
+      throw new Error('Server is out of date — fully stop it and re-run launch.bat so the '
+                    + 'YouTube feature loads (a page reload alone is not enough).');
+    }
+    if (!res.ok) {
+      let err = await res.text();
+      try { err = JSON.parse(err).error || err; } catch (_) {}
+      throw new Error(err);
+    }
+
+    const vTitle  = decodeURIComponent(res.headers.get('X-Video-Title')  || '');
+    const vArtist = decodeURIComponent(res.headers.get('X-Video-Artist') || '');
+    const buf     = await res.arrayBuffer();
+
+    clearInterval(ticker);
+    statusEl.style.color = 'var(--accent)';
+    statusEl.textContent = `✓ Got "${vTitle || 'audio'}" — loading…`;
+
+    let fname = (vArtist ? vArtist + ' - ' : '') + (vTitle || 'youtube_audio');
+    fname = fname.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, ' ').trim() + '.ogg';
+
+    // Prefill Title/Artist BEFORE ingest — the change handler only fills EMPTY fields,
+    // so this lets the (better) video metadata win over filename parsing.
+    if (vTitle)  { const t = document.getElementById('title');  if (!t.value.trim()) { t.value = vTitle;  scheduleLibSuggestCheck(); } }
+    if (vArtist) { const a = document.getElementById('artist'); if (!a.value.trim()) { a.value = vArtist; scheduleLibSuggestCheck(); } }
+
+    // Route the OGG through the normal upload path.
+    const file = new File([buf], fname, { type: 'audio/ogg' });
+    const dt   = new DataTransfer();
+    dt.items.add(file);
+    const audioInput = document.getElementById('audioFile');
+    audioInput.files = dt.files;
+    audioInput.dispatchEvent(new Event('change'));
+
+    input.value = '';
+  } catch (ex) {
+    clearInterval(ticker);
+    statusEl.style.color = 'var(--red)';
+    statusEl.textContent = '✗ YouTube import failed: ' + (ex.message || ex);
+    console.error('[YouTube]', ex);
+  } finally {
+    clearInterval(ticker);
+    btn.disabled = false;
+    btn.textContent = oldLabel;
+  }
 }
 
 // Audio

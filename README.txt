@@ -15,10 +15,19 @@ STEP 2 — Install ffmpeg
       winget install ffmpeg
   (or download from https://ffmpeg.org and add to PATH)
 
-STEP 3 — Install the official Beatmap Editor (free)
+STEP 3 — (Optional) Enable YouTube import
+  Lets you paste a YouTube / YouTube Music link to pull the song's audio directly. Run:
+      py -3.12 -m pip install -U yt-dlp
+      winget install DenoLand.Deno
+  yt-dlp does the download (uses the ffmpeg from STEP 2); Deno is the JS runtime yt-dlp
+  needs to solve YouTube's challenges reliably (without it some videos are slow or fail).
+  Re-run the pip command with -U occasionally to keep up with YouTube changes.
+  NOTE: after installing Deno, RESTART the server so it picks up the new PATH.
+
+STEP 4 — Install the official Beatmap Editor (free)
   https://store.steampowered.com/app/1121930/Synth_Riders_Beatmap_Editor/
 
-STEP 4 — Place these files in a folder and double-click launch.bat
+STEP 5 — Place these files in a folder and double-click launch.bat
   The tool opens automatically at http://localhost:8080
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -59,6 +68,8 @@ can skip the official editor entirely.
 WHAT THIS TOOL DOES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - Upload audio in any format (auto-converts to OGG via ffmpeg)
+- YouTube import — paste a link, audio is downloaded (yt-dlp) + converted to OGG in one
+  step and saved to ..\MP3, then loaded automatically (needs the STEP 3 install)
 - GPU stem separation (Demucs) — drums / bass / vocals / guitar analysed separately
   (requires Python 3.12 + CUDA torch; falls back to JS analysis otherwise)
 - Auto-detect BPM + live web lookup by title/artist
@@ -73,7 +84,8 @@ WHAT THIS TOOL DOES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SOURCE / UPDATES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-GitHub: https://github.com/ExKylebur/Synthriderz-Beatmapper
+GitHub: https://github.com/ExKylebur/Synthriderz-Beatmapper-v2 (this is the v2 sandbox — separate
+repo from the stable Synthriderz-Beatmapper).
 Run upload_to_github.bat to push the latest local changes.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
