@@ -7348,7 +7348,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // later passes (rail dedup, snap re-runs, etc.) reintroduce them. This is the
   // final iron-clad cleanup before return — anything still wrong gets removed.
   {
-    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)) });
+    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps });
     if (_sw.grc > 0) console.log(`[GreenRail] Removed ${_sw.grc} green orb(s) overlapping an active rail`);
     const _railCount = result.filter(n => n.railEndBeat !== undefined && n.type <= 1).length;
     const _goldCount = result.filter(n => n.type === 3).length;
@@ -7461,7 +7461,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // expandSections / section-splice / mutateMap paths get it too) clamps them to
   // exactly the limit. Runs before [RowLift] (a constant shift that cannot
   // increase jump deltas).
-  clampC3Jumps(result);
+  clampC3Jumps(result, bps);
 
   // ── [RowLift] shift the whole map up by ROW_LIFT rows — the final spatial word ───────
   // Row 0 = top (physically highest in VR); a higher row index = lower. In-game the note
@@ -8913,7 +8913,7 @@ function naturalX(hand, row, patternProgress, allowCrossCenter = false) {
   return COL_X[col];
 }
 
-function expandSections(sections, totalBeats, diff, hints = {}) {
+function expandSections(sections, totalBeats, diff, hints = {}, bpm) {
   const result = [];
   const autoWalls = [];
   // Note value → beat step.  Difficulty caps max density so Easy/Normal top out at
@@ -9245,7 +9245,7 @@ function expandSections(sections, totalBeats, diff, hints = {}) {
   // final iron-clad cleanup before return — anything still wrong gets removed.
   {
     // expandSections fallback path — same shared fixers as the main pipeline.
-    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)) });
+    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps: bpm ? bpm / 60 : undefined });
     console.log(`[FinalSweep] C1: re-snapped ${_sw.c1.snapped}, removed ${_sw.c1.removed}. C2 gold: ${_sw.gold}, green: ${_sw.green}.`);
   }
 
@@ -9468,7 +9468,22 @@ function handTrajectory(notes, h) {
   }).sort((a, b) => a.beat - b.beat);
 }
 
-function clampC3Jumps(notes) {
+// A large spatial jump is only a REAL problem if the hand doesn't have time to make it.
+// A 9-column jump over a 12-beat idle gap (~7s) is trivially reachable; the same jump in
+// 0.3s is not. Every C3 check below gates on this BEFORE looking at distance — without it,
+// a long single-arm rest (or a gold sweep bridging two distant same-hand notes) reads as a
+// "recurring unreachable jump" that no fixer can resolve, because there's nothing to fix.
+// Calibrated against real data (2026-07-07): a confirmed batch of real gold/green jumps
+// measured 0.52s-1.25s apart — a lower cutoff (e.g. 0.5s) would silently stop clamping
+// those. 2.0s sits comfortably above that with margin, while still excluding genuinely
+// long idle gaps.
+const C3_MIN_GAP_SEC = 2.0;
+function c3TooFast(dtBeats, bps) {
+  if (!bps) return true;  // no tempo info — fail safe to "still check" (old behavior)
+  return (dtBeats / bps) < C3_MIN_GAP_SEC;
+}
+
+function clampC3Jumps(notes, bps) {
   const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
   const _railsByHand = [[], []];
   for (const r of notes) {
@@ -9487,6 +9502,7 @@ function clampC3Jumps(notes) {
       const hn = handTrajectory(notes, h);  // own orbs + gold + zone-matched green
       for (let k = 1; k < hn.length; k++) {
         const a = hn[k - 1], b = hn[k];
+        if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         const dC = _c3col(b._x) - _c3col(a._x), dR = (b.row || 0) - (a.row || 0);
         if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
         // pick the note to move: prefer loose (non-pattern) movable, then any movable
@@ -9514,12 +9530,12 @@ function clampC3Jumps(notes) {
   return { clamped, stuck };
 }
 
-function runFinalSweep(notes, { beatOccupied = null, clampFn } = {}) {
+function runFinalSweep(notes, { beatOccupied = null, clampFn, bps } = {}) {
   const grc   = clearGreenRailConflicts(notes, beatOccupied);
   const c1    = fixC1(notes, { beatOccupied, clampFn });
   const gold  = clearGoldC2(notes, beatOccupied);
   const green = clearGreenC2(notes, beatOccupied);
-  const c3    = clampC3Jumps(notes);   // last — C1/C2 deletions above can join distant neighbours
+  const c3    = clampC3Jumps(notes, bps);   // last — C1/C2 deletions above can join distant neighbours
   return { grc, c1, gold, green, c3 };
 }
 
@@ -9866,6 +9882,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const hn = handTrajectory(currentNotes, h);  // own orbs + gold + zone-matched green (matches clampC3Jumps)
       for (let i = 1; i < hn.length; i++) {
         const a = hn[i - 1], b = hn[i];
+        if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
         const dCol = Math.abs(xToColF(b._x) - xToColF(a._x));
         const dRow = Math.abs((b.row || 0) - (a.row || 0));
@@ -10153,11 +10170,13 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     }
 
     // ── C3: unreachable spatial jumps ────────────────────────────────────
-    // Gold (type 3) notes are both-hands simultaneous and don't drive single-hand
-    // reach — they're claimed by whichever hand is closer. Including them in the
-    // per-hand sequence creates phantom violations at gold sweep boundaries (e.g.
-    // a right-hand note at col 14 followed by a gold sweep starting at col 3
-    // shows up as a 11-col jump but is physically a both-hands transition).
+    // Uses handTrajectory (own orbs + gold + zone-matched green — same definition as
+    // clampC3Jumps/nonpattern_big_jumps, so the checker and the fixer always agree) plus
+    // a temporal gate: a big spatial delta is only a violation if the hand DOESN'T have
+    // time to make the move (c3TooFast, < C3_MIN_GAP_SEC apart). Without the gate, a long
+    // idle gap (or a gold sweep run bridging two distant same-hand notes — the hand
+    // travels smoothly through it, never actually jumping) read as a permanent CRITICAL
+    // that no fixer could resolve, since there was never anything to fix.
     if (!result.issues.some(i => i.startsWith('CRITICAL: C3'))) {
       let c3 = 0;
       const _c3Detail = [];
@@ -10166,8 +10185,9 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         n._denseSweep && 'dsw', n._goldSweep && 'gsw', n._crossover && 'xover',
         n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
       for (let h = 0; h <= 1; h++) {
-        const hn = currentNotes.filter(n => n.type === h).sort((a,b) => a.beat - b.beat);
+        const hn = handTrajectory(currentNotes, h);
         for (let i = 1; i < hn.length; i++) {
+          if (!c3TooFast(hn[i].beat - hn[i-1].beat, bps)) continue;
           const dR = Math.abs(hn[i].row - hn[i-1].row);
           const dCl = Math.abs(xToColFin(hn[i]._x ?? 0) - xToColFin(hn[i-1]._x ?? 0));
           if (dR > 5 || dCl > 7) {
@@ -11039,16 +11059,16 @@ Rules:
             iterWalls = audioResult.walls;
             iterSingleArmSections = audioResult.singleArmSections || [];
           } else {
-            const expanded = expandSections(sections, beats, diff, hints);
+            const expanded = expandSections(sections, beats, diff, hints, bpm);
             iterNotes = expanded.notes; iterWalls = expanded.walls;
           }
         } catch (_genErr) {
           console.warn('[Generator] onsetsToNotes failed, falling back to expandSections:', _genErr?.message || _genErr);
-          const expanded = expandSections(sections, beats, diff, hints);
+          const expanded = expandSections(sections, beats, diff, hints, bpm);
           iterNotes = expanded.notes; iterWalls = expanded.walls;
         }
       } else {
-        const expanded = expandSections(sections, beats, diff, hints);
+        const expanded = expandSections(sections, beats, diff, hints, bpm);
         iterNotes = expanded.notes; iterWalls = expanded.walls;
       }
       // Return the energy curve so the critic gets real energy data (not an empty array)
@@ -11173,36 +11193,18 @@ Rules:
       }
 
       // ── C3: Unreachable spatial jump ──────────────────────────────────
-      // Same-hand consecutive: clamp so jump is ≤5 rows, ≤7 columns.
-      // Opposite-hand simultaneous: clamp so spread is ≤8 rows, ≤10 columns.
+      // Same-hand consecutive: delegated to the shared clampC3Jumps (single source of
+      // truth, matching runFinalSweep + the critic's detector — same gold/zone-green
+      // trajectory, same temporal gate). Previously hand-rolled here with its own
+      // gold-only inclusion, no movability guard (could silently reposition a rail/comp/
+      // gold note), and no time-awareness (flagged long idle-gap resumes as violations).
+      // Opposite-hand simultaneous spread stays local — a distinct check, not duplicated.
       {
-        const MAX_SAME_ROW = 5, MAX_SAME_COL = 7;
         const MAX_OPP_ROW  = 8, MAX_OPP_COL  = 10;
         const xToCol = x => Math.round((parseFloat(x) + 0.9555) / 0.1365);
         const colToX = c => parseFloat((-0.9555 + c * 0.1365).toFixed(4));
 
-        // Same-hand consecutive jumps
-        const byHand = [
-          result.filter(n => n.type === 0 || n.type === 3).sort((a, b) => a.beat - b.beat),
-          result.filter(n => n.type === 1 || n.type === 3).sort((a, b) => a.beat - b.beat),
-        ];
-        let clamped = 0;
-        for (const hand of byHand) {
-          for (let j = 1; j < hand.length; j++) {
-            const prev = hand[j - 1], curr = hand[j];
-            const dr = curr.row - prev.row;
-            const dc = xToCol(curr._x ?? 0) - xToCol(prev._x ?? 0);
-            if (Math.abs(dr) > MAX_SAME_ROW) {
-              curr.row = prev.row + Math.sign(dr) * MAX_SAME_ROW;
-              clamped++;
-            }
-            if (Math.abs(dc) > MAX_SAME_COL) {
-              const newCol = xToCol(prev._x ?? 0) + Math.sign(dc) * MAX_SAME_COL;
-              curr._x = colToX(Math.max(0, Math.min(14, newCol)));
-              clamped++;
-            }
-          }
-        }
+        let clamped = clampC3Jumps(result, beatsPerSec).clamped;
 
         // Opposite-hand simultaneous spread
         const beatMap = new Map();
@@ -11411,7 +11413,7 @@ Rules:
       // same C1/C2 logic as onsetsToNotes' FinalSweep to catch any new ones.
       {
         // Shared fixers (Finding-1). No beatOccupied set in mutateMap scope.
-        const _sw = runFinalSweep(result);
+        const _sw = runFinalSweep(result, { bps: beatsPerSec });
         console.log(`[Mutate-FinalSweep] C1: re-snapped ${_sw.c1.snapped}, removed ${_sw.c1.removed}. C2 gold: ${_sw.gold}, green: ${_sw.green}, greenRail: ${_sw.grc}.`);
       }
 
@@ -11764,7 +11766,7 @@ Rules:
               // The splice combines two independently-validated halves; boundary
               // companions and preserved gold can create new C1/C2 violations.
               {
-                const _sw = runFinalSweep(iterNotes);
+                const _sw = runFinalSweep(iterNotes, { bps: bpm / 60 });
                 if (_sw.c1.snapped || _sw.c1.removed) console.log(`[SpliceC1] reSnapped=${_sw.c1.snapped} removed=${_sw.c1.removed}`);
                 if (_sw.gold > 0 || _sw.green > 0 || _sw.grc > 0) console.log(`[SpliceC2] Cleared gold:${_sw.gold} green:${_sw.green} greenRail:${_sw.grc} after splice`);
               }
