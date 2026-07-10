@@ -9499,15 +9499,38 @@ function c3TooFast(dtBeats, bps) {
   return (dtBeats / bps) < C3_MIN_GAP_SEC;
 }
 
-function clampC3Jumps(notes, bps) {
-  const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
-  const _railsByHand = [[], []];
+// Per-hand list of active rails (notes with a railEndBeat) that hand rides. Gold rails
+// (type 3) pin BOTH hands simultaneously. Shared by every C3 check (clampC3Jumps,
+// _finalize's detector, nonpattern_big_jumps) so the same-rail exemption below is applied
+// consistently everywhere.
+function buildRailsByHand(notes) {
+  const railsByHand = [[], []];
   for (const r of notes) {
     if (r.railEndBeat == null) continue;
-    if (r.type === 0)      _railsByHand[0].push(r);
-    else if (r.type === 1) _railsByHand[1].push(r);
-    else if (r.type === 3) { _railsByHand[0].push(r); _railsByHand[1].push(r); } // gold rail pins both
+    if (r.type === 0)      railsByHand[0].push(r);
+    else if (r.type === 1) railsByHand[1].push(r);
+    else if (r.type === 3) { railsByHand[0].push(r); railsByHand[1].push(r); }
   }
+  return railsByHand;
+}
+
+// Two same-hand notes riding the SAME active rail aren't a "jump" at all — the hand is
+// continuously sliding along the rail's curve between them the whole time, so no discrete
+// reachability check applies. Confirmed root cause (2026-07-10, "Jawbreaker"): a rail's own
+// waypoint path can legitimately swing 6+ rows between two of its companion snap-points
+// (e.g. an ellipse/wave shape). Every C3 check was treating this as an "unreachable jump"
+// that could NEVER be fixed — both endpoints are locked to the rail, so clampC3Jumps
+// correctly refused to move either (stuck=1, every iteration, same pair) — this is exactly
+// the "both notes rail-bound" residual the project's own notes anticipated but had never
+// confirmed in practice. The fix isn't a smarter clamp; these pairs were never a violation.
+function sameRailWindow(a, b, railsByHand, h) {
+  return railsByHand[h].some(r => a.beat >= r.beat && a.beat <= r.railEndBeat &&
+                                   b.beat >= r.beat && b.beat <= r.railEndBeat);
+}
+
+function clampC3Jumps(notes, bps) {
+  const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  const _railsByHand = buildRailsByHand(notes);
   // Only FREE red/blue orbs move. Gold (3) / green (2) are anchors (moving a both-hands or
   // either-hand note to satisfy one hand would break the other hand / GoldSweep shape).
   const _movable = (n, h) => n.type !== 2 && n.type !== 3 && n.railEndBeat == null && !n._comp &&
@@ -9518,6 +9541,7 @@ function clampC3Jumps(notes, bps) {
       const hn = handTrajectory(notes, h);  // own orbs + gold + zone-matched green
       for (let k = 1; k < hn.length; k++) {
         const a = hn[k - 1], b = hn[k];
+        if (sameRailWindow(a, b, _railsByHand, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         const dC = _c3col(b._x) - _c3col(a._x), dR = (b.row || 0) - (a.row || 0);
         if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
@@ -9894,10 +9918,12 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
   flowMetrics.nonpattern_big_jumps = (() => {
     const xToColF = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
     const worst = [];
+    const _railsByHandNP = buildRailsByHand(currentNotes);
     for (let h = 0; h <= 1; h++) {
       const hn = handTrajectory(currentNotes, h);  // own orbs + gold + zone-matched green (matches clampC3Jumps)
       for (let i = 1; i < hn.length; i++) {
         const a = hn[i - 1], b = hn[i];
+        if (sameRailWindow(a, b, _railsByHandNP, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
         const dCol = Math.abs(xToColF(b._x) - xToColF(a._x));
@@ -10200,15 +10226,18 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const _tags = n => [n.railEndBeat != null && 'rail', n._comp && 'comp',
         n._denseSweep && 'dsw', n._goldSweep && 'gsw', n._crossover && 'xover',
         n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
+      const _railsByHandFin = buildRailsByHand(currentNotes);
       for (let h = 0; h <= 1; h++) {
         const hn = handTrajectory(currentNotes, h);
         for (let i = 1; i < hn.length; i++) {
-          if (!c3TooFast(hn[i].beat - hn[i-1].beat, bps)) continue;
-          const dR = Math.abs(hn[i].row - hn[i-1].row);
-          const dCl = Math.abs(xToColFin(hn[i]._x ?? 0) - xToColFin(hn[i-1]._x ?? 0));
+          const a = hn[i - 1], b = hn[i];
+          if (sameRailWindow(a, b, _railsByHandFin, h)) continue; // continuous rail slide, not a jump
+          if (!c3TooFast(b.beat - a.beat, bps)) continue;
+          const dR = Math.abs(b.row - a.row);
+          const dCl = Math.abs(xToColFin(b._x ?? 0) - xToColFin(a._x ?? 0));
           if (dR > 5 || dCl > 7) {
             c3++;
-            _c3Detail.push(`${(hn[i].beat / bps).toFixed(1)}s ${h === 0 ? 'R' : 'L'} ${dCl}c/${dR}r [${_tags(hn[i-1])}→${_tags(hn[i])}]`);
+            _c3Detail.push(`${(b.beat / bps).toFixed(1)}s ${h === 0 ? 'R' : 'L'} ${dCl}c/${dR}r [${_tags(a)}→${_tags(b)}]`);
           }
         }
       }
