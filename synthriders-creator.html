@@ -9567,10 +9567,32 @@ function sameRailWindow(a, b, railsByHand, h) {
 function clampC3Jumps(notes, bps) {
   const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
   const _railsByHand = buildRailsByHand(notes);
+  // A note's EFFECTIVE position for reachability purposes. If it's a rail-defining note
+  // (owns railEndBeat) and it's the EARLIER side of a comparison, the hand is actually at
+  // the rail's END when it releases — not the stored start `.row`/`._x` (using the start
+  // here was a latent inaccuracy; sameRailWindow already guarantees b.beat > a.railEndBeat
+  // whenever a is a rail, so the rail has fully finished before b happens). The LATER side
+  // always uses its stored (start) position, whether it's a lone orb or a rail's own start,
+  // since that's the position the hand needs to arrive at.
+  const _effPos = (n, isEarlierSide) => (isEarlierSide && n.railEndBeat != null)
+    ? railPosAt(n, n.railEndBeat)
+    : { _x: n._x ?? 0, row: n.row || 0 };
   // Only FREE red/blue orbs move. Gold (3) / green (2) are anchors (moving a both-hands or
   // either-hand note to satisfy one hand would break the other hand / GoldSweep shape).
   const _movable = (n, h) => n.type !== 2 && n.type !== 3 && n.railEndBeat == null && !n._comp &&
     !_railsByHand[h].some(r => n !== r && n.beat >= r.beat && n.beat <= r.railEndBeat);
+  // Last resort: an UNTAGGED solo gold/green orb (not itself a rail, not a rail companion,
+  // not part of an intentional GoldSweep/DenseSweep shape) can be repositioned when nothing
+  // else can move. Confirmed root cause (2026-07-10, "Another Life"): gold accents and rail
+  // starts are chosen by separate, uncoordinated generation passes, so a gold moment can
+  // land right next to a brand-new rail's start (or vice versa) with zero cross-pass
+  // reachability check — both sides are normally protected (gold as an anchor, a rail's own
+  // geometry as unmovable), so this was a genuinely unresolvable "stuck" case every prior
+  // iteration. A solo, untagged gold/green orb isn't part of any shape worth protecting,
+  // unlike a GoldSweep run or a rail's curve — safe to reposition as a deliberate last resort.
+  const _movableLastResort = (n, h) => (n.type === 2 || n.type === 3) && n.railEndBeat == null &&
+    !n._comp && !n._denseSweep && !n._goldSweep &&
+    !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat);
   let clamped = 0, stuck = 0;
   for (let pass = 0; pass < 2; pass++) {
     for (let h = 0; h <= 1; h++) {
@@ -9579,25 +9601,30 @@ function clampC3Jumps(notes, bps) {
         const a = hn[k - 1], b = hn[k];
         if (sameRailWindow(a, b, _railsByHand, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
-        const dC = _c3col(b._x) - _c3col(a._x), dR = (b.row || 0) - (a.row || 0);
+        const aPos = _effPos(a, true), bPos = _effPos(b, false);
+        const dC = _c3col(bPos._x) - _c3col(aPos._x), dR = bPos.row - aPos.row;
         if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
-        // pick the note to move: prefer loose (non-pattern) movable, then any movable
+        // pick the note to move: prefer loose (non-pattern) movable, then any movable,
+        // then (last resort) an untagged solo gold/green orb
         let mv = null;
         if      (!b._denseSweep && _movable(b, h)) mv = b;
         else if (!a._denseSweep && _movable(a, h)) mv = a;
         else if (_movable(b, h))                   mv = b;
         else if (_movable(a, h))                   mv = a;
+        else if (_movableLastResort(b, h))         mv = b;
+        else if (_movableLastResort(a, h))         mv = a;
         // Count as "stuck" only when a red/blue endpoint existed but was rail-locked — a
         // gold→gold / gold→green pair (both anchors) is an intended shape, not a failure.
         if (!mv) { if (pass === 1 && (a.type === h || b.type === h)) stuck++; continue; }
         const anchor = mv === b ? a : b;
-        const sC = _c3col(mv._x) - _c3col(anchor._x), sR = (mv.row || 0) - (anchor.row || 0);
-        let nc = _c3col(anchor._x) + Math.max(-7, Math.min(7, sC));   // clamp to exactly the
-        const nr = (anchor.row || 0) + Math.max(-5, Math.min(5, sR)); // limit → minimal move
+        const anchorPos = anchor === a ? aPos : bPos;
+        const sC = _c3col(mv._x) - _c3col(anchorPos._x), sR = (mv.row || 0) - anchorPos.row;
+        let nc = _c3col(anchorPos._x) + Math.max(-7, Math.min(7, sC));   // clamp to exactly the
+        const nr = anchorPos.row + Math.max(-5, Math.min(5, sR));       // limit → minimal move
         if (mv._crossover) nc = Math.max(0, Math.min(14, nc));        // crossovers may sit past centre
         else nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc));
         mv._x  = COL_X[nc];
-        mv.row = Math.max(0, Math.min(10, nr));
+        mv.row = Math.max(0, Math.min(10, Math.round(nr)));
         clamped++;
       }
     }
@@ -9959,6 +9986,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const hn = handTrajectory(currentNotes, h);  // own orbs + gold + zone-matched green (matches clampC3Jumps)
       for (let i = 1; i < hn.length; i++) {
         const a = hn[i - 1], b = hn[i];
+        if (a.type === 3 && b.type === 3 && h === 1) continue; // gold-gold pair is identical in both hands' walks — count once (h=0)
         if (sameRailWindow(a, b, _railsByHandNP, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
@@ -10267,6 +10295,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         const hn = handTrajectory(currentNotes, h);
         for (let i = 1; i < hn.length; i++) {
           const a = hn[i - 1], b = hn[i];
+          if (a.type === 3 && b.type === 3 && h === 1) continue; // gold-gold pair is identical in both hands' walks — count once (h=0)
           if (sameRailWindow(a, b, _railsByHandFin, h)) continue; // continuous rail slide, not a jump
           if (!c3TooFast(b.beat - a.beat, bps)) continue;
           const dR = Math.abs(b.row - a.row);
