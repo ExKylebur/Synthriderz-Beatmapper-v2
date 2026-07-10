@@ -4945,6 +4945,42 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
                 // For remaining notes, swap direction sign at this point
               }
             }
+
+            // ── Entry boundary check ──────────────────────────────────────
+            // startCol/baseRow above are chosen by pure Math.random(), with zero
+            // awareness of wherever the hand actually was right before this run —
+            // the exact "region entry jump" class DenseSweep/GoldSweep were given a
+            // boundary-smoothing pass for (07-06), but GreenSweep never got one.
+            // Confirmed root cause (2026-07-10, "Jewelry Duty"): an entry landed 7
+            // rows from a rail companion that had JUST released, with well under 2s
+            // of real free time — clampC3Jumps can't fix it after the fact (green is
+            // an anchor by design, and the rail companion is itself position-locked),
+            // so a violation like this survives every critique iteration untouched.
+            // Green is either-hand, so "whatever note (any type/hand) came right
+            // before this run" is the right reachability proxy. Uniformly shifting
+            // the whole run preserves its internal sine-arc shape (same principle as
+            // RowLift's constant shift — deltas within the run are unaffected).
+            const _prevAny = result
+              .filter(n => n !== sorted[i] && n.beat < runStart)
+              .sort((a, b) => b.beat - a.beat)[0];
+            if (_prevAny) {
+              const _prevCol  = xToCol(_prevAny._x ?? 0);
+              const _entryCol = xToCol(sorted[i]._x);
+              const _dCol = _entryCol - _prevCol;
+              const _dRow = sorted[i].row - (_prevAny.row || 0);
+              const _colShift = Math.abs(_dCol) > 7 ? _dCol - Math.sign(_dCol) * 7 : 0;
+              const _rowShift = Math.abs(_dRow) > 5 ? _dRow - Math.sign(_dRow) * 5 : 0;
+              if (_colShift || _rowShift) {
+                for (let k = 0; k < take; k++) {
+                  const note = sorted[i + k];
+                  const c = xToCol(note._x) - _colShift;
+                  note._x  = COL_X[Math.max(0, Math.min(14, c))];
+                  note.row = clampRow(Math.round(note.row - _rowShift));
+                }
+                console.log(`[GreenSweep] Boundary-shifted entry (col${_colShift ? ' ' + -_colShift : ''}${_rowShift ? ' row ' + -_rowShift : ''}) to stay reachable from prior note`);
+              }
+            }
+
             greensAdded += take;
             runsInjected++;
             lastRunEnd = sorted[i + take - 1].beat;
