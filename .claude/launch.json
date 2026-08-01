@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "synthmapper-v2",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py"],
+      "port": 8090
+    }
+  ]
+}
