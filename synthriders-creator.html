@@ -5223,13 +5223,24 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           );
           if (railConflict) continue;
 
-          const row = clampRow(lastHandRow[hand] ?? 5);
+          // Row: was a frozen `lastHandRow[hand]` snapshot from wherever the main
+          // placement loop last left that hand — since gap-fill never updated it,
+          // EVERY fill note for a hand for the rest of the song landed on that one
+          // row (measured: ~43% of single-hand notes parked on a single row). Now a
+          // small bounded random walk off the previous gap-fill row (falls back to
+          // lastHandRow[hand] on the first fill), updated per-note so it actually
+          // varies. Gap-fill notes sit in silence with generous spacing (≥
+          // gapThreshBeats*0.5 apart), so a modest ±1-3 row step has plenty of time
+          // to read as a real move rather than a jump.
+          const row = clampRow(Math.max(diffRowMin, Math.min(diffRowMax,
+            (lastHandRow[hand] ?? 5) + (Math.floor(Math.random() * 5) - 2))));
           const x   = naturalX(hand, row, energyAt(ev.beat), false);
           result.push({ beat: ev.beat, row, type: hand, _x: x,
                         stemSource: ev.stemSource, _gapFill: true });
           beatOccupied.add(bk);
           windowFloor = ev.beat;
           gapFilled++;
+          lastHandRow[hand] = row;
         }
       }
 
@@ -7409,31 +7420,37 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const _xrails = result.filter(n => n.railEndBeat != null);
     const _xcol = n => Math.round(((n._x ?? 0) + 0.9555) / 0.1365);
     let _xc = 0, _xR = 0, _xL = 0, _xElig = 0;
+    // [Diag] per-hand candidate pool + rejection-reason breakdown — added 2026-08-01 to
+    // investigate the reported R/L crossover skew (~2-3x toward left, see handoff doc).
+    // Pure logging, no behavior change. Remove once the skew's cause is confirmed/fixed.
+    const _xDiag = { 0: { pool: 0, face: 0, spacing: 0, rail: 0, dense: 0, collision: 0, reach: 0, elig: 0 },
+                      1: { pool: 0, face: 0, spacing: 0, rail: 0, dense: 0, collision: 0, reach: 0, elig: 0 } };
     for (const hand of [0, 1]) {
       const opp = 1 - hand;
       const seq = result
         .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail)
         .sort((a, b) => a.beat - b.beat);
+      _xDiag[hand].pool = seq.length;
       let lastCrossBeat = -99;
       for (let i = 0; i < seq.length; i++) {
         const n = seq[i];
-        if (n.row < 4) continue;                                                 // skip face-height rows
-        if (n.beat - lastCrossBeat < 0.5) continue;                              // min spacing between crosses on a hand (was 1.0 — capped rate ~7%)
-        if (_xrails.some(r => r.type === opp && n.beat >= r.beat && n.beat <= r.railEndBeat)) continue;
+        if (n.row < 4) { _xDiag[hand].face++; continue; }                        // skip face-height rows
+        if (n.beat - lastCrossBeat < 0.5) { _xDiag[hand].spacing++; continue; }   // min spacing between crosses on a hand (was 1.0 — capped rate ~7%)
+        if (_xrails.some(r => r.type === opp && n.beat >= r.beat && n.beat <= r.railEndBeat)) { _xDiag[hand].rail++; continue; }
         // Skip crossovers in DENSE passages — a cross-body reach amid rapid notes is where the
         // controllers actually smack together (the opposite hand is busy right next to the
         // crossed position). >6 notes within ±1 beat (~>2.7 NPS) = too busy to cross safely.
-        if (result.reduce((c, m) => c + (Math.abs(m.beat - n.beat) <= 1.0 ? 1 : 0), 0) > 6) continue;
+        if (result.reduce((c, m) => c + (Math.abs(m.beat - n.beat) <= 1.0 ? 1 : 0), 0) > 6) { _xDiag[hand].dense++; continue; }
         const targetCol = hand === 0 ? 5 + Math.floor(Math.random() * 2)         // right → cols 5-6 (left of centre)
                                      : 8 + Math.floor(Math.random() * 2);        // left  → cols 8-9 (right of centre)
         // Collision gate: block if the opposite hand has a note within ±0.4 beat (widened from
         // 0.25 — notes 0.15-0.2 s apart were still colliding) that is column-close to the target.
         // A SEPARATED opposite note (opp hand out on its own side) IS the cross-body challenge → allow.
         if (result.some(m => m.type === opp && Math.abs(m.beat - n.beat) <= 0.4
-                          && Math.abs(_xcol(m) - targetCol) < COLLISION_SEP)) continue;
-        if (i > 0              && Math.abs(targetCol - _xcol(seq[i-1])) > MAX_REACH) continue;  // reachable in
-        if (i < seq.length - 1 && Math.abs(targetCol - _xcol(seq[i+1])) > MAX_REACH) continue;  // reachable out
-        _xElig++;
+                          && Math.abs(_xcol(m) - targetCol) < COLLISION_SEP)) { _xDiag[hand].collision++; continue; }
+        if ((i > 0              && Math.abs(targetCol - _xcol(seq[i-1])) > MAX_REACH) ||
+            (i < seq.length - 1 && Math.abs(targetCol - _xcol(seq[i+1])) > MAX_REACH)) { _xDiag[hand].reach++; continue; } // reachable in/out
+        _xElig++; _xDiag[hand].elig++;
         if (Math.random() >= CROSS_RATE) continue;
         n._x = COL_X[targetCol];
         n._crossover = true;
@@ -7442,6 +7459,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       }
     }
     if (_xc > 0) console.log(`[Crossover] ${_xc} cross-body accents (R${_xR}/L${_xL}) of ${_xElig} eligible at diff ${diff}`);
+    console.log(`[Crossover][Diag] R pool=${_xDiag[0].pool} face=${_xDiag[0].face} spacing=${_xDiag[0].spacing} rail=${_xDiag[0].rail} dense=${_xDiag[0].dense} collision=${_xDiag[0].collision} reach=${_xDiag[0].reach} elig=${_xDiag[0].elig} | L pool=${_xDiag[1].pool} face=${_xDiag[1].face} spacing=${_xDiag[1].spacing} rail=${_xDiag[1].rail} dense=${_xDiag[1].dense} collision=${_xDiag[1].collision} reach=${_xDiag[1].reach} elig=${_xDiag[1].elig}`);
   }
 
   // FINAL obstacle occlusion (free orbs only) — the last spatial word. Runs after
@@ -8805,6 +8823,13 @@ function getGeneratorModel() {
 async function callAnthropic(apiKey, body) {
   const MAX_RETRIES = 3;
   const BASE_DELAY  = 5000; // ms
+  // Some models (found 2026-08: Sonnet 5 / Opus 4.8 via the model dropdown) reject an
+  // explicit `temperature` param outright ("`temperature` is deprecated for this model")
+  // instead of just ignoring it — this silently broke the critic loop for any non-Haiku
+  // model selection (every iteration errored, loop only survived via the catch-and-continue
+  // in critiqueMap). Rather than hardcode which models accept it, strip it and retry once
+  // on this specific error — keeps `temperature: 0`'s determinism where supported (Haiku).
+  let _tempStripped = false;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     const res  = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -8818,6 +8843,15 @@ async function callAnthropic(apiKey, body) {
     });
     const data = await res.json();
     const _errType = data.error?.type;
+    if (!_tempStripped && 'temperature' in body &&
+        /temperature/i.test(data.error?.message || '') &&
+        /deprecated|not supported|unsupported/i.test(data.error?.message || '')) {
+      console.warn(`[API] temperature rejected by model (${data.error.message}) — retrying without it`);
+      const { temperature, ...rest } = body;
+      body = rest;
+      _tempStripped = true;
+      continue;
+    }
     if (_errType === 'overloaded_error' || _errType === 'rate_limit_error') {
       // BOTH are transient. rate_limit_error (429) previously fell through un-retried —
       // one burst over a per-minute budget instantly failed the whole song in batch.
@@ -11069,8 +11103,12 @@ Rules:
       }
       const data = await callAnthropic(apiKey, {
         model: getGeneratorModel(),
-        max_tokens: 4000,  // raised from 1800 — long songs (15-20 sections) were truncating,
-                           // producing "Unterminated string in JSON" and killing iter 1.
+        max_tokens: 8000,  // raised from 1800, then 4000 (2026-08: Sonnet 5/Opus 4.8 via the
+                           // model dropdown produce noticeably more verbose section JSON than
+                           // Haiku and were hitting 4000 before even one complete section —
+                           // truncation-repair had nothing to recover, generation failed
+                           // outright). Long songs (15-20 sections) were the original reason
+                           // for raising it at all; matches the critic's own 8192 ceiling.
         messages
       });
       if (data.error) throw new Error(`${data.error.type || 'API error'}: ${data.error.message}`);
