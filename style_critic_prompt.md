@@ -32,7 +32,7 @@ The generator reshapes some sections into deliberate choreography. Sampled notes
 
 - **[GoldSweep] `pattern:"gold"`** — gold runs of 3+ shaped along a 5-shape palette (diagonal/circle/pendulum/wave/valley), moving in BOTH axes (cols 3–11, rows 2–8), ≤3 Manhattan step/orb. Vertical/curved/non-linear gold motion is intentional. Gold-to-gold spacing exempt from C2.
 - **[DenseSweep] `pattern:"dense"`** — dense runs choreographed from a 14-move library incl. **spiral** and **spike** shapes, ≤3 Manhattan step/hand/beat. A dense run may trace a spiral or spike, not just a simple arc.
-- **[RailShapes]** — rails rolled from ellipse (~50%) / wave (~25%) / zigzag (~15%) / pendulum (~10%). A zigzag/wave rail is intentional shaping, not "erratic"; it satisfies the ≥60% X-variation target.
+- **[RailShapes]** — shape is length-tiered, not one flat roll: short rails (<2.5 beats) use ellipse/hook/flick; mid (2.5–8 beats) add wave/zigzag/pendulum/switchback/ramp; long (8+ beats) add spiral/figure8/staircase. Sharp corners (hook/flick/switchback), a tightening spiral, a figure-8 crossing pattern, or discrete stair-step rows are all intentional shaping, not "erratic" — they satisfy the ≥60% X-variation target the same way the older ellipse/wave/zigzag/pendulum set did.
 
 **Scope:** do NOT score pattern-tagged notes as jittery flow or flag them as C3 jumps — their per-step caps keep them reachable. BUT this pass does NOT excuse loose (non-pattern) sections. Use `flow_metrics.nonpattern_big_jumps` (jumps exceeding C3 limits where NOT both endpoints are pattern-tagged) to catch real problems in loose sections and region boundaries — flag those with their beats.
 
@@ -196,7 +196,7 @@ Only C1–C6 are auto-fail. **NEVER** mark CRITICAL for: hand balance, gold/gree
 - **C3 — unreachable jump:** same-hand consecutive: row diff >5 OR col diff >7. Opposite-hand same-beat: col sep >10 OR row sep >8. Gold (type 3) excluded from same-hand sequence. Flag: `CRITICAL: C3 — [hand] at Xs jumps N rows / N cols (limit 5 rows / 7 cols same-hand)`.
 - **C4 — extreme layer over-concentration:** Ceiling >2% of notes, OR low_minus+floor combined >1%. Flag: `CRITICAL: Ceiling layer over-used — X% (max 2%)`.
 - **C5 — rail crossing:** (a) opposite-hand invasion of active rail space (see rail integrity); (b) rail waypoints cross center then reverse within 4 beats (wrist collision). Flag: `CRITICAL: [type] note at Xs invades active [hand] rail space`.
-- **C6 — note in blocked zone during obstacle** (window = beat through beat+duration+2): crouch → rows 0–3 blocked; leanLeft → right-hand col≥11 AND row≤4 blocked; leanRight → left-hand col≤3 AND row≤4 blocked. Only flag notes STILL blocked after the generator's repositioning. Slide obstacles don't block arm reach. Flag: `CRITICAL: row R note at Xs unreachable during crouch`.
+- **C6 — note in blocked zone during obstacle** (window = beat through beat+duration+2): crouch → rows 0–3 blocked. Lean walls are a triangular prism, wide at the top — the blocked column is TAPERED, not flat: leanLeft → right-hand blocked above ~col 8 at rows 0–1, widening to ~col 12 at row 8; leanRight is the mirror (left-hand blocked below ~col 6 at rows 0–1, narrowing to ~col 2 at row 8). Use the row-appropriate end of that range, not a single flat threshold. Only flag notes STILL blocked after the generator's repositioning. Slide obstacles don't block arm reach. Flag: `CRITICAL: row R note at Xs unreachable during crouch`.
 
 ---
 
