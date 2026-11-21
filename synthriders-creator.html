@@ -1427,6 +1427,19 @@ const OBSTACLE_BUFFER_BEATS = 2;
 // reads and enters the obstacle. Adjustable.
 const OBSTACLE_LEAD_BEATS = 2;
 
+// ── Cross-centre reach — how far a hand may go PAST centre (col 7) ─────────────
+// Matches the deliberate [Crossover] targets (cols 5-6 / 8-9), DenseSweep's crossReturn
+// move, and validate.py's ZONE check (3+ cols past centre = unreachable → HARD fail).
+// handZoneCols() is the single source for a hand's column range; cross=true widens it by
+// this reach, never to the full grid. A full 0-14 zone let single-arm rails travel to
+// col 13 / col 1 (lateral shapes target zone-edge ∓ 1), which validate flagged as ZONE.
+const CROSS_REACH_COLS = 2;
+function handZoneCols(hand, cross = false) {
+  const reach = cross ? CROSS_REACH_COLS : 0;
+  return hand === 0 ? { colMin: 7 - reach, colMax: 14 }
+                    : { colMin: 0,         colMax: 7 + reach };
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
@@ -3472,8 +3485,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   // free-orb occlusion all exclude the same 4-column band.
   let colMinConstraint = null, colMaxConstraint = null;
   if (obstacleConstraints) {
-    const colMin = allowCrossCenter ? 0  : (hand === 0 ? 7  : 0);
-    const colMax = allowCrossCenter ? 14 : (hand === 0 ? 14 : 7);
+    const { colMin, colMax } = handZoneCols(hand, allowCrossCenter);
     // Check if obstacles exist on far-right (cols 11-14 for right hand) or far-left (cols 0-3 for left hand)
     const hasRightObs = obstacleConstraints.hasRightObs;
     const hasLeftObs  = obstacleConstraints.hasLeftObs;
@@ -3501,8 +3513,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
     return best;
   }
 
-  let colMin = allowCrossCenter ? 0  : (hand === 0 ? 7  : 0);
-  let colMax = allowCrossCenter ? 14 : (hand === 0 ? 14 : 7);
+  let { colMin, colMax } = handZoneCols(hand, allowCrossCenter);
   // [FEAT-1] Apply obstacle constraints if provided
   if (colMinConstraint !== null) colMin = Math.max(colMin, colMinConstraint);
   if (colMaxConstraint !== null) colMax = Math.min(colMax, colMaxConstraint);
@@ -3970,7 +3981,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const focusEnd   = hints.focusSectionEndBeat   ??  Infinity;
   function inFocus(beat) { return beat >= focusStart && beat <= focusEnd; }
 
+  // snapBeat takes SECONDS (onset times) → snapped beat. snapToGrid takes a BEAT → snapped beat.
+  // Passing a beat to snapBeat multiplies it by bps (~2-3x): that bug sat in 8 call sites since
+  // the v2 baseline — gold accents/climax landed past the song end, the rail-synthesis fallback
+  // broke out of its candidate loop immediately (so under-railed sections never got rails), and
+  // solo-density fills / chorus-buildup golds missed their sections. Found 2026-11-21.
   function snapBeat(t)    { return Math.round(t * bps / snapSize) * snapSize; }
+  function snapToGrid(b)  { return Math.round(b / snapSize) * snapSize; }
   function energyAt(beat) {
     if (!energyCurve?.length) return 0.5;
     return energyCurve[Math.min(Math.floor(beat), energyCurve.length - 1)];
@@ -5347,8 +5364,16 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           // varies. Gap-fill notes sit in silence with generous spacing (≥
           // gapThreshBeats*0.5 apart), so a modest ±1-3 row step has plenty of time
           // to read as a real move rather than a jump.
-          const row = clampRow(Math.max(diffRowMin, Math.min(diffRowMax,
-            (lastHandRow[hand] ?? 5) + (Math.floor(Math.random() * 5) - 2))));
+          // Bounded to the comfortable band (rows 2-8, same as [DenseSweep]) with a gentle
+          // pull toward mid-height. A walk clamped only at diffRowMin piles up against the
+          // edge — at Master that edge is row 0, and [RowLift] then lifts row 1 into it too.
+          // Measured on Another Life (Master): 10 of the 14 ceiling notes were gap-fill,
+          // tripping CRITICAL C4 (ceiling >2%) on 4 of 5 critique iterations.
+          const _gfLo = Math.max(diffRowMin, 2), _gfHi = Math.min(diffRowMax, 8);
+          const _gfPrev = lastHandRow[hand] ?? 5;
+          const _gfPull = _gfPrev <= 3 ? 1 : _gfPrev >= 7 ? -1 : 0;
+          const row = clampRow(Math.max(_gfLo, Math.min(_gfHi,
+            _gfPrev + (Math.floor(Math.random() * 5) - 2) + _gfPull)));
           const x   = naturalX(hand, row, energyAt(ev.beat), false);
           result.push({ beat: ev.beat, row, type: hand, _x: x,
                         stemSource: ev.stemSource, _gapFill: true });
@@ -5591,7 +5616,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const fillStep = secBeats / (needed + 1);
       for (let fi = 1; fi <= needed; fi++) {
         const fb  = sec.startBeat + fillStep * fi;
-        const fbs = snapBeat(fb);
+        const fbs = snapToGrid(fb);
         const fk  = Math.round(fbs * 100);
         if (beatOccupied.has(fk) || fbs >= sec.endBeat) continue;
         const fillRow = Math.max(diffRowMin, Math.min(diffRowMax,
@@ -5628,6 +5653,18 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const applyObstacleOcclusion = (freeOrbsOnly = false) => {
     if (hints.noObstacles) return;
     const _skip = n => n.railEndBeat !== undefined || (freeOrbsOnly && n._comp);
+    // Relocate note n (currently at `col`) into the safe column band [lo, hi].
+    // Loose notes get a random column in the band (spread, so a cluster doesn't pile onto
+    // one column). [DenseSweep] notes are CLAMPED to the nearest band edge instead: a dense
+    // run is a choreographed move whose per-beat steps are reachability-capped, and an
+    // independent random pick per note scrambled it into jitter. Measured on Painkiller
+    // (Master, 76% dense): 13.9% of dense steps broke the move's step cap inside side-wall
+    // windows vs 8.3% outside. Clamping is 1-Lipschitz — it can only shrink the distance
+    // between two neighbours, never grow it — so occlusion cannot add a jump to a dense run.
+    const _toBand = (n, col, lo, hi) => {
+      n._x = COL_X[n._denseSweep ? Math.max(lo, Math.min(hi, col))
+                                 : lo + Math.floor(Math.random() * (hi - lo + 1))];
+    };
     for (const w of autoWalls) {
       // Symmetric clearance window: lead-in BEFORE + reaction buffer AFTER, so the
       // obstacle-side columns are clear as the player approaches, holds, and exits.
@@ -5638,7 +5675,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue; // rail heads stay (arc sweeps overhead)
-          if (n.row <= 3) n.row = 4 + Math.floor(Math.random() * 4); // rows 4-7
+          if (n.row <= 3) n.row = n._denseSweep ? 4 : 4 + Math.floor(Math.random() * 4); // rows 4-7 (dense: nearest safe row, see _toBand)
         }
       } else if (w.wallType === 'leanLeft') {
         // LeanLeft: obstacle on the RIGHT side. Player leans LEFT (AWAY from the obstacle).
@@ -5652,13 +5689,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 0) {
-            if (col > 8) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 8–10)
+            if (col > 8) _toBand(n, col, 6, 8); // cols 6–8 (was 8–10)
           } else if (n.type === 1) {
-            if (col > 5 || col < 2) n._x = COL_X[2 + Math.floor(Math.random() * 4)]; // cols 2–5
+            if (col > 5 || col < 2) _toBand(n, col, 2, 5); // cols 2–5
           } else if (n.type === 2) {
-            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
+            if (col < 5 || col > 8) _toBand(n, col, 5, 8); // cols 5–8
           } else if (n.type === 3) {
-            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
+            if (col < 5 || col > 8) _toBand(n, col, 5, 8); // cols 5–8
           }
         }
       } else if (w.wallType === 'leanRight') {
@@ -5671,13 +5708,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 1) {
-            if (col < 6) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 4–6)
+            if (col < 6) _toBand(n, col, 6, 8); // cols 6–8 (was 4–6)
           } else if (n.type === 0) {
-            if (col < 9) n._x = COL_X[9 + Math.floor(Math.random() * 4)]; // cols 9–12
+            if (col < 9) _toBand(n, col, 9, 12); // cols 9–12
           } else if (n.type === 2) {
-            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
+            if (col < 6 || col > 9) _toBand(n, col, 6, 9); // cols 6–9
           } else if (n.type === 3) {
-            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
+            if (col < 6 || col > 9) _toBand(n, col, 6, 9); // cols 6–9
           }
         }
       } else if (w.wallType === 'slide') {
@@ -5695,10 +5732,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           const col = xToCol(n._x ?? 0);
           if (sType === 0) {            // box on the HIGH-column side
             if ((n.type === 0 || n.type === 2 || n.type === 3) && col > 7)
-              n._x = COL_X[5 + Math.floor(Math.random() * 3)];                 // cols 5–7
+              _toBand(n, col, 5, 7);                 // cols 5–7
           } else if (sType === 4) {     // box on the LOW-column side
             if ((n.type === 1 || n.type === 2 || n.type === 3) && col < 7)
-              n._x = COL_X[7 + Math.floor(Math.random() * 3)];                 // cols 7–9
+              _toBand(n, col, 7, 9);                 // cols 7–9
           } else if (sType === 3) {
             if (n.row >= 4 && n.row <= 6) n.row = Math.random() < 0.5
               ? Math.max(diffRowMin, n.row - 3)
@@ -5747,7 +5784,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     // Gather high-energy candidates (quarter-note steps, energy ≥ 0.70)
     const gaCandidates = [];
     for (let b = 8; b < totalBeats - 8; b += 4) {
-      const bs = snapBeat(b);
+      const bs = snapToGrid(b);
       if (energyAt(bs) < 0.70) continue;
       if (beatOccupied.has(Math.round(bs * 100))) continue;
       if (result.some(n => n.railEndBeat !== undefined && bs >= n.beat && bs <= n.railEndBeat)) continue;
@@ -5779,7 +5816,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const sweepSteps = [];
       let col = startCol, b = startBeat;
       while (goLeft ? col <= endCol : col >= endCol) {
-        sweepSteps.push({ beat: snapBeat(b), col });
+        sweepSteps.push({ beat: snapToGrid(b), col });
         col += 2 * colDir;
         b   += stepSize;
       }
@@ -6520,7 +6557,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       for (let inj = 0; inj < needed; inj++) {
         const pct = (inj + 1) / (needed + 1);
         const targetBeat = sec.startBeat + (sec.endBeat - sec.startBeat) * pct;
-        const bs = snapBeat(targetBeat);
+        const bs = snapToGrid(targetBeat);
         // Find a nearby orb to upgrade
         const idx = result.findIndex(n =>
           (n.type === 0 || n.type === 1) && n.railEndBeat === undefined &&
@@ -6571,7 +6608,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const e = energyAt(b);
       if (e > bestE) { bestE = e; bestBeat = b; }
     }
-    const bs = snapBeat(bestBeat);
+    const bs = snapToGrid(bestBeat);
     // Is there already a gold at/near the climax peak? (within 2 beats)
     const goldAtPeak = result.find(n => n.type === 3 && Math.abs(n.beat - bs) < 2.0);
     if (!goldAtPeak) {
@@ -6654,7 +6691,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const step = snapSize * 4; // quarter-note steps
       const candidates = [];
       for (let b = sStart; b < sEnd - MIN_RAIL_DUR; b += step) {
-        const bs = snapBeat(b);
+        const bs = snapToGrid(b);
         if (bs >= sEnd - MIN_RAIL_DUR) break;
         if (beatOccupied.has(Math.round(bs * 100))) continue;
         const insideRail = result.some(n => n.railEndBeat !== undefined &&
@@ -6686,11 +6723,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         // Duration: extend as far as possible (up to MAX_RAIL_DUR) before the next occupied beat
         let railDur = MIN_RAIL_DUR;
         for (let d = MIN_RAIL_DUR + snapSize; d <= MAX_RAIL_DUR; d += snapSize) {
-          const eb = snapBeat(rb + d);
+          const eb = snapToGrid(rb + d);
           if (eb >= sEnd || beatOccupied.has(Math.round(eb * 100))) break;
           railDur = d;
         }
-        const endBeat = Math.min(snapBeat(rb + railDur), sEnd - snapSize, totalBeats - snapSize);
+        const endBeat = Math.min(snapToGrid(rb + railDur), sEnd - snapSize, totalBeats - snapSize);
         if (endBeat - rb < MIN_RAIL_DUR) continue;
 
         const midRow = Math.max(diffRowMin, Math.min(diffRowMax, Math.round(win.avgRow ?? 5)));
@@ -8909,8 +8946,24 @@ function toast(msg, type) {
 
 
 
+// Sentinel returned by getApiKey() when the field is empty but server.py holds a key
+// (env ANTHROPIC_API_KEY or .anthropic_key). callAnthropic then posts to the local /anthropic
+// proxy, which adds the key server-side — the key itself never enters the page.
+const SERVER_KEY = '__server_key__';
+let _serverKeyAvailable = false;
+async function probeServerKey() {
+  if (!/^https?:/.test(location.protocol)) return;
+  try {
+    const r = await fetch('/api_key_status');
+    _serverKeyAvailable = r.ok && !!(await r.json()).server_key;
+  } catch { _serverKeyAvailable = false; }
+  const el = document.getElementById('apiKey');
+  if (_serverKeyAvailable && el && !el.value) el.placeholder = 'Using key from server (leave blank)';
+}
+
 function getApiKey() {
   const key = document.getElementById('apiKey').value.trim();
+  if (!key && _serverKeyAvailable) return SERVER_KEY;
   if (!key) throw new Error('Enter your Anthropic API key in the AI First Pass section first.');
   if (!key.startsWith('sk-')) throw new Error('API key should start with "sk-" — check console.anthropic.com.');
   return key;
@@ -8935,16 +8988,22 @@ async function callAnthropic(apiKey, body) {
   // on this specific error — keeps `temperature: 0`'s determinism where supported (Haiku).
   let _tempStripped = false;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const res  = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify(body),
-    });
+    const res  = apiKey === SERVER_KEY
+      ? await fetch('/anthropic', {                      // server adds the key (local-only)
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify(body),
+        })
+      : await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+          body: JSON.stringify(body),
+        });
     const data = await res.json();
     const _errType = data.error?.type;
     if (!_tempStripped && 'temperature' in body &&
@@ -13661,6 +13720,11 @@ async function checkLibSuggestByHash(hash) {
   // If fields are already filled with the SAME song, this is a re-upload — still show banner.
   // If fields are filled with a DIFFERENT song, stay silent (don't clobber user's work).
   if (fieldsPopulated && _libKey(titleEl.value, artistEl.value) !== entry.key) return;
+  if (_autoApplyLib) {                       // ?song= dev autoload: apply without the banner
+    _autoApplyLib = false;
+    console.log(`[DevSong] Library match "${entry.title}" applied`);
+    return loadLibraryEntry(entry);
+  }
   _libSuggestEntry = entry;
   const isReupload = !!fieldsPopulated;
   document.getElementById('libSuggestLabel').textContent = isReupload
@@ -13935,7 +13999,31 @@ function renderLibraryGrid(filter) {
 }
 
 // Close on overlay background click — deferred because libOverlay is rendered after this script block
+// Dev autoload: `?song=<filename substring>` pulls the file from server.py's /dev_song
+// (the ../MP3 folder) and feeds it through the normal upload handler, so a generation can
+// be driven end-to-end without the native file picker. A library hash match is applied
+// automatically (title/artist/BPM) instead of waiting on the banner click.
+let _autoApplyLib = false;
+async function devAutoloadSong() {
+  const q = new URLSearchParams(location.search).get('song');
+  if (!q || !/^https?:/.test(location.protocol)) return;
+  try {
+    const r = await fetch('/dev_song?q=' + encodeURIComponent(q));
+    if (!r.ok) { console.warn('[DevSong]', (await r.json()).error); return; }
+    const name = decodeURIComponent(r.headers.get('X-Song-Name') || (q + '.ogg'));
+    const file = new File([await r.blob()], name);
+    const dt = new DataTransfer(); dt.items.add(file);
+    const inp = document.getElementById('audioFile');
+    inp.files = dt.files;
+    _autoApplyLib = true;
+    inp.dispatchEvent(new Event('change'));
+    console.log(`[DevSong] Loaded "${name}" via server`);
+  } catch (e) { console.warn('[DevSong] autoload failed:', e.message); }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
+  probeServerKey();
+  devAutoloadSong();
   document.getElementById('libOverlay')?.addEventListener('click', e => {
     if (e.target === document.getElementById('libOverlay')) closeLibraryModal();
   });

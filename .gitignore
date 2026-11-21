@@ -50,6 +50,7 @@ API*Key*.txt
 *.env
 .env
 secrets.json
+.anthropic_key
 
 # Temp/scratch files from dev tooling
 _combined.js
