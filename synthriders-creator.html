@@ -1671,6 +1671,47 @@ function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, m
   return { runs, tagged, smoothed: smoothPatternBoundaries(orbs) };
 }
 
+// ── [PatternCoverage] keep choreographed coverage in band ─────────────────────────────
+// Coverage = share of ALL notes owned by a shape: rails (heads + companions), DenseSweep,
+// SparseSweep, GoldSweep. Under the band: one promotion attempt (caller passes a relaxed
+// SparseSweep). Over the band: demote SparseSweep runs (shortest first), then DenseSweep,
+// restoring each note's pre-sweep position. Rails and GoldSweep are never touched.
+const PATTERN_COVERAGE_BAND = { lo: 0.60, hi: 0.80 };
+function isCoverageNote(n) { return n.railEndBeat !== undefined || !!n._comp || isPattern(n) || !!n._goldSweep; }
+function patternCoverage(notes) { return notes.length ? notes.filter(isCoverageNote).length / notes.length : 0; }
+// Runs of `tag`-tagged notes split at gaps > 2 beats.
+function patternRuns(notes, tag) {
+  const tagged = notes.filter(n => n[tag]).sort((a, b) => a.beat - b.beat);
+  const runs = [];
+  for (const n of tagged) {
+    const cur = runs[runs.length - 1];
+    if (cur && n.beat - cur[cur.length - 1].beat <= 2) cur.push(n); else runs.push([n]);
+  }
+  return runs;
+}
+function enforcePatternCoverage(result, { band = PATTERN_COVERAGE_BAND, promote = () => ({ tagged: 0 }) } = {}) {
+  const before = patternCoverage(result);
+  let promoted = 0, demoted = 0;
+  if (before < band.lo) promoted = promote().tagged || 0;
+  const floorCount = Math.ceil(band.lo * result.length);
+  let covered = result.filter(isCoverageNote).length;
+  let excess = covered - Math.floor(band.hi * result.length);
+  for (const tag of ['_sparseSweep', '_denseSweep']) {
+    if (excess <= 0) break;
+    for (const run of patternRuns(result, tag).sort((a, b) => a.length - b.length)) {
+      if (excess <= 0) break;
+      if (covered - run.length < floorCount) continue;        // would overshoot BELOW the band — skip
+      covered -= run.length;
+      for (const n of run) {
+        if (n._preSweep) { n._x = n._preSweep.x; n.row = n._preSweep.row; }
+        delete n[tag]; delete n._preSweep; delete n._crossover;
+        if (!isCoverageNote(n)) { excess--; demoted++; }
+      }
+    }
+  }
+  return { before, after: patternCoverage(result), promoted, demoted };
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
