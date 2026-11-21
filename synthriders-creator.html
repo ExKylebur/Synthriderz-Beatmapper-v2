@@ -5834,14 +5834,14 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const _skip = n => n.railEndBeat !== undefined || (freeOrbsOnly && n._comp);
     // Relocate note n (currently at `col`) into the safe column band [lo, hi].
     // Loose notes get a random column in the band (spread, so a cluster doesn't pile onto
-    // one column). [DenseSweep] notes are CLAMPED to the nearest band edge instead: a dense
+    // one column). Pattern notes (isPattern: DenseSweep/SparseSweep) are CLAMPED to the nearest band edge instead: a dense
     // run is a choreographed move whose per-beat steps are reachability-capped, and an
     // independent random pick per note scrambled it into jitter. Measured on Painkiller
     // (Master, 76% dense): 13.9% of dense steps broke the move's step cap inside side-wall
     // windows vs 8.3% outside. Clamping is 1-Lipschitz — it can only shrink the distance
     // between two neighbours, never grow it — so occlusion cannot add a jump to a dense run.
     const _toBand = (n, col, lo, hi) => {
-      n._x = COL_X[n._denseSweep ? Math.max(lo, Math.min(hi, col))
+      n._x = COL_X[isPattern(n) ? Math.max(lo, Math.min(hi, col))
                                  : lo + Math.floor(Math.random() * (hi - lo + 1))];
     };
     for (const w of autoWalls) {
@@ -5854,7 +5854,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue; // rail heads stay (arc sweeps overhead)
-          if (n.row <= 3) n.row = n._denseSweep ? 4 : 4 + Math.floor(Math.random() * 4); // rows 4-7 (dense: nearest safe row, see _toBand)
+          if (n.row <= 3) n.row = isPattern(n) ? 4 : 4 + Math.floor(Math.random() * 4); // rows 4-7 (dense: nearest safe row, see _toBand)
         }
       } else if (w.wallType === 'leanLeft') {
         // LeanLeft: obstacle on the RIGHT side. Player leans LEFT (AWAY from the obstacle).
@@ -7706,7 +7706,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (const hand of [0, 1]) {
       const opp = 1 - hand;
       const seq = result
-        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail)
+        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail && !n._sparseSweep)
         .sort((a, b) => a.beat - b.beat);
       _xDiag[hand].pool = seq.length;
       let lastCrossBeat = -99;
@@ -10047,7 +10047,7 @@ function clampC3Jumps(notes, bps) {
   // iteration. A solo, untagged gold/green orb isn't part of any shape worth protecting,
   // unlike a GoldSweep run or a rail's curve — safe to reposition as a deliberate last resort.
   const _movableLastResort = (n, h) => (n.type === 2 || n.type === 3) && n.railEndBeat == null &&
-    !n._comp && !n._denseSweep && !n._goldSweep &&
+    !n._comp && !isPattern(n) && !n._goldSweep &&
     !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat);
   let clamped = 0, stuck = 0;
   for (let pass = 0; pass < 2; pass++) {
@@ -10063,8 +10063,8 @@ function clampC3Jumps(notes, bps) {
         // pick the note to move: prefer loose (non-pattern) movable, then any movable,
         // then (last resort) an untagged solo gold/green orb
         let mv = null;
-        if      (!b._denseSweep && _movable(b, h)) mv = b;
-        else if (!a._denseSweep && _movable(a, h)) mv = a;
+        if      (!isPattern(b) && _movable(b, h)) mv = b;
+        else if (!isPattern(a) && _movable(a, h)) mv = a;
         else if (_movable(b, h))                   mv = b;
         else if (_movable(a, h))                   mv = a;
         else if (_movableLastResort(b, h))         mv = b;
@@ -10298,7 +10298,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         : null,
       // pattern: which choreography pass placed this note ('dense'/'gold'), else omitted.
       // Lets the critic accept intended in-pattern movement while still judging loose sections.
-      ...(n._denseSweep ? { pattern: 'dense' } : n._goldSweep ? { pattern: 'gold' } : {}),
+      ...(n._denseSweep ? { pattern: 'dense' } : n._sparseSweep ? { pattern: 'sparse' } : n._goldSweep ? { pattern: 'gold' } : {}),
     }));
 
   // Row distribution across 11 layers (Ceiling … Floor)
@@ -10451,7 +10451,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         if (a.type === 3 && b.type === 3 && h === 1) continue; // gold-gold pair is identical in both hands' walks — count once (h=0)
         if (sameRailWindow(a, b, _railsByHandNP, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
-        if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
+        if ((isPattern(a) || a._goldSweep) && (isPattern(b) || b._goldSweep)) continue; // both in a pattern → intended
         const dCol = Math.abs(xToColF(b._x) - xToColF(a._x));
         const dRow = Math.abs((b.row || 0) - (a.row || 0));
         if (dCol > 7 || dRow > 5) {
@@ -10750,7 +10750,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const _c3Detail = [];
       // tag string for diagnosis: which pass owns each offending note
       const _tags = n => [n.railEndBeat != null && 'rail', n._comp && 'comp',
-        n._denseSweep && 'dsw', n._goldSweep && 'gsw', n._crossover && 'xover',
+        n._denseSweep && 'dsw', n._sparseSweep && 'ssw', n._goldSweep && 'gsw', n._crossover && 'xover',
         n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
       const _railsByHandFin = buildRailsByHand(currentNotes);
       for (let h = 0; h <= 1; h++) {

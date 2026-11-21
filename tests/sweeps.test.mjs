@@ -33,3 +33,13 @@ test('smoothPatternBoundaries nudges only the loose side, to exactly the C3 limi
   assert.equal(loose2.row, 5);
   assert.equal(colOf(anchor._x), 0);
 });
+
+import { appSource } from './harness.mjs';
+test('pattern checks go through isPattern (no stray _denseSweep-only gates)', () => {
+  const src = appSource();
+  for (const bad of ['n._denseSweep ? Math.max(lo', 'n._denseSweep ? 4 :',
+    "!b._denseSweep && _movable(b, h)", "!a._denseSweep && _movable(a, h)",
+    '(a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)'])
+    assert.ok(!src.includes(bad), `still present: ${bad}`);
+  assert.ok(src.includes("n._sparseSweep ? { pattern: 'sparse' }"));
+});
