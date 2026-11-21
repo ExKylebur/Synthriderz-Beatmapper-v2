@@ -3669,7 +3669,7 @@ function railWaypointCount(railShape, len, stairSteps) {
 // Rails travel from xStart to a chosen xEnd column, like Y travels from rowStart to rowEnd.
 // hand: 0 = right, 1 = left. allowCrossCenter: single-arm sections may sweep across X=0.
 // bpm: used to guarantee at least 1 waypoint per second of rail duration.
-function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 0, hand = 0, allowCrossCenter = false, swayBoost = 1.0, bpm = 120, obstacleConstraints = null, walls = null) {
+function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 0, hand = 0, allowCrossCenter = false, swayBoost = 1.0, bpm = 120, obstacleConstraints = null, walls = null, motifPlan = null) {
   const len = endBeat - startBeat;
   if (len < 1.0) return { waypoints: [], xEnd: xStart, rowEnd };
 
@@ -3714,6 +3714,20 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   if (colMaxConstraint !== null) colMax = Math.min(colMax, colMaxConstraint);
   const startCol = colIdxOf(xStart);
 
+  // Per-point clamp: hand zone, playable rows, then the row-aware obstacle band when real
+  // walls are known. The obstacle step is what lets the wider-travelling shapes above be
+  // safe — a spiral or figure8 reaching a high row near the zone edge is exactly the path
+  // that lands in a lean prism's full-width top.
+  const clampPt = (col, row, beat) => {
+    const r = Math.max(1, Math.min(8, Math.round(row)));
+    let c = Math.max(colMin, Math.min(colMax, Math.round(col)));
+    if (walls && walls.length) {
+      const band = obstacleBandAt(walls, beat, beat, r, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+      c = Math.max(band.minCol, Math.min(band.maxCol, c));
+    }
+    return { col: c, row: r };
+  };
+
   // ── Rail path parametrization — shape palette ───────────────────────────────
   // The rail traces a path in col x row space parametrized over t in [0,1]. Shapes are
   // picked from a LENGTH TIER, because a rail's beat length sets its waypoint budget and
@@ -3732,39 +3746,68 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   // [colMin,colMax], rows [1,8] (keeping companions/fixC1 and the C4 floor budget safe) AND
   // to the row-aware obstacle band when real walls are known — the wider row/column travel
   // these shapes use is exactly what walks into a lean prism's wide top otherwise.
+  // Rails >= 6 beats chain 2-3 of these shapes (planRailSegments); see the multi-segment block below.
   const rng = Math.random();
   const _shapeRoll = Math.random();
-  const railShape = pickRailShape(len, _shapeRoll);
-  const { posAt, stairSteps } = buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng);
-  const numWP = railWaypointCount(railShape, len, stairSteps);
+  // Multi-segment plan for rails >= 6 beats (or a replayed chorus motif). Below 6 beats with
+  // no motif this is null and the legacy single-shape path runs with an identical RNG
+  // sequence (golden test vs acd1853).
+  const plan = motifPlan ? fitRailPlan(motifPlan, len) : planRailSegments(len);
 
-  // Per-point clamp: hand zone, playable rows, then the row-aware obstacle band when real
-  // walls are known. The obstacle step is what lets the wider-travelling shapes above be
-  // safe — a spiral or figure8 reaching a high row near the zone edge is exactly the path
-  // that lands in a lean prism's full-width top.
-  const clampPt = (col, row, beat) => {
-    const r = Math.max(1, Math.min(8, Math.round(row)));
-    let c = Math.max(colMin, Math.min(colMax, Math.round(col)));
-    if (walls && walls.length) {
-      const band = obstacleBandAt(walls, beat, beat, r, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
-      c = Math.max(band.minCol, Math.min(band.maxCol, c));
+  if (!plan || plan.length === 1) {
+    const railShape = plan ? plan[0].shape : pickRailShape(len, _shapeRoll);
+    const { posAt, stairSteps } = buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng);
+    const numWP = railWaypointCount(railShape, len, stairSteps);
+    const waypoints = [];
+    for (let i = 1; i <= numWP; i++) {
+      const t    = i / (numWP + 1);
+      const p    = posAt(t);
+      const beat = Math.round((startBeat + len * t) / snapSz) * snapSz;
+      const wp   = clampPt(p.col, p.row, beat);
+      waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
     }
-    return { col: c, row: r };
-  };
-
-  const waypoints = [];
-  for (let i = 1; i <= numWP; i++) {
-    const t    = i / (numWP + 1);
-    const p    = posAt(t);
-    const beat = Math.round((startBeat + len * t) / snapSz) * snapSz;
-    const wp   = clampPt(p.col, p.row, beat);
-    waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
+    const pEnd = posAt(1);
+    const end  = clampPt(pEnd.col, pEnd.row, endBeat);
+    return { waypoints, xEnd: COL_X[end.col], rowEnd: end.row,
+             plan: [{ frac: 1, shape: railShape }],
+             segments: [{ shape: railShape, startCol, startRow: rowStart, endCol: end.col, endRow: end.row, count: numWP + 1 }] };
   }
 
-  // Path-determined endpoint so callers can store the true end position
-  const pEnd = posAt(1);
-  const end  = clampPt(pEnd.col, pEnd.row, endBeat);
-  return { waypoints, xEnd: COL_X[end.col], rowEnd: end.row };
+  // Multi-segment: share the 12-waypoint render cap in proportion to segment length, >= 3 per
+  // segment so corner shapes keep a node on their corner. Each segment's LAST waypoint lands
+  // exactly on its end (t=1) and the next segment seeds from that CLAMPED point — seeding
+  // from the unclamped posAt(1) would leave a gap at the seam whenever a wall clamped it.
+  const nSeg   = plan.length;
+  const budget = Math.min(12, Math.max(3 * nSeg, Math.round(len * 1.2)));
+  const counts = plan.map(s => Math.max(3, Math.round(budget * s.frac)));
+  while (counts.reduce((a, b) => a + b, 0) > 12) counts[counts.indexOf(Math.max(...counts))]--;
+  const waypoints = [], segments = [];
+  let segStart = startBeat, curCol = startCol, curRow = rowStart;
+  for (let k = 0; k < nSeg; k++) {
+    const segLen = len * plan[k].frac;
+    const { posAt: rawAt } = buildRailPath(plan[k].shape, segLen, curCol, curRow, colMin, colMax, swayBoost, Math.random());
+    // Anchor to the seam. Some shapes do NOT pass through their own start: the ellipse/spiral
+    // clamp their centre row into [1+r, 8-r], so a segment seeded near the floor begins its
+    // loop up to ~6 rows away (seen at k=167 in tests: row 8 → row 2). A single rail hides that
+    // behind its head; at a seam it is a real jump. Fade the offset (1-t) so t=0 sits exactly
+    // on the seam and t=1 is the shape's own endpoint.
+    const p0 = rawAt(0), dC0 = curCol - p0.col, dR0 = curRow - p0.row;
+    const posAt = t => { const p = rawAt(t); return { col: p.col + dC0 * (1 - t), row: p.row + dR0 * (1 - t) }; };
+    let last = null;
+    for (let i = 1; i <= counts[k]; i++) {
+      const t    = i / counts[k];
+      const p    = posAt(t);
+      const beat = k === nSeg - 1 && i === counts[k] ? endBeat
+                 : Math.round((segStart + segLen * t) / snapSz) * snapSz;
+      last = clampPt(p.col, p.row, beat);
+      waypoints.push({ beat, row: last.row, _x: COL_X[last.col] });
+    }
+    segments.push({ shape: plan[k].shape, startCol: curCol, startRow: curRow, endCol: last.col, endRow: last.row, count: counts[k] });
+    curCol = last.col; curRow = last.row;
+    segStart += segLen;
+  }
+  const endWp = waypoints.pop();             // the final point IS the rail end, not a waypoint
+  return { waypoints, xEnd: endWp._x, rowEnd: endWp.row, plan, segments };
 }
 
 async function analyseAudio(buffer, bpm, statusEl) {

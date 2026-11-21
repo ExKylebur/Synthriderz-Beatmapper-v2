@@ -41,7 +41,8 @@ test('fitShapeToLength downgrades gracefully and always lands in tier', () => {
 import { loadAt, withSeed, RAIL_DEPS, colOf } from './harness.mjs';
 
 const RAIL_NEW = ['RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
-  'fitShapeToLength', 'buildRailPath', 'railWaypointCount', 'generateRailArc'];
+  'fitShapeToLength', 'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS', 'assignSegmentShapes',
+  'planRailSegments', 'fitRailPlan', 'buildRailPath', 'railWaypointCount', 'generateRailArc'];
 const OLD = loadAt('acd1853', [...RAIL_DEPS, 'generateRailArc']);
 const NEW = load([...RAIL_DEPS, ...RAIL_NEW]);
 
@@ -70,14 +71,6 @@ test('railWaypointCount: corners get exact counts, cap 12', () => {
   assert.equal(NEW.railWaypointCount('ellipse', 20, 0), 12);
 });
 
-test('golden (Task 2 only): ALL lengths identical to acd1853', () => {
-  for (let k = 0; k < 400; k++) {
-    const args = goldenCase(k, 16);
-    const a = withSeed(k + 1, () => OLD.generateRailArc(...args));
-    const b = withSeed(k + 1, () => NEW.generateRailArc(...args));
-    assert.equal(strip(b), strip(a), `case ${k}`);
-  }
-});
 
 const P = load(['RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
   'fitShapeToLength', 'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS',
@@ -111,4 +104,53 @@ test('fitRailPlan: replays shapes + proportions, downgrades, keeps invariants', 
   const p3 = P.fitRailPlan(rec, 4);                          // short rail → single fitted shape
   assert.deepEqual(p3, [{ frac: 1, shape: 'ellipse' }]);     // spiral downgrades to ellipse at 4 beats
   assert.equal(P.fitRailPlan(null, 10), null);
+});
+
+const randRail = (k, cross) => {
+  const hand = k % 2, len = 1 + ((k * 0.613) % 15);
+  const start = hand === 0 ? 7 + (k % 7) : (k % 8);
+  return { hand, len, args: [0, 1 + (k % 8), len, 4, 0.25, NEW.COL_X[start], hand, cross, 1.0, 120, null, null] };
+};
+
+test('multi-seg: zone, rows, waypoint cap, plan shape over 20k rails', () => {
+  for (let k = 0; k < 20000; k++) {
+    const cross = k % 3 === 0;
+    const { hand, len, args } = randRail(k, cross);
+    const r = withSeed(k + 11, () => NEW.generateRailArc(...args));
+    const z = NEW.handZoneCols(hand, cross);
+    for (const p of [...r.waypoints.map(w => ({ c: colOf(w._x), row: w.row })), { c: colOf(r.xEnd), row: r.rowEnd }]) {
+      assert.ok(p.c >= z.colMin && p.c <= z.colMax, `zone k=${k}`);
+      assert.ok(p.row >= 1 && p.row <= 8, `row k=${k}`);
+    }
+    assert.ok(r.waypoints.length <= 12);
+    assert.equal(r.plan.length, len >= 12 ? 3 : len >= 6 ? 2 : 1);
+  }
+});
+
+// Only SEAM steps are checked: inside one shape, consecutive waypoints of an ellipse/zigzag
+// may legitimately be far apart (the rail is continuous; C3 never applies within a rail).
+test('multi-seg: each segment seeds from the previous clamped endpoint; seam step within C3 caps', () => {
+  for (let k = 0; k < 3000; k++) {
+    const { args } = randRail(k, k % 2 === 0);
+    if (args[2] < 6) continue;
+    const r = withSeed(k + 5, () => NEW.generateRailArc(...args));
+    const pts = [...r.waypoints.map(w => [colOf(w._x), w.row]), [colOf(r.xEnd), r.rowEnd]];
+    let idx = 0;
+    for (let i = 0; i < r.segments.length; i++) {
+      if (i > 0) {
+        assert.equal(r.segments[i].startCol, r.segments[i - 1].endCol);
+        assert.equal(r.segments[i].startRow, r.segments[i - 1].endRow);
+        const seam = pts[idx - 1], next = pts[idx];               // seam point → first point of segment i
+        assert.ok(Math.abs(next[0] - seam[0]) <= 7, `seam col step k=${k}`);
+        assert.ok(Math.abs(next[1] - seam[1]) <= 5, `seam row step k=${k}`);
+      }
+      idx += r.segments[i].count;
+    }
+  }
+});
+
+test('motifPlan replay: recorded shapes come back on a different length', () => {
+  const rec = [{ frac: 0.6, shape: 'wave' }, { frac: 0.4, shape: 'pendulum' }];
+  const r = withSeed(9, () => NEW.generateRailArc(0, 4, 9, 4, 0.25, NEW.COL_X[10], 0, false, 1, 120, null, null, rec));
+  assert.deepEqual(r.plan.map(s => s.shape), ['wave', 'pendulum']);
 });

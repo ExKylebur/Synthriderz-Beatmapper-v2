@@ -611,6 +611,9 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   Also update the palette comment above `const rng` with one line: `// Rails >= 6 beats chain 2-3 of these shapes (planRailSegments); see the multi-segment block below.`
 
 - [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). If the seam-step test fails, print the failing `r.plan` / `r.segments` and check whether a `buildRailPath` branch can move more than 7 cols in the first `1/counts[k]` of its length. If one can, raise that segment's waypoint count rather than loosening the assertion.
+- **Executed 2026-11-21 — deviation:** the seam test caught a real bug. The ellipse/spiral clamp their centre row, so a
+  segment seeded near row 8 began its loop ~6 rows away. Each segment's path is now anchored with a fading offset
+  `posAt(t) = rawAt(t) + (seed - rawAt(0)) * (1 - t)` (see the code comment in the multi-segment loop).
 - [ ] **Commit:** `git commit -am "Rails: multi-segment generateRailArc (2-3 shapes seeded from clamped seams, motifPlan replay)"`
 
 ---
