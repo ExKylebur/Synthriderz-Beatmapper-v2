@@ -32,7 +32,7 @@
 
 ### Task 0: Test harness + syntax test
 
-- [ ] **Create `tests/harness.mjs`:**
+- [x] **Create `tests/harness.mjs`:**
 
 ```js
 // Loads REAL declarations out of synthriders-creator.html so tests exercise shipped code,
@@ -90,7 +90,7 @@ export const RAIL_DEPS = ['ROW_Y', 'P3D', 'COL_X', 'OBS_BOX', 'OBS_CLEAR', 'OBST
 export const colOf = x => Math.round((x + 0.9555) / 0.1365);
 ```
 
-- [ ] **Create `tests/syntax.test.mjs`:**
+- [x] **Create `tests/syntax.test.mjs`:**
 
 ```js
 import test from 'node:test';
@@ -105,14 +105,14 @@ test('every inline <script> block parses', () => {
 });
 ```
 
-- [ ] **Run:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `ℹ pass 1`, `ℹ fail 0`.
-- [ ] **Commit:** `git add tests && git commit -m "tests: Node harness extracting real declarations from the app + syntax test"`
+- [x] **Run:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `ℹ pass 1`, `ℹ fail 0`.
+- [x] **Commit:** `git add tests && git commit -m "tests: Node harness extracting real declarations from the app + syntax test"`
 
 ---
 
 ### Task 1: Rail shape tier helpers (single source for the palette)
 
-- [ ] **Write the failing test.** Create `tests/rail-shapes.test.mjs`:
+- [x] **Write the failing test.** Create `tests/rail-shapes.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -156,8 +156,8 @@ test('fitShapeToLength downgrades gracefully and always lands in tier', () => {
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: RAIL_SHAPE_TIERS`.
-- [ ] **Implement.** In `synthriders-creator.html`, insert directly after the closing `}` of `function handZoneCols` (~line 1441):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: RAIL_SHAPE_TIERS`.
+- [x] **Implement.** In `synthriders-creator.html`, insert directly after the closing `}` of `function handZoneCols` (~line 1441):
 
 ```js
 
@@ -195,14 +195,14 @@ function fitShapeToLength(shape, len) {
 }
 ```
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: all pass.
-- [ ] **Commit:** `git commit -am "Rail shapes: module-level tier helpers (pickRailShape, fitShapeToLength)"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: all pass.
+- [x] **Commit:** `git commit -am "Rail shapes: module-level tier helpers (pickRailShape, fitShapeToLength)"`
 
 ---
 
 ### Task 2: Extract `buildRailPath` + `railWaypointCount` from `generateRailArc` (pure refactor, golden-tested)
 
-- [ ] **Write the failing test.** Append to `tests/rail-shapes.test.mjs`:
+- [x] **Write the failing test.** Append to `tests/rail-shapes.test.mjs`:
 
 ```js
 import { loadAt, withSeed, RAIL_DEPS, colOf } from './harness.mjs';
@@ -251,8 +251,8 @@ test('golden (Task 2 only): ALL lengths identical to acd1853', () => {
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: buildRailPath`.
-- [ ] **Implement.** Insert these two module-level functions directly **above** `function generateRailArc(`:
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: buildRailPath`.
+- [x] **Implement.** Insert these two module-level functions directly **above** `function generateRailArc(`:
 
 ```js
 // Rail path for ONE shape: t in [0,1] -> { col, row } (unclamped), anchored at (startCol,
@@ -392,14 +392,14 @@ function railWaypointCount(railShape, len, stairSteps) {
 
   Leave `clampPt`, the waypoint loop and the `return` exactly as they are.
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: both golden tests pass, all 400 cases.
-- [ ] **Commit:** `git commit -am "generateRailArc: extract buildRailPath/railWaypointCount (golden-identical to acd1853)"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: both golden tests pass, all 400 cases.
+- [x] **Commit:** `git commit -am "generateRailArc: extract buildRailPath/railWaypointCount (golden-identical to acd1853)"`
 
 ---
 
 ### Task 3: Segment planning — `planRailSegments`, `assignSegmentShapes`, `fitRailPlan`
 
-- [ ] **Write the failing test.** Append to `tests/rail-shapes.test.mjs`:
+- [x] **Write the failing test.** Append to `tests/rail-shapes.test.mjs`:
 
 ```js
 const P = load(['RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
@@ -437,8 +437,8 @@ test('fitRailPlan: replays shapes + proportions, downgrades, keeps invariants', 
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: RAIL_SEG_MIN_BEATS`.
-- [ ] **Implement.** Insert directly after `function fitShapeToLength` (from Task 1):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: RAIL_SEG_MIN_BEATS`.
+- [x] **Implement.** Insert directly after `function fitShapeToLength` (from Task 1):
 
 ```js
 
@@ -481,14 +481,14 @@ function fitRailPlan(recorded, len, rnd = Math.random) {
 }
 ```
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Commit:** `git commit -am "Rails: segment planning + motif plan fitting"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Commit:** `git commit -am "Rails: segment planning + motif plan fitting"`
 
 ---
 
 ### Task 4: Multi-segment `generateRailArc`
 
-- [ ] **Edit the tests.** Delete the `golden (Task 2 only): ALL lengths …` test. Add `'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS', 'assignSegmentShapes', 'planRailSegments', 'fitRailPlan'` to the `RAIL_NEW` array (before `'generateRailArc'`). Then append:
+- [x] **Edit the tests.** Delete the `golden (Task 2 only): ALL lengths …` test. Add `'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS', 'assignSegmentShapes', 'planRailSegments', 'fitRailPlan'` to the `RAIL_NEW` array (before `'generateRailArc'`). Then append:
 
 ```js
 const randRail = (k, cross) => {
@@ -541,8 +541,8 @@ test('motifPlan replay: recorded shapes come back on a different length', () => 
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: failures on `r.plan` undefined.
-- [ ] **Implement.** Change the signature to add a 13th parameter:
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: failures on `r.plan` undefined.
+- [x] **Implement.** Change the signature to add a 13th parameter:
 
 ```js
 function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 0, hand = 0, allowCrossCenter = false, swayBoost = 1.0, bpm = 120, obstacleConstraints = null, walls = null, motifPlan = null) {
@@ -610,17 +610,17 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
 
   Also update the palette comment above `const rng` with one line: `// Rails >= 6 beats chain 2-3 of these shapes (planRailSegments); see the multi-segment block below.`
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). If the seam-step test fails, print the failing `r.plan` / `r.segments` and check whether a `buildRailPath` branch can move more than 7 cols in the first `1/counts[k]` of its length. If one can, raise that segment's waypoint count rather than loosening the assertion.
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). If the seam-step test fails, print the failing `r.plan` / `r.segments` and check whether a `buildRailPath` branch can move more than 7 cols in the first `1/counts[k]` of its length. If one can, raise that segment's waypoint count rather than loosening the assertion.
 - **Executed 2026-11-21 — deviation:** the seam test caught a real bug. The ellipse/spiral clamp their centre row, so a
   segment seeded near row 8 began its loop ~6 rows away. Each segment's path is now anchored with a fading offset
   `posAt(t) = rawAt(t) + (seed - rawAt(0)) * (1 - t)` (see the code comment in the multi-segment loop).
-- [ ] **Commit:** `git commit -am "Rails: multi-segment generateRailArc (2-3 shapes seeded from clamped seams, motifPlan replay)"`
+- [x] **Commit:** `git commit -am "Rails: multi-segment generateRailArc (2-3 shapes seeded from clamped seams, motifPlan replay)"`
 
 ---
 
 ### Task 5: Chorus motif memory helpers
 
-- [ ] **Write the failing test.** Create `tests/motif.test.mjs`:
+- [x] **Write the failing test.** Create `tests/motif.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -658,8 +658,8 @@ test('memory: first occurrence records, later ones replay in order, per kind', (
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: CHORUS_RE`.
-- [ ] **Implement.** Insert after `function fitRailPlan` (Task 3):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). Expected: `declaration not found: CHORUS_RE`.
+- [x] **Implement.** Insert after `function fitRailPlan` (Task 3):
 
 ```js
 
@@ -711,14 +711,14 @@ function createMotifMemory(sections) {
   `/chorus|drop|climax|hook|refrain/i.test(s.name || '') && !/pre/i.test(s.name || '')` with
   `CHORUS_RE.test(s.name || '') && !/pre/i.test(s.name || '')`.
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). The test's `roots: 1` holds because only `chorus1`/`chorus2` share a root in that fixture.
-- [ ] **Commit:** `git commit -am "Motif memory: chorusRootKey + createMotifMemory; shared CHORUS_RE"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). The test's `roots: 1` holds because only `chorus1`/`chorus2` share a root in that fixture.
+- [x] **Commit:** `git commit -am "Motif memory: chorusRootKey + createMotifMemory; shared CHORUS_RE"`
 
 ---
 
 ### Task 6: Hoist the move library (`DANCE_MOVES`) + `isPattern` + `smoothPatternBoundaries`
 
-- [ ] **Write the failing test.** Create `tests/sweeps.test.mjs`:
+- [x] **Write the failing test.** Create `tests/sweeps.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -758,8 +758,8 @@ test('smoothPatternBoundaries nudges only the loose side, to exactly the C3 limi
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Implement (module level).** Insert after `function createMotifMemory` (Task 5). The `addMove` lines are moved verbatim from `[DenseSweep]`:
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Implement (module level).** Insert after `function createMotifMemory` (Task 5). The `addMove` lines are moved verbatim from `[DenseSweep]`:
 
 ```js
 
@@ -844,14 +844,14 @@ function smoothPatternBoundaries(orbs) {
     }
      ```
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Commit:** `git commit -am "Sweeps: hoist DANCE_MOVES, isPattern, shared smoothPatternBoundaries"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Commit:** `git commit -am "Sweeps: hoist DANCE_MOVES, isPattern, shared smoothPatternBoundaries"`
 
 ---
 
 ### Task 7: Make the pattern-aware sites use `isPattern` (occlusion, C3, critic tags, Crossover)
 
-- [ ] **Write the failing test.** Append to `tests/sweeps.test.mjs`. It's a source-level guard that no `_denseSweep`-only pattern checks are left:
+- [x] **Write the failing test.** Append to `tests/sweeps.test.mjs`. It's a source-level guard that no `_denseSweep`-only pattern checks are left:
 
 ```js
 import { appSource } from './harness.mjs';
@@ -865,8 +865,8 @@ test('pattern checks go through isPattern (no stray _denseSweep-only gates)', ()
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Implement** (exact replacements in `synthriders-creator.html`; in this table `\|` is markdown escaping, so type a plain `|`):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Implement** (exact replacements in `synthriders-creator.html`; in this table `\|` is markdown escaping, so type a plain `|`):
 
 | Find | Replace with |
 |---|---|
@@ -882,14 +882,14 @@ test('pattern checks go through isPattern (no stray _denseSweep-only gates)', ()
 
   Also update the `_toBand` comment's first sentence to say "Pattern notes (`isPattern`: DenseSweep/SparseSweep)…".
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Commit:** `git commit -am "Pattern-aware sites use isPattern (occlusion, C3 clamp, critic tags, Crossover)"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Commit:** `git commit -am "Pattern-aware sites use isPattern (occlusion, C3 clamp, critic tags, Crossover)"`
 
 ---
 
 ### Task 8: `applySparseSweep`
 
-- [ ] **Write the failing test.** Append to `tests/sweeps.test.mjs`:
+- [x] **Write the failing test.** Append to `tests/sweeps.test.mjs`:
 
 ```js
 const W = load(['COL_X', 'CROSS_REACH_COLS', 'handZoneCols', 'buildDanceMoves', 'DANCE_MOVES',
@@ -938,8 +938,8 @@ test('pickMove hook receives section + region index', () => {
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Implement.** Insert after `function smoothPatternBoundaries` (Task 6):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Implement.** Insert after `function smoothPatternBoundaries` (Task 6):
 
 ```js
 
@@ -1004,14 +1004,14 @@ function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, m
 }
 ```
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Commit:** `git commit -am "SparseSweep: choreograph loose runs from DANCE_MOVES"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Commit:** `git commit -am "SparseSweep: choreograph loose runs from DANCE_MOVES"`
 
 ---
 
 ### Task 9: `[PatternCoverage]` band
 
-- [ ] **Write the failing test.** Create `tests/coverage.test.mjs`:
+- [x] **Write the failing test.** Create `tests/coverage.test.mjs`:
 
 ```js
 import test from 'node:test';
@@ -1069,8 +1069,8 @@ test('under band: promote() is called once and its tagged count is reported', ()
 });
 ```
 
-- [ ] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Implement.** Insert after `function applySparseSweep` (Task 8):
+- [x] **Verify failure:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Implement.** Insert after `function applySparseSweep` (Task 8):
 
 ```js
 
@@ -1116,8 +1116,8 @@ function enforcePatternCoverage(result, { band = PATTERN_COVERAGE_BAND, promote 
 }
 ```
 
-- [ ] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
-- [ ] **Commit:** `git commit -am "PatternCoverage: 60-80% band with promote/demote"`
+- [x] **Verify pass:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails).
+- [x] **Commit:** `git commit -am "PatternCoverage: 60-80% band with promote/demote"`
 
 ---
 
@@ -1125,11 +1125,11 @@ function enforcePatternCoverage(result, { band = PATTERN_COVERAGE_BAND, promote 
 
 There's no unit test for this task; Task 12's live run verifies it. Make these edits:
 
-- [ ] **Motif memory instance.** Directly after `function sectionAt(beat) { … }` inside `onsetsToNotes`, add:
+- [x] **Motif memory instance.** Directly after `function sectionAt(beat) { … }` inside `onsetsToNotes`, add:
 ```js
   const motifMemory = createMotifMemory(sections);   // per Generate call (spec decision 2026-11-21)
 ```
-- [ ] **Main-loop rails.** Replace
+- [x] **Main-loop rails.** Replace
 ```js
       const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint);
 ```
@@ -1139,20 +1139,20 @@ with
       const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
       motifMemory.record(_motifSec, 'rails', _arc.plan);
 ```
-- [ ] **GoldSweep.** Replace `const shape = gReshaped % GOLD_SHAPES;` with
+- [x] **GoldSweep.** Replace `const shape = gReshaped % GOLD_SHAPES;` with
 ```js
         const _gSec = sectionAt(run[0].beat);
         const shape = motifMemory.replay(_gSec, 'gold') ?? (gReshaped % GOLD_SHAPES);
         motifMemory.record(_gSec, 'gold', shape);
 ```
-- [ ] **DenseSweep.** Replace `let mvIdx = _reg % MOVES.length, mv = MOVES[mvIdx], k = 0, lastBk = null;` with
+- [x] **DenseSweep.** Replace `let mvIdx = _reg % MOVES.length, mv = MOVES[mvIdx], k = 0, lastBk = null;` with
 ```js
         const _dSec = sectionAt(region[0].beat);
         let mvIdx = motifMemory.replay(_dSec, 'dense') ?? (_reg % MOVES.length);
         motifMemory.record(_dSec, 'dense', mvIdx);
         let mv = MOVES[mvIdx], k = 0, lastBk = null;
 ```
-- [ ] **SparseSweep + PatternCoverage.** Insert right after the closing `}` of `if (DENSE_SWEEP) { … }`, before `// ── FINAL C1/C2 SWEEP`:
+- [x] **SparseSweep + PatternCoverage.** Insert right after the closing `}` of `if (DENSE_SWEEP) { … }`, before `// ── FINAL C1/C2 SWEEP`:
 ```js
   // ── [SparseSweep] choreograph loose runs (0.5-1.5-beat spacing) — see applySparseSweep ──
   const _sswOpts = {
@@ -1175,51 +1175,51 @@ with
     console.log(`[PatternCoverage] before=${(100 * _pc.before).toFixed(0)}% after=${(100 * _pc.after).toFixed(0)}% promoted=${_pc.promoted} demoted=${_pc.demoted}`);
   }
 ```
-- [ ] **Motif log.** Directly after the `[RowLift]` block's `console.log(…)` closing `}`, add:
+- [x] **Motif log.** Directly after the `[RowLift]` block's `console.log(…)` closing `}`, add:
 ```js
   { const _ms = motifMemory.stats(); if (_ms.roots) console.log(`[MotifMemory] roots=${_ms.roots} recorded=${_ms.recorded} replayed=${_ms.replayed}`); }
 ```
-- [ ] **Run:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). All tests pass, including syntax.
-- [ ] **Commit:** `git commit -am "Wire motif memory, SparseSweep and PatternCoverage into onsetsToNotes"`
+- [x] **Run:** `node --test` (auto-discovers `tests/*.test.mjs`; on Windows a directory argument fails). All tests pass, including syntax.
+- [x] **Commit:** `git commit -am "Wire motif memory, SparseSweep and PatternCoverage into onsetsToNotes"`
 
 ---
 
 ### Task 11: Critic prompt
 
-- [ ] In `style_critic_prompt.md`, section "Choreographed patterns", change the intro sentence to `… carry \`pattern: "dense"\`, \`pattern: "sparse"\` or \`pattern: "gold"\` …`. Add after the DenseSweep bullet:
+- [x] In `style_critic_prompt.md`, section "Choreographed patterns", change the intro sentence to `… carry \`pattern: "dense"\`, \`pattern: "sparse"\` or \`pattern: "gold"\` …`. Add after the DenseSweep bullet:
 ```md
 - **[SparseSweep] `pattern:"sparse"`** — LOOSE runs (0.5–1.5-beat spacing) choreographed from the SAME 14-move library, ≤3–5 Manhattan step/hand (cap grows with the gap). Treat like `dense`: intended shape, judge only its entry/exit via `nonpattern_big_jumps`.
 - **Chorus motifs** — later choruses deliberately REPLAY the first chorus's rail shapes / sweep moves / gold shapes (intensity still escalates). Repetition across choruses is intended; do not flag it as "repetitive".
 ```
   and append to the `[RailShapes]` bullet: `Rails ≥6 beats chain 2–3 of these shapes back to back (e.g. wave→hook); a mid-rail change of character is intentional.`
-- [ ] **Commit:** `git commit -am "Critic prompt: sparse pattern, multi-segment rails, chorus motifs"`
+- [x] **Commit:** `git commit -am "Critic prompt: sparse pattern, multi-segment rails, chorus motifs"`
 
 ---
 
 ### Task 12: Live verification (agent server, no user involvement)
 
-- [ ] `preview_start synthmapper-v2-agent` (:8092). Confirm the key: `curl -s localhost:8092/api_key_status` should return `{"server_key": true}`.
-- [ ] For each song (`painkiller`, then `another%20life`), at Master:
+- [x] `preview_start synthmapper-v2-agent` (:8092). Confirm the key: `curl -s localhost:8092/api_key_status` should return `{"server_key": true}`.
+- [x] For each song (`painkiller`, then `another%20life`), at Master:
   1. Navigate to `http://localhost:8092/?song=<q>`.
   2. Install the `window.__log` console hook.
   3. Wait 8 s, set the Master `<select>`, and click "Generate Beatmap".
   4. Poll `window.__log` for `Committed best result`, in calls of at most 40 s.
   5. Click `#exportBtn`, wait about 8 s, then run `python validate.py debug_last_export.synth`.
-- [ ] **Pass criteria (record the actual numbers in the handoff):**
+- [x] **Pass criteria (record the actual numbers in the handoff):**
   - `validate.py`: **0 HARD** for both songs.
   - `[PatternCoverage] after=` within 60–80%, or the reason it isn't (for example `promoted=0` because no eligible loose runs exist). Tune `SSW_*` or the band only on evidence from these logs.
   - `[SparseSweep]` fires on Another Life (the less dense song).
   - `[MotifMemory] replayed > 0` on any song with ≥ 2 chorus-named sections.
   - No `unresolvable` in the final-iteration `[C3Clamp]`. No `CRITICAL` in the committed result.
   - Dense/sparse step-cap breaks inside wall windows are no worse than the 2026-11-21 baseline of 5.9%. Measure them in-page over `isPattern` notes, with the same script as the handoff (`inWall`, Manhattan > cap).
-- [ ] If a criterion fails, diagnose it from the source tags in the in-page `notes` (they keep `_sparseSweep`, `_preSweep` and the rest) before changing any threshold.
+- [x] If a criterion fails, diagnose it from the source tags in the in-page `notes` (they keep `_sparseSweep`, `_preSweep` and the rest) before changing any threshold.
 
 ---
 
 ### Task 13: Handoff + commit
 
-- [ ] Add a session-log entry at the top of `handoff_next_session.md` (gitignored; edit only). Include the numbers from Task 12, any thresholds you tuned and why, and the open items (VR play-test of sparse choreography and multi-segment rails).
-- [ ] `git status` should be clean apart from the handoff. Ask the user before pushing.
+- [x] Add a session-log entry at the top of `handoff_next_session.md` (gitignored; edit only). Include the numbers from Task 12, any thresholds you tuned and why, and the open items (VR play-test of sparse choreography and multi-segment rails).
+- [x] `git status` should be clean apart from the handoff. Ask the user before pushing.
 
 ---
 
