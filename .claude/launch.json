@@ -13,6 +13,20 @@
       "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8092", "--no-browser"],
       "port": 8092,
       "autoPort": false
+    },
+    {
+      "name": "synthmapper-v2-agent-alt",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8094", "--no-browser"],
+      "port": 8094,
+      "autoPort": false
+    },
+    {
+      "name": "synthmapper-v2-agent-timing",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8096", "--no-browser"],
+      "port": 8096,
+      "autoPort": false
     }
   ]
 }
