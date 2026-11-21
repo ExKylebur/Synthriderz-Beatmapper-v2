@@ -327,9 +327,79 @@ def _sliding_mean_std(arr, win):
     return mean, std
 
 
+# ── Per-stem onsets: peak-picked SuperFlux (2026-11-21) ──────────────────────
+# The old per-stem detector (detect_onsets_np on a 10 ms RMS envelope + spectral_flux_hfc_np,
+# both "first frame over local mean + kσ") was RANDOM against the beat: 10 ms RMS frames wobble
+# with the waveform (bass periods are 10-20 ms), so it fired every lockout whatever the music
+# did. Measured with onset_phase_lock on Demucs stems, on each song's folded grid: Electric Love
+# drums R(8th, triplet, 16th) = 0.03/0.05/0.05 (noise floor 0.03). This detector picks PEAKS of
+# a spectral-flux onset function instead (same stems: drums 0.39/0.99/0.35 — the song is swung).
+# See handoff "2026-11-21 (cont. 5)" for the per-stem table; tests/onsets.test.mjs gates it.
+STEM_ONSET_HOP = 128            # 5.8 ms frames at 22050 Hz (same as TEMPO_HOP)
+STEM_ONSET_NFFT = 1024          # 46 ms: 2048 smears bass attacks (+35 ms, wide spread)
+# librosa SuperFlux settings (lag 2, max filter over 3 mel bands): suppresses vibrato, which
+# lifted the vocal/other lock on all 3 test songs; drums and bass are unchanged by it.
+STEM_ONSET_LAG = 2
+STEM_ONSET_MAX_SIZE = 3
+# A peak of this onset function lags the hit by 10 ms (synthetic click/kick/snare/hat:
+# +9.8..+12.0 ms). NOT the 14 ms ONSET_ENV_LATENCY: that is the FOLDED, smoothed envelope,
+# whose peak sits later. Subtracted so `time` is the hit itself.
+STEM_ONSET_LATENCY = 0.010
+STEM_ONSET_THRESH = 1.0         # a peak must clear local mean + 1.0σ of the onset function
+STEM_ONSET_WINDOW = 15.0        # ±15 s local statistics, so quiet sections still get onsets
+STEM_ONSET_PEAK_HALF = 0.05     # a peak is the max within ±50 ms (or ±min_gap/2 if smaller)
+
+
+def stem_onsets(signal, sr: int, min_gap_sec: float) -> list:
+    """Onset times of one stem: peak-picked SuperFlux, latency-corrected.
+
+    1. librosa onset_strength (mel, n_fft 1024, hop 128, lag 2, max_size 3, center=True).
+    2. Candidates: local maxima (±STEM_ONSET_PEAK_HALF) above the local mean + STEM_ONSET_THRESH·σ
+       over ±STEM_ONSET_WINDOW s.
+    3. Non-maximum suppression at `min_gap_sec`, strongest first: the lockout keeps the
+       strongest hit in a burst, not the first frame that crossed a threshold.
+    4. time = peak frame − STEM_ONSET_LATENCY; energy = peak value / the 99th percentile of the
+       stem's peak values, clipped to 1. This puts the per-stem means at 0.19-0.54, close to the
+       old detector's 0.17-0.49, which buildStemDominanceMap's weights were tuned on.
+
+    Returns [{ 'time': float (s), 'energy': float (0-1) }] in time order — the same shape as
+    detect_onsets_np.
+    """
+    import numpy as np
+    import librosa
+    from scipy.ndimage import maximum_filter1d
+    sig = np.asarray(signal, dtype=np.float32)
+    if len(sig) < STEM_ONSET_NFFT or not np.any(sig):
+        return []
+    dt = STEM_ONSET_HOP / sr
+    env = librosa.onset.onset_strength(y=sig, sr=sr, hop_length=STEM_ONSET_HOP,
+                                       n_fft=STEM_ONSET_NFFT, lag=STEM_ONSET_LAG,
+                                       max_size=STEM_ONSET_MAX_SIZE)
+    mean, std = _sliding_mean_std(env, max(1, int(STEM_ONSET_WINDOW / dt)))
+    half = max(1, int(round(min(STEM_ONSET_PEAK_HALF, min_gap_sec / 2) / dt)))
+    is_peak = env >= maximum_filter1d(env, size=2 * half + 1, mode='nearest')
+    cand = np.flatnonzero(is_peak & (env > mean + STEM_ONSET_THRESH * std) & (env > 0))
+    if len(cand) == 0:
+        return []
+    gap = max(1, int(min_gap_sec / dt))
+    taken = np.zeros(len(env) + 2 * gap + 2, dtype=bool)   # taken[j + gap] ↔ frame j kept
+    keep = []
+    for i in cand[np.argsort(-env[cand], kind='stable')]:
+        if not taken[i + 1:i + 2 * gap].any():               # no kept frame within (i−gap, i+gap)
+            keep.append(int(i))
+            taken[i + gap] = True
+    keep = np.sort(np.array(keep, dtype=np.int64))
+    vals = env[keep]
+    ref = float(np.percentile(vals, 99)) or float(vals.max()) or 1.0
+    times = np.maximum(keep * dt - STEM_ONSET_LATENCY, 0.0)
+    return [{'time': round(float(t), 4), 'energy': round(float(min(1.0, v / ref)), 4)}
+            for t, v in zip(times, vals)]
+
+
 def detect_onsets_np(env, hop_sec: float, min_gap_sec: float,
                      local_window_sec: float = 30.0):
-    """Detect onset times (seconds) from an RMS envelope using local flux thresholding.
+    """LEGACY (fallback when librosa is missing): onset times from an RMS envelope using local
+    flux thresholding. Random against the beat on real stems; see stem_onsets.
 
     Uses a ±local_window_sec sliding window to normalise threshold so quiet
     sections and loud sections are treated fairly — same approach as the JS version.
@@ -363,7 +433,8 @@ def detect_onsets_np(env, hop_sec: float, min_gap_sec: float,
 
 def spectral_flux_hfc_np(signal, sr: int, hop_sec: float, min_gap_sec: float,
                           n_fft: int = 1024, local_window_sec: float = 30.0):
-    """[SUGGESTION-H] HFC-weighted spectral flux onset detection.
+    """LEGACY (fallback when librosa is missing; superseded by stem_onsets).
+    [SUGGESTION-H] HFC-weighted spectral flux onset detection.
 
     Computes onset strength via positive bin-wise STFT magnitude change between
     consecutive frames, weighted linearly by frequency bin (HFC = High Frequency
@@ -610,6 +681,26 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     if pad_n:
         print(f'  Beat-1 pad: {pad_n / SR:.3f}s of silence before every stem')
 
+    # Onsets: peak-picked SuperFlux per stem (stem_onsets). The lockouts are the old ones (in
+    # beats), now applied as non-maximum suppression. Without librosa, fall back to the legacy
+    # RMS (+HFC) detectors, which are random against the beat.
+    try:
+        import librosa  # noqa: F401
+        legacy = False
+    except ImportError:
+        legacy = True
+        print('  WARNING: librosa missing: legacy RMS onsets (not beat-locked). pip install librosa')
+
+    def _onsets(sig, gap_beats, hfc=False):
+        if not legacy:
+            return stem_onsets(sig, SR, beat_sec * gap_beats)
+        env = rms_envelope(sig, HOP)
+        rms = detect_onsets_np(env, HOP_SEC, beat_sec * gap_beats)
+        if not hfc:
+            return rms
+        return merge_onsets(rms, spectral_flux_hfc_np(sig, SR, HOP_SEC, beat_sec * gap_beats),
+                            beat_sec * 0.25)
+
     result_stems = {}
 
     # ── Drums ────────────────────────────────────────────────────────────────
@@ -617,8 +708,7 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     drums_sig = _lead(drums_sig)
     if enabled_stems.get('drums', True):
         print('  Analysing drums stem…')
-        drums_env    = rms_envelope(drums_sig, HOP)
-        raw_onsets   = detect_onsets_np(drums_env, HOP_SEC, beat_sec * 0.25)
+        raw_onsets   = _onsets(drums_sig, 0.25)
         drums_onsets = []
         for o in raw_onsets:
             subtype = classify_drum_hit(drums_sig, SR, o['time'])
@@ -638,24 +728,20 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
         bass_regions = detect_sustained_regions_np(
             bass_env, HOP_SEC, bass_thresh,
             min_sec=beat_sec * 0.5, max_sec=beat_sec * 20)
-        bass_onsets  = detect_onsets_np(bass_env, HOP_SEC, beat_sec * 0.4)
+        bass_onsets  = _onsets(bass_sig, 0.4)
         result_stems['bass'] = {'regions': bass_regions, 'onsets': bass_onsets}
     else:
         print('  Skipping bass stem (disabled).')
         result_stems['bass'] = {'regions': [], 'onsets': []}
 
     # ── Vocals ───────────────────────────────────────────────────────────────
-    # [SUGGESTION-H] Combine RMS-based onsets with HFC-weighted spectral flux to
-    # catch consonants and subtle vocal attacks that don't show in RMS envelope.
+    # SuperFlux (stem_onsets) catches consonants and soft vocal attacks; it replaced the old
+    # RMS + HFC-flux merge ([SUGGESTION-H]), which was random against the beat.
     vox_sig, _ = load_wav_mono(stems['vocals'], SR)
     vox_sig = _lead(vox_sig)
     if enabled_stems.get('vocals', True):
-        print('  Analysing vocals stem (RMS + spectral flux)…')
-        vox_env         = rms_envelope(vox_sig, HOP)
-        vox_onsets_rms  = detect_onsets_np(vox_env, HOP_SEC, beat_sec * 0.5)
-        vox_onsets_flux = spectral_flux_hfc_np(vox_sig, SR, HOP_SEC, beat_sec * 0.5)
-        vox_onsets_raw  = merge_onsets(vox_onsets_rms, vox_onsets_flux, beat_sec * 0.25)
-        print(f'    vocals: {len(vox_onsets_rms)} RMS + {len(vox_onsets_flux)} flux → {len(vox_onsets_raw)} merged')
+        print('  Analysing vocals stem…')
+        vox_onsets_raw  = _onsets(vox_sig, 0.5, hfc=True)
         vox_onsets = []
         for o in vox_onsets_raw:
             pitch_row = estimate_pitch_row(vox_sig, SR, o['time'])
@@ -666,21 +752,19 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
         result_stems['vocals'] = {'onsets': [], 'regions': []}
 
     # ── Other / synth ────────────────────────────────────────────────────────
-    # [SUGGESTION-H] Combine RMS + spectral flux for guitars / synths — catches
-    # pinch harmonics and string attacks the RMS envelope misses.
+    # Guitars / synths: SuperFlux catches pinch harmonics and string attacks (it replaced the
+    # old RMS + HFC-flux merge).
     other_sig, _ = load_wav_mono(stems['other'], SR)
     other_sig = _lead(other_sig)
     if enabled_stems.get('other', True):
-        print('  Analysing other stem (RMS + spectral flux)…')
-        other_env         = rms_envelope(other_sig, HOP)
-        other_onsets_rms  = detect_onsets_np(other_env, HOP_SEC, beat_sec * 0.4)
-        other_onsets_flux = spectral_flux_hfc_np(other_sig, SR, HOP_SEC, beat_sec * 0.4)
-        other_onsets      = merge_onsets(other_onsets_rms, other_onsets_flux, beat_sec * 0.25)
-        print(f'    other:  {len(other_onsets_rms)} RMS + {len(other_onsets_flux)} flux → {len(other_onsets)} merged')
+        print('  Analysing other stem…')
+        other_onsets      = _onsets(other_sig, 0.4, hfc=True)
         result_stems['other'] = {'onsets': other_onsets, 'regions': []}  # regions filled below
     else:
         print('  Skipping other stem (disabled).')
         result_stems['other'] = {'onsets': [], 'regions': []}
+    print('    onsets ' + ('(LEGACY RMS)' if legacy else '(SuperFlux peaks)') + ': '
+          + ', '.join(f"{k} {len(v['onsets'])}" for k, v in result_stems.items()))
 
     # ── Combined melodic sustained-region detection (vocals + other) ─────────
     # Analysing each stem independently fragments phrases: a 200ms consonant gap
@@ -1271,6 +1355,38 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
             'bpm': round(bpm, 3), 'phase': round(fit['phase'], 4),
             'confidence': round(fit['confidence'], 3), 'drift': fit['drift'],
             'candidates': cands}
+
+
+def onset_phase_lock(times, bpm: float, phase: float = 0.0, bins: int = 16) -> dict:
+    """How tightly onset times lock to a beat grid: beats at phase + k·60/bpm (s).
+
+    Measures an onset detector against a VERIFIED grid (fold_tempo's bpm/phase on the same
+    audio). Each onset's beat phase x = ((t − phase)/P) mod 1 goes into a `bins`-bin histogram,
+    and for subdivision k the phase-locking value is the mean resultant length
+    R_k = |mean(exp(2πi·k·x))|: 1 = every onset on the 1/k-beat grid, ~sqrt(π/4N) = random.
+      k=1 beats, k=2 8ths (the 2026-11-21 measurement: server detector 0.023 vs librosa 0.32 on
+      Electric Love), k=3 triplets (swing), k=4 16ths (the Master snap).
+    `lock` = max R_k: a straight song locks at k=2/4, a swung one at k=3, a random detector at
+    none. `offset_ms` is where the cluster of that best grid sits (R_k's mean angle, in ms):
+    ≈0 means the detector's times ARE the hits; a constant offset means a latency error, not
+    randomness. `random` is the expected R for N uniform onsets (the noise floor).
+    """
+    import numpy as np
+    t = np.asarray(times, dtype=float)
+    P = 60.0 / bpm
+    n = int(len(t))
+    if n == 0:
+        return {'n': 0, 'hist': [0] * bins, 'R': [0.0] * 4, 'lock': 0.0, 'lock_k': 0,
+                'offset_ms': 0.0, 'random': 1.0}
+    x = ((t - phase) / P) % 1.0
+    hist = np.bincount(np.minimum((x * bins).astype(np.int64), bins - 1), minlength=bins)
+    R = [float(np.abs(np.exp(2j * np.pi * k * x).mean())) for k in (1, 2, 3, 4)]
+    k_best = int(np.argmax(R)) + 1
+    ang = float(np.angle(np.exp(2j * np.pi * k_best * x).mean()))
+    return {'n': n, 'hist': [int(v) for v in hist], 'R': [round(r, 3) for r in R],
+            'lock': round(max(R), 3), 'lock_k': k_best,
+            'offset_ms': round(ang / (2 * np.pi * k_best) * P * 1000, 1),
+            'random': round(float(np.sqrt(np.pi / (4 * n))), 3)}
 
 
 # ── .synth coordinate constants (match the official editor) ──────────────────
