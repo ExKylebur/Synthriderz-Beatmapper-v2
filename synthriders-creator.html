@@ -10181,6 +10181,17 @@ function clampC3Jumps(notes, bps) {
   const _movableLastResort = (n, h) => (n.type === 2 || n.type === 3) && n.railEndBeat == null &&
     !n._comp && !isPattern(n) && !n._goldSweep &&
     !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat);
+  // Final fallback: the FIRST or LAST orb of a GoldSweep run. Nudging a run's edge (minimal
+  // move, to exactly the C3 limit) leaves its interior shape intact, unlike moving a middle
+  // orb. Confirmed case (2026-11-21, Another Life, Master): a 6-orb GoldSweep run ended at
+  // row 7 and a right-hand rail started 0.49s later at row 1 — gold run (protected) vs rail
+  // head (locked), identical CRITICAL C3 on every critique iteration. An edge is a gold orb
+  // with no other GoldSweep gold within the run gap (1.5 beats) on one side.
+  const _GSW_GAP = 1.5;
+  const _gswEdge = (n, h) => n.type === 3 && n._goldSweep && n.railEndBeat == null &&
+    !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat) &&
+    (!notes.some(m => m !== n && m._goldSweep && m.type === 3 && m.beat < n.beat && n.beat - m.beat <= _GSW_GAP) ||
+     !notes.some(m => m !== n && m._goldSweep && m.type === 3 && m.beat > n.beat && m.beat - n.beat <= _GSW_GAP));
   let clamped = 0, stuck = 0;
   for (let pass = 0; pass < 2; pass++) {
     for (let h = 0; h <= 1; h++) {
@@ -10201,6 +10212,8 @@ function clampC3Jumps(notes, bps) {
         else if (_movable(a, h))                   mv = a;
         else if (_movableLastResort(b, h))         mv = b;
         else if (_movableLastResort(a, h))         mv = a;
+        else if (_gswEdge(b, h))                   mv = b;
+        else if (_gswEdge(a, h))                   mv = a;
         // Count as "stuck" only when a red/blue endpoint existed but was rail-locked — a
         // gold→gold / gold→green pair (both anchors) is an intended shape, not a failure.
         if (!mv) { if (pass === 1 && (a.type === h || b.type === h)) stuck++; continue; }
