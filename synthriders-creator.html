@@ -1473,6 +1473,44 @@ function fitShapeToLength(shape, len) {
   return s;
 }
 
+// ── Multi-segment rail plans ─────────────────────────────────────────────────
+// A plan is [{ frac, shape }] (fracs sum to 1). Rails >= 6 beats chain 2 (6-12) or 3 (12+)
+// shapes; every segment is >= 2.5 beats so it reaches the mid tier; adjacent shapes differ.
+const RAIL_SEG_MIN_BEATS = 2.5;
+const RAIL_MULTISEG_MIN_BEATS = 6;
+function assignSegmentShapes(plan, len, rnd = Math.random) {
+  for (let k = 0; k < plan.length; k++) {
+    const segLen = plan[k].frac * len;
+    const prev = k > 0 ? plan[k - 1].shape : null;
+    let s = plan[k].shape ? fitShapeToLength(plan[k].shape, segLen) : pickRailShape(segLen, rnd());
+    for (let tries = 0; s === prev && tries < 6; tries++) s = pickRailShape(segLen, rnd());
+    if (s === prev) s = RAIL_SHAPE_TIERS[railTierOf(segLen)].find(x => x !== prev);
+    plan[k] = { frac: plan[k].frac, shape: s };
+  }
+  return plan;
+}
+// Affine map w -> minF + spare*w keeps every segment >= minF AND the sum exactly 1.
+function planRailSegments(len, rnd = Math.random) {
+  if (len < RAIL_MULTISEG_MIN_BEATS) return null;           // single-shape rail (legacy path)
+  const n = len >= 12 ? 3 : 2;
+  const minF = RAIL_SEG_MIN_BEATS / len, spare = 1 - n * minF;
+  const w = Array.from({ length: n }, () => 0.5 + rnd());
+  const wSum = w.reduce((a, b) => a + b, 0);
+  return assignSegmentShapes(w.map(x => ({ frac: minF + spare * x / wSum, shape: null })), len, rnd);
+}
+// Chorus-motif replay: a recorded plan's shapes + proportions on a rail of a new length.
+function fitRailPlan(recorded, len, rnd = Math.random) {
+  if (!recorded || !recorded.length) return null;
+  if (len < RAIL_MULTISEG_MIN_BEATS || recorded.length === 1)
+    return [{ frac: 1, shape: fitShapeToLength(recorded[0].shape, len) }];
+  const n = Math.min(recorded.length, len >= 12 ? 3 : 2);
+  const raw = recorded.slice(0, n).map(s => s.frac);
+  const rSum = raw.reduce((a, b) => a + b, 0);
+  const minF = RAIL_SEG_MIN_BEATS / len, spare = 1 - n * minF;
+  return assignSegmentShapes(
+    raw.map((f, k) => ({ frac: minF + spare * f / rSum, shape: recorded[k].shape })), len, rnd);
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes

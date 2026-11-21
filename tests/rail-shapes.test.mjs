@@ -78,3 +78,37 @@ test('golden (Task 2 only): ALL lengths identical to acd1853', () => {
     assert.equal(strip(b), strip(a), `case ${k}`);
   }
 });
+
+const P = load(['RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
+  'fitShapeToLength', 'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS',
+  'assignSegmentShapes', 'planRailSegments', 'fitRailPlan']);
+const sum = a => a.reduce((x, y) => x + y, 0);
+
+test('planRailSegments: null below 6 beats, 2 segs for 6-12, 3 for 12+', () => {
+  assert.equal(P.planRailSegments(5.9), null);
+  for (let k = 0; k < 300; k++) {
+    const len = 6 + (k * 0.11) % 12;
+    const plan = withSeed(k + 7, () => P.planRailSegments(len));
+    assert.equal(plan.length, len >= 12 ? 3 : 2);
+    assert.ok(Math.abs(sum(plan.map(s => s.frac)) - 1) < 1e-9);
+    for (let i = 0; i < plan.length; i++) {
+      assert.ok(plan[i].frac * len >= 2.5 - 1e-9, `seg ${i} too short`);
+      assert.ok(P.RAIL_SHAPE_TIERS[P.railTierOf(plan[i].frac * len)].includes(plan[i].shape));
+      if (i) assert.notEqual(plan[i].shape, plan[i - 1].shape, 'adjacent shapes must differ');
+    }
+  }
+});
+
+test('fitRailPlan: replays shapes + proportions, downgrades, keeps invariants', () => {
+  const rec = [{ frac: 0.25, shape: 'spiral' }, { frac: 0.5, shape: 'staircase' }, { frac: 0.25, shape: 'wave' }];
+  const p = withSeed(3, () => P.fitRailPlan(rec, 14));
+  assert.equal(p.length, 3);
+  assert.ok(p[1].frac > p[0].frac);                          // proportions survive
+  assert.ok(Math.abs(sum(p.map(s => s.frac)) - 1) < 1e-9);
+  for (const s of p) assert.ok(s.frac * 14 >= 2.5 - 1e-9);
+  const p2 = withSeed(3, () => P.fitRailPlan(rec, 8));       // 3 recorded → 2 slots
+  assert.equal(p2.length, 2);
+  const p3 = P.fitRailPlan(rec, 4);                          // short rail → single fitted shape
+  assert.deepEqual(p3, [{ frac: 1, shape: 'ellipse' }]);     // spiral downgrades to ellipse at 4 beats
+  assert.equal(P.fitRailPlan(null, 10), null);
+});
