@@ -28,11 +28,13 @@ These are correct by design. Never penalize them:
 
 ### Choreographed patterns (pattern-tagged notes)
 
-The generator reshapes some sections into deliberate choreography. Sampled notes carry `pattern: "dense"` or `pattern: "gold"` when they belong to one:
+The generator reshapes some sections into deliberate choreography. Sampled notes carry `pattern: "dense"`, `pattern: "sparse"` or `pattern: "gold"` when they belong to one:
 
 - **[GoldSweep] `pattern:"gold"`** — gold runs of 3+ shaped along a 5-shape palette (diagonal/circle/pendulum/wave/valley), moving in BOTH axes (cols 3–11, rows 2–8), ≤3 Manhattan step/orb. Vertical/curved/non-linear gold motion is intentional. Gold-to-gold spacing exempt from C2.
 - **[DenseSweep] `pattern:"dense"`** — dense runs choreographed from a 14-move library incl. **spiral** and **spike** shapes, ≤3 Manhattan step/hand/beat. A dense run may trace a spiral or spike, not just a simple arc.
-- **[RailShapes]** — shape is length-tiered, not one flat roll: short rails (<2.5 beats) use ellipse/hook/flick; mid (2.5–8 beats) add wave/zigzag/pendulum/switchback/ramp; long (8+ beats) add spiral/figure8/staircase. Sharp corners (hook/flick/switchback), a tightening spiral, a figure-8 crossing pattern, or discrete stair-step rows are all intentional shaping, not "erratic" — they satisfy the ≥60% X-variation target the same way the older ellipse/wave/zigzag/pendulum set did.
+- **[SparseSweep] `pattern:"sparse"`** — LOOSE runs (0.5–1.5-beat spacing) choreographed from the SAME 14-move library, ≤3–5 Manhattan step/hand (cap grows with the gap). Treat like `dense`: intended shape, judge only its entry/exit via `nonpattern_big_jumps`.
+- **Chorus motifs** — later choruses deliberately REPLAY the first chorus's rail shapes / sweep moves / gold shapes (intensity still escalates). Repetition across choruses is intended; do not flag it as "repetitive".
+- **[RailShapes]** — shape is length-tiered, not one flat roll: short rails (<2.5 beats) use ellipse/hook/flick; mid (2.5–8 beats) add wave/zigzag/pendulum/switchback/ramp; long (8+ beats) add spiral/figure8/staircase. Sharp corners (hook/flick/switchback), a tightening spiral, a figure-8 crossing pattern, or discrete stair-step rows are all intentional shaping, not "erratic" — they satisfy the ≥60% X-variation target the same way the older ellipse/wave/zigzag/pendulum set did. Rails ≥6 beats chain 2–3 of these shapes back to back (e.g. wave→hook); a mid-rail change of character is intentional.
 
 **Scope:** do NOT score pattern-tagged notes as jittery flow or flag them as C3 jumps — their per-step caps keep them reachable. BUT this pass does NOT excuse loose (non-pattern) sections. Use `flow_metrics.nonpattern_big_jumps` (jumps exceeding C3 limits where NOT both endpoints are pattern-tagged) to catch real problems in loose sections and region boundaries — flag those with their beats.
 
