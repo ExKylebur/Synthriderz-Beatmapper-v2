@@ -1554,6 +1554,63 @@ function createMotifMemory(sections) {
   };
 }
 
+// ── Two-hand move library — shared by [DenseSweep] and [SparseSweep] ─────────────────────
+// Each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null } steps (col 0-14,
+// row 1-9). `cross` lets a move reach across the centre line. Previewed in move_playbook.html.
+function buildDanceMoves() {
+  const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
+  const MOVES = [];
+  const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
+  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
+  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
+  { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
+  { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
+  { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
+  { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
+  { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const t = k / (N - 1), row = cc(5 - 3 * Math.sin(t * 2 * Math.PI), 1, 9); s.push({ l: [cc(1 + 5 * t, 0, 7), row], r: [cc(13 - 5 * t, 7, 14), row] }); } addMove('mirrorWings', false, s); }
+  { const a = [3, 5, 7, 9, 7, 5, 3], b = [11, 9, 7, 5, 7, 9, 11]; addMove('crossReturn', true, a.map((v, k) => ({ l: [v, 4], r: [b[k], 6] }))); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const a = k / (N - 1) * 2 * Math.PI, t = k / (N - 1); s.push({ l: [cc(2 + 4 * t, 0, 7), cc(5 - 3 * Math.sin(a), 1, 9)], r: [cc(8 + 4 * t, 7, 14), cc(5 - 3 * Math.sin(a + Math.PI), 1, 9)] }); } addMove('dnaHelix', false, s); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const p = Math.sin(k / (N - 1) * 2 * Math.PI), sh = Math.round(3 * p), row = cc(4 + 1.8 * Math.abs(p), 1, 9); s.push({ l: [cc(4 + sh, 0, 7), row], r: [cc(10 + sh, 7, 14), row] }); } addMove('pendulum', false, s); }
+  { addMove('outwardBloom', false, [{ l: [6, 5], r: [8, 5] }, { l: [3, 3], r: [11, 3] }, { l: [1, 1], r: [13, 1] }, { l: [3, 3], r: [11, 3] }, { l: [6, 5], r: [8, 5] }, { l: [3, 7], r: [11, 7] }, { l: [1, 9], r: [13, 9] }, { l: [3, 7], r: [11, 7] }]); }
+  { const Ls = [[2, 3], [5, 3], [5, 6], [2, 6]], Rs = [[9, 3], [12, 3], [12, 6], [9, 6]]; let s = []; for (let k = 0; k < 8; k++) { const ix = k % 4; s.push({ l: Ls[ix], r: Rs[ix] }); } addMove('boxStep', false, s); }
+  { const rw = [8, 2, 8, 2, 7, 3]; addMove('heartbeat', false, rw.map(v => ({ l: [4, v], r: [10, v] }))); }
+  return MOVES;
+}
+const DANCE_MOVES = buildDanceMoves();
+
+// Notes whose position is owned by a two-hand choreography move. Obstacle occlusion clamps
+// them instead of re-scattering (_toBand), C3 prefers to move loose notes over them, and
+// boundary smoothing treats them as anchors. GoldSweep is NOT included: it is gold-only and
+// has its own handling everywhere it matters.
+function isPattern(n) { return !!(n && (n._denseSweep || n._sparseSweep)); }
+
+// Pattern-edge smoothing. Where exactly one of a consecutive same-hand pair is
+// pattern-tagged and the jump exceeds C3 (>7 cols or >5 rows), nudge the LOOSE note to
+// exactly the limit — minimal displacement, choreography untouched. `orbs` = beat-sorted
+// free orbs. Returns the number of notes nudged.
+function smoothPatternBoundaries(orbs) {
+  const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  let clamped = 0;
+  for (let h = 0; h <= 1; h++) {
+    const hn = orbs.filter(n => n.type === h);
+    for (let k = 1; k < hn.length; k++) {
+      const a = hn[k - 1], b = hn[k];
+      if (isPattern(a) === isPattern(b)) continue;
+      const loose = isPattern(a) ? b : a, anchor = isPattern(a) ? a : b;
+      const dC = xCol(loose._x) - xCol(anchor._x), dR = (loose.row || 0) - (anchor.row || 0);
+      if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
+      let nc = xCol(anchor._x) + Math.max(-7, Math.min(7, dC));
+      const nr = (anchor.row || 0) + Math.max(-5, Math.min(5, dR));
+      nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc));
+      loose._x = COL_X[nc];
+      loose.row = Math.max(0, Math.min(10, nr));
+      clamped++;
+    }
+  }
+  return clamped;
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
@@ -7554,25 +7611,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_MAXSTEP = 3;
     const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
     const clRow = r => Math.max(dRowLo, Math.min(dRowHi, Math.round(r)));
-    const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
-    // Move library — each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null }
-    // steps (col 0-14, row 1-9, 5 = centre). `cross` lets a move reach across the centre line.
-    const MOVES = [];
-    const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
-    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
-    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
-    { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
-    { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
-    { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
-    { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
-    { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const t = k / (N - 1), row = cc(5 - 3 * Math.sin(t * 2 * Math.PI), 1, 9); s.push({ l: [cc(1 + 5 * t, 0, 7), row], r: [cc(13 - 5 * t, 7, 14), row] }); } addMove('mirrorWings', false, s); }
-    { const a = [3, 5, 7, 9, 7, 5, 3], b = [11, 9, 7, 5, 7, 9, 11]; addMove('crossReturn', true, a.map((v, k) => ({ l: [v, 4], r: [b[k], 6] }))); }  // hands cross at DIFFERENT rows (4/6) — same-cell collision guard
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const a = k / (N - 1) * 2 * Math.PI, t = k / (N - 1); s.push({ l: [cc(2 + 4 * t, 0, 7), cc(5 - 3 * Math.sin(a), 1, 9)], r: [cc(8 + 4 * t, 7, 14), cc(5 - 3 * Math.sin(a + Math.PI), 1, 9)] }); } addMove('dnaHelix', false, s); }
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const p = Math.sin(k / (N - 1) * 2 * Math.PI), sh = Math.round(3 * p), row = cc(4 + 1.8 * Math.abs(p), 1, 9); s.push({ l: [cc(4 + sh, 0, 7), row], r: [cc(10 + sh, 7, 14), row] }); } addMove('pendulum', false, s); }
-    { addMove('outwardBloom', false, [{ l: [6, 5], r: [8, 5] }, { l: [3, 3], r: [11, 3] }, { l: [1, 1], r: [13, 1] }, { l: [3, 3], r: [11, 3] }, { l: [6, 5], r: [8, 5] }, { l: [3, 7], r: [11, 7] }, { l: [1, 9], r: [13, 9] }, { l: [3, 7], r: [11, 7] }]); }
-    { const Ls = [[2, 3], [5, 3], [5, 6], [2, 6]], Rs = [[9, 3], [12, 3], [12, 6], [9, 6]]; let s = []; for (let k = 0; k < 8; k++) { const ix = k % 4; s.push({ l: Ls[ix], r: Rs[ix] }); } addMove('boxStep', false, s); }
-    { const rw = [8, 2, 8, 2, 7, 3]; addMove('heartbeat', false, rw.map(v => ({ l: [4, v], r: [10, v] }))); }
+    const MOVES = DANCE_MOVES;                       // shared library (buildDanceMoves)
 
     const orbs = result
       .filter(n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
@@ -7608,6 +7647,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (mv.cross) col = Math.max(0, Math.min(14, col));             // crossover move: may pass the centre line
           else if (isR) col = Math.max(7, Math.min(14, col));             // otherwise keep each hand in its zone
           else          col = Math.max(0, Math.min(7, col));
+          o._preSweep = o._preSweep || { x: o._x, row: o.row };   // demotion snapshot ([PatternCoverage])
           o._x = COL_X[col];
           o.row = rowv;
           o._denseSweep = true;
@@ -7620,34 +7660,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense region(s) (${_dswNotes} orbs) using ${MOVES.length} two-hand move types`);
 
-    // ── [DenseSweep] boundary smoothing ─────────────────────────────────────
-    // Reshaping moves pattern notes, but their LOOSE same-hand neighbours (region
-    // entry/exit) were placed with no knowledge of the new positions — leaking
-    // just-over-limit C3 jumps (consistently 8 cols) at recurring region-boundary
-    // timestamps (confirmed via nonpattern_big_jumps). Where exactly one of a
-    // consecutive same-hand pair is pattern-tagged and the jump exceeds C3 limits
-    // (>7 cols or >5 rows), nudge the LOOSE note just enough to get back under —
-    // the pattern choreography stays intact and the loose note barely moves
-    // (an 8-col jump = a 1-col nudge).
+    // ── [DenseSweep] boundary smoothing — shared smoothPatternBoundaries (also used by [SparseSweep]) ──
     {
-      const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
-      let _dswClamped = 0;
-      for (let h = 0; h <= 1; h++) {
-        const hn = orbs.filter(n => n.type === h);          // beat-sorted free orbs only
-        for (let k = 1; k < hn.length; k++) {
-          const a = hn[k - 1], b = hn[k];
-          if (!!a._denseSweep === !!b._denseSweep) continue; // need exactly one pattern note
-          const loose = a._denseSweep ? b : a, anchor = a._denseSweep ? a : b;
-          const dC = xCol(loose._x) - xCol(anchor._x), dR = (loose.row || 0) - (anchor.row || 0);
-          if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
-          let nc = xCol(anchor._x) + Math.max(-7, Math.min(7, dC));  // clamp to exactly the C3 limit
-          let nr = (anchor.row || 0) + Math.max(-5, Math.min(5, dR)); // → minimal displacement
-          nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc)); // keep hand zone
-          loose._x = COL_X[nc];
-          loose.row = Math.max(0, Math.min(10, nr));
-          _dswClamped++;
-        }
-      }
+      const _dswClamped = smoothPatternBoundaries(orbs);
       if (_dswClamped) console.log(`[DenseSweep] Boundary-clamped ${_dswClamped} loose neighbour(s) at region edges`);
     }
   }
