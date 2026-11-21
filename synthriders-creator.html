@@ -13377,17 +13377,21 @@ Rules:
           '#f0a034', '#e07828', '#d05020', '#c03030',
         ];
 
+        // All 11 rows, always: hiding empty rows made the 11-row scale look like 8 (the
+        // extremes are capped at ~2%, so rows 0, 9 and 10 are often empty). Empty rows are
+        // dimmed; a row with a few notes shows "<1%" rather than rounding to 0.
         const rowRows = rowCounts.map((count, row) => {
-          const pct = Math.round(count / total * 100);
-          if (pct === 0) return '';
-          const bar = '█'.repeat(Math.max(1, Math.round(pct / 4))); // 1 block per 4%
-          return `<div style="display:flex;align-items:center;gap:5px;">` +
+          const raw = count / total * 100;
+          const pct = Math.round(raw);
+          const pctTxt = count === 0 ? '0%' : pct === 0 ? '<1%' : `${pct}%`;
+          const bar = count === 0 ? '' : '█'.repeat(Math.max(1, Math.round(raw / 4))); // 1 block per 4%
+          return `<div style="display:flex;align-items:center;gap:5px;${count === 0 ? 'opacity:.35;' : ''}">` +
             `<span style="color:${ROW_COLORS[row]};font-size:11px;">●</span>` +
             `<span style="min-width:84px;color:var(--fg);font-family:'Space Mono',monospace;">${ROW_LABELS[row]}</span>` +
             `<span style="color:${ROW_COLORS[row]};letter-spacing:-1px;font-size:9px;">${bar}</span>` +
-            `<span style="color:var(--muted);margin-left:2px;">${pct}%</span>` +
+            `<span style="color:var(--muted);margin-left:2px;">${pctTxt}</span>` +
             `</div>`;
-        }).filter(Boolean);
+        });
 
         heightEl.innerHTML =
           '<div style="font-size:9px;color:var(--muted);margin-bottom:3px;text-transform:uppercase;letter-spacing:.5px;">Height distribution</div>' +
@@ -13861,12 +13865,26 @@ function _build3DHwy(scene, THREE) {
 }
 
 // ── Proper group disposal ─────────────────────────────────────────────────────
+// ── Shared 3D resources (2026-11-21) ─────────────────────────────────────────
+// refresh3DView runs on every animation frame during playback. It used to create a NEW
+// sphere geometry + material for every visible orb (and a box + material for every wall
+// tile) each frame, then dispose them all: ~200 geometries uploaded to the GPU per frame,
+// ~90 ms/frame (≈11 fps) on a dense Master map. Orb and wall shapes/colours repeat, so each
+// is built once here and reused; _clearGroup skips anything flagged shared. Rail tubes are
+// clipped to the view window each frame, so their geometry is still rebuilt (and disposed).
+const _3dShared = new Map();
+function _3dShare(key, make) {
+  let r = _3dShared.get(key);
+  if (!r) { r = make(); r.userData.shared = true; _3dShared.set(key, r); }
+  return r;
+}
+
 function _clearGroup(grp) {
   for (let i = grp.children.length - 1; i >= 0; i--) {
     const c = grp.children[i];
-    c.geometry?.dispose();
-    if (Array.isArray(c.material)) c.material.forEach(m => m.dispose());
-    else c.material?.dispose();
+    if (!c.geometry?.userData?.shared) c.geometry?.dispose();
+    for (const m of (Array.isArray(c.material) ? c.material : [c.material]))
+      if (m && !m.userData?.shared) m.dispose();
     grp.remove(c);
   }
 }
@@ -13937,9 +13955,9 @@ function refresh3DView() {
       if (curvePts.length >= 2) {
         const curve   = new THREE.CatmullRomCurve3(curvePts);
         const tubeSeg = Math.max(12, curvePts.length * 6);
-        const tubeGeo = new THREE.TubeGeometry(curve, tubeSeg, 0.13, 7, false);
-        const tubeMat = new THREE.MeshPhongMaterial(
-          { color: col, emissive: glow, shininess: 80, transparent: true, opacity: 0.88 });
+        const tubeGeo = new THREE.TubeGeometry(curve, tubeSeg, 0.13, 7, false);   // per frame: clipped to the window
+        const tubeMat = _3dShare(`mat:rail:${col}:${glow}`, () => new THREE.MeshPhongMaterial(
+          { color: col, emissive: glow, shininess: 80, transparent: true, opacity: 0.88 }));
         railGroup.add(new THREE.Mesh(tubeGeo, tubeMat));
       }
 
@@ -14007,7 +14025,8 @@ function refresh3DView() {
 
     // Lean obstacles use a right-triangular prism: wide at top, tapers to bottom corner.
     // BoxGeometry is used for all other obstacle types.
-    let wGeo;
+    // Shared per shape (tiles all have the same length), built on first use.
+    const wGeo = _3dShare(`geo:wall:${isLL ? 'LL' : isLR ? 'LR' : 'box'}:${boxW}:${boxH}:${boxZ}`, () => {
     if (isLL || isLR) {
       const hw = boxW / 2, hh = boxH / 2;
       // Base at top, tall vertical edge on the EXTERIOR, hypotenuse facing centre.
@@ -14023,14 +14042,14 @@ function refresh3DView() {
         triShape.lineTo( hw, -hh); // bottom-exterior (right = exterior for leanRight)
       }
       triShape.closePath();
-      wGeo = new THREE.ExtrudeGeometry(triShape, { depth: boxZ, bevelEnabled: false });
-    } else {
-      wGeo = new THREE.BoxGeometry(boxW, boxH, boxZ);
+      return new THREE.ExtrudeGeometry(triShape, { depth: boxZ, bevelEnabled: false });
     }
-    const wMat = new THREE.MeshPhongMaterial({
+    return new THREE.BoxGeometry(boxW, boxH, boxZ);
+    });
+    const wMat = _3dShare(`mat:wall:${wColor}`, () => new THREE.MeshPhongMaterial({
       color: wColor, emissive: wColor, emissiveIntensity: 0.3,
       transparent: true, opacity: 0.48, side: THREE.DoubleSide,
-    });
+    }));
     const wMesh = new THREE.Mesh(wGeo, wMat);
     // ExtrudeGeometry spans z=[0, depth] in local space; BoxGeometry is centred at z=0.
     const wPosZ = (isLL || isLR) ? wz : wz + boxZ / 2;
@@ -14082,17 +14101,18 @@ function refresh3DView() {
 }
 
 // ── Orb helper (solid core + glow shell + optional stem halo ring) ───────────
+// Geometries and materials are shared (_3dShare): only the Mesh objects are per frame.
 function _addOrb(THREE, group, x, y, z, col, glow, r, stemCol = null) {
   const core = new THREE.Mesh(
-    new THREE.SphereGeometry(r, 16, 12),
-    new THREE.MeshPhongMaterial({ color: col, emissive: glow, shininess: 110 })
+    _3dShare(`geo:orb:${r}`, () => new THREE.SphereGeometry(r, 16, 12)),
+    _3dShare(`mat:orb:${col}:${glow}`, () => new THREE.MeshPhongMaterial({ color: col, emissive: glow, shininess: 110 }))
   );
   core.position.set(x, y, z);
   group.add(core);
 
   const shell = new THREE.Mesh(
-    new THREE.SphereGeometry(r * 1.55, 8, 6),
-    new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.11 })
+    _3dShare(`geo:shell:${r}`, () => new THREE.SphereGeometry(r * 1.55, 8, 6)),
+    _3dShare(`mat:shell:${col}`, () => new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.11 }))
   );
   shell.position.set(x, y, z);
   group.add(shell);
@@ -14100,11 +14120,11 @@ function _addOrb(THREE, group, x, y, z, col, glow, r, stemCol = null) {
   // Stem halo — torus ring in the XY plane (faces camera head-on)
   if (stemCol !== null) {
     const halo = new THREE.Mesh(
-      new THREE.TorusGeometry(r * 1.85, r * 0.13, 6, 24),
-      new THREE.MeshBasicMaterial({
+      _3dShare(`geo:halo:${r}`, () => new THREE.TorusGeometry(r * 1.85, r * 0.13, 6, 24)),
+      _3dShare(`mat:halo:${stemCol}`, () => new THREE.MeshBasicMaterial({
         color: stemCol, transparent: true, opacity: 0.90,
         blending: THREE.AdditiveBlending, depthWrite: false,
-      })
+      }))
     );
     halo.position.set(x, y, z);
     group.add(halo);
