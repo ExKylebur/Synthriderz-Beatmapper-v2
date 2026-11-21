@@ -1611,6 +1611,66 @@ function smoothPatternBoundaries(orbs) {
   return clamped;
 }
 
+// ── [SparseSweep] choreograph LOOSE runs with the same move library ─────────────────────
+// [DenseSweep] only takes runs at <=0.5-beat spacing; looser runs fell back to per-note
+// naturalX arcs + jitter, the source of most "random-feeling" stretches. A sparse run is
+// consecutive untagged free orbs with every gap <= maxGap, >= minRun orbs over >= minSpan
+// beats. One move step per onset (new beat). A sparse hand has more time between notes, so
+// the per-step Manhattan cap scales with the gap: min(5, 3 + floor(gapBeats)). Zone via
+// handZoneCols (cross moves reach <= CROSS_REACH_COLS past centre), rows clamped to
+// [rowLo,rowHi]. Records a _preSweep snapshot so [PatternCoverage] can demote the run.
+const SSW_MAXGAP = 1.5;   // max beats between consecutive orbs in a sparse run
+const SSW_MINRUN = 4;     // min orbs
+const SSW_MINSPAN = 4;    // min beats spanned
+function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, minRun = SSW_MINRUN,
+                                    minSpan = SSW_MINSPAN, sectionAt = () => null,
+                                    pickMove = (_sec, reg) => reg % DANCE_MOVES.length } = {}) {
+  const orbs = result
+    .filter(n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
+    .sort((a, b) => a.beat - b.beat);
+  let runs = 0, tagged = 0, reg = 0, i = 0;
+  while (i < orbs.length) {
+    if (isPattern(orbs[i])) { i++; continue; }
+    let j = i;
+    while (j + 1 < orbs.length && !isPattern(orbs[j + 1]) && orbs[j + 1].beat - orbs[j].beat <= maxGap) j++;
+    const run = orbs.slice(i, j + 1);
+    if (run.length >= minRun && run[run.length - 1].beat - run[0].beat >= minSpan) {
+      let mvIdx = pickMove(sectionAt(run[0].beat), reg) % DANCE_MOVES.length;
+      let mv = DANCE_MOVES[mvIdx], k = 0, lastBk = null, prevL = null, prevR = null;
+      for (const o of run) {
+        const bk = Math.round(o.beat * 64);
+        if (lastBk !== null && bk !== lastBk) {
+          k++;
+          if (k >= mv.steps.length) { mvIdx = (mvIdx + 1) % DANCE_MOVES.length; mv = DANCE_MOVES[mvIdx]; k = 0; }
+        }
+        lastBk = bk;
+        const isR = o.type === 0, st = mv.steps[k];
+        const want = (isR ? st.r : st.l) || (isR ? (prevR || [10, 5]) : (prevL || [4, 5]));
+        let col = want[0], row = want[1];
+        const prev = isR ? prevR : prevL;
+        if (prev) {
+          const cap = Math.min(5, 3 + Math.floor(o.beat - prev[2]));
+          const dC = col - prev[0], dR = row - prev[1], manh = Math.abs(dC) + Math.abs(dR);
+          if (manh > cap) { const sc = cap / manh; col = Math.round(prev[0] + dC * sc); row = Math.round(prev[1] + dR * sc); }
+        }
+        row = Math.max(rowLo, Math.min(rowHi, Math.round(row)));
+        const z = handZoneCols(isR ? 0 : 1, mv.cross);
+        col = Math.max(z.colMin, Math.min(z.colMax, col));
+        o._preSweep = o._preSweep || { x: o._x, row: o.row };
+        o._x = COL_X[col];
+        o.row = row;
+        o._sparseSweep = true;
+        if (mv.cross && ((isR && col < 7) || (!isR && col > 7))) o._crossover = true;
+        if (isR) prevR = [col, row, o.beat]; else prevL = [col, row, o.beat];
+        tagged++;
+      }
+      runs++; reg++;
+    }
+    i = j + 1;
+  }
+  return { runs, tagged, smoothed: smoothPatternBoundaries(orbs) };
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes

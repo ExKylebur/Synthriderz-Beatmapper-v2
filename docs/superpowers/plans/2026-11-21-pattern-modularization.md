@@ -951,7 +951,9 @@ test('pickMove hook receives section + region index', () => {
 // the per-step Manhattan cap scales with the gap: min(5, 3 + floor(gapBeats)). Zone via
 // handZoneCols (cross moves reach <= CROSS_REACH_COLS past centre), rows clamped to
 // [rowLo,rowHi]. Records a _preSweep snapshot so [PatternCoverage] can demote the run.
-const SSW_MAXGAP = 1.5, SSW_MINRUN = 4, SSW_MINSPAN = 4;
+const SSW_MAXGAP = 1.5;   // max beats between consecutive orbs in a sparse run
+const SSW_MINRUN = 4;     // min orbs
+const SSW_MINSPAN = 4;    // min beats spanned
 function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, minRun = SSW_MINRUN,
                                     minSpan = SSW_MINSPAN, sectionAt = () => null,
                                     pickMove = (_sec, reg) => reg % DANCE_MOVES.length } = {}) {
