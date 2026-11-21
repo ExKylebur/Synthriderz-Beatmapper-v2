@@ -4276,6 +4276,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (const s of sections) if (beat >= s.startBeat && beat < s.endBeat) return s;
     return sections[sections.length - 1] || { avgRow: 5, rowVariance: 2, startBeat: 0, endBeat: totalBeats };
   }
+  const motifMemory = createMotifMemory(sections);   // per Generate call (spec decision 2026-11-21)
+
 
   const events = extractNoteEvents(analysis, bpm, diff, { ...hints, _sections: sections });
   if (events.length < 10) {
@@ -4987,7 +4989,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         arcRowEnd   = Math.max(diffRowMin, Math.min(2, 1 + Math.floor(Math.random() * 2)));
       }
 
-      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint);
+      const _motifSec = sectionAt(beat);
+      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
+      motifMemory.record(_motifSec, 'rails', _arc.plan);
 
       // [FEAT-6] For elevate rails, blend the circular arc waypoints with a linear
       // upward ramp so the rail visually and physically ascends from start to end.
@@ -7648,7 +7652,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       while (gj + 1 < golds.length && golds[gj + 1].beat - golds[gj].beat <= GS_GAP) gj++;
       const run = golds.slice(gi, gj + 1);
       if (run.length >= 3) {
-        const shape = gReshaped % GOLD_SHAPES;
+        const _gSec = sectionAt(run[0].beat);
+        const shape = motifMemory.replay(_gSec, 'gold') ?? (gReshaped % GOLD_SHAPES);
+        motifMemory.record(_gSec, 'gold', shape);
         const flip  = gReshaped % 2 === 0 ? 0 : 4;          // alternate start side per run
         let prevC = null, prevR = null;
         for (let k = 0; k < run.length; k++) {
@@ -7725,7 +7731,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const region = orbs.slice(i, j + 1);
       const beatKeys = new Set(region.map(o => Math.round(o.beat * 64)));
       if (region.length >= DSW_MINRUN && beatKeys.size >= 3) {
-        let mvIdx = _reg % MOVES.length, mv = MOVES[mvIdx], k = 0, lastBk = null;
+        const _dSec = sectionAt(region[0].beat);
+        let mvIdx = motifMemory.replay(_dSec, 'dense') ?? (_reg % MOVES.length);
+        motifMemory.record(_dSec, 'dense', mvIdx);
+        let mv = MOVES[mvIdx], k = 0, lastBk = null;
         let prevL = null, prevR = null;
         for (const o of region) {
           const bk = Math.round(o.beat * 64);
@@ -7766,6 +7775,27 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const _dswClamped = smoothPatternBoundaries(orbs);
       if (_dswClamped) console.log(`[DenseSweep] Boundary-clamped ${_dswClamped} loose neighbour(s) at region edges`);
     }
+  }
+
+  // ── [SparseSweep] choreograph loose runs (0.5-1.5-beat spacing) — see applySparseSweep ──
+  const _sswOpts = {
+    rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), sectionAt,
+    pickMove: (sec, reg) => {
+      const v = motifMemory.replay(sec, 'sparse') ?? (reg % DANCE_MOVES.length);
+      motifMemory.record(sec, 'sparse', v);
+      return v;
+    },
+  };
+  {
+    const _ssw = applySparseSweep(result, _sswOpts);
+    if (_ssw.runs) console.log(`[SparseSweep] Choreographed ${_ssw.runs} sparse run(s) (${_ssw.tagged} orbs), boundary-smoothed ${_ssw.smoothed}`);
+  }
+  // ── [PatternCoverage] keep choreographed coverage in 60-80% — see enforcePatternCoverage ──
+  {
+    const _pc = enforcePatternCoverage(result, {
+      promote: () => applySparseSweep(result, { ..._sswOpts, minRun: 3, minSpan: 3, maxGap: 2.0 }),
+    });
+    console.log(`[PatternCoverage] before=${(100 * _pc.before).toFixed(0)}% after=${(100 * _pc.after).toFixed(0)}% promoted=${_pc.promoted} demoted=${_pc.demoted}`);
   }
 
   // ── FINAL C1/C2 SWEEP — runs last, after every pass that could touch result ──
@@ -7914,6 +7944,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (was sitting too low in VR; clamped at row ${diffRowMin})`);
   }
+  { const _ms = motifMemory.stats(); if (_ms.roots) console.log(`[MotifMemory] roots=${_ms.roots} recorded=${_ms.recorded} replayed=${_ms.replayed}`); }
 
   // ── [Phase2Probe] skeleton diff — what the spatial zone did to the population ─────────
   // Compares the note population at FINAL against the skeleton locked at phase-boundary.
