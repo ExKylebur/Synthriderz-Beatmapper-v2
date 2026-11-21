@@ -17,9 +17,12 @@ Exit code = number of files with HARD violations (0 = all clean). Stats never fa
 --timing (needs librosa) refits the beat on the exported OGG: map BPM error, how far the map's
 integer beats sit from the music's beats, and per-quarter drift (see timing_check).
 
-COORDINATE NOTES (from server.py /export):
-    Position = [x, y, z];  x = _x + 0.002,  y = ROW_Y8[row] + 0.0012,  z = (beat/bps)*20
+COORDINATE NOTES (from server.py build_note_track):
+    Position = [x, y, z];  x = _x + 0.002,  y = ROW_Y[row] + 0.0012,  z = (beat/bps)*20
     => z is the universal clock: seconds = z/20, beat = (z/20)*bps. Notes AND walls share it.
+    ROW_Y is the app's 11-row table (row 0 = ceiling, row 10 = floor), imported from server.py,
+    which tests/rows.test.mjs keeps identical to the app. Exports made before 2026-11-21 used an
+    older 8-row table: their rows decode to the nearest 11-row row and trip the ROW-GRID stat.
     A note is a RAIL iff it has a non-null "Segments" list; its end-z = last segment's z.
     Type: 0=right(red) 1=left(blue) 2=green(either) 3=gold(both).
 """
@@ -29,8 +32,12 @@ try:
 except Exception:
     pass
 
-# Export's 8-row Y table (server.py ROW_Y) — for recovering row index from Position[1].
-ROW_Y8 = [0.6825, 0.4875, 0.2925, 0.0975, -0.0975, -0.2925, -0.4875, -0.6825]
+# Decode rows with the SAME table the exporter writes (one Python source). It used to keep its
+# own copy of the exporter's stale 8-row table, so it agreed with the exporter's bug.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from server import ROW_Y, Y_OFFSET  # noqa: E402
+FLOOR_ROW = len(ROW_Y) - 1
+ROW_GRID_TOL = 0.002       # |y - (ROW_Y[r] + Y_OFFSET)| above this = height off the app's grid
 COL_STEP = 0.1365          # one grid column in X (COL_X step)
 C1_X_TOL = COL_STEP * 1.1  # off-rail lateral tolerance (mirrors isOffRail's > RAIL_COL_STEP)
 GOLD_BEATS = 1.0           # gold/green C2 clearance window (beats)
@@ -94,7 +101,12 @@ def _song_duration(path):
 
 
 def _row_of(y):
-    return min(range(len(ROW_Y8)), key=lambda i: abs(ROW_Y8[i] - (y - 0.0012)))
+    return min(range(len(ROW_Y)), key=lambda i: abs(ROW_Y[i] - (y - Y_OFFSET)))
+
+
+def _off_grid(y):
+    """True when a height is not one of the app's row heights (e.g. a pre-fix 8-row export)."""
+    return abs(ROW_Y[_row_of(y)] + Y_OFFSET - y) > ROW_GRID_TOL
 
 
 def _notes_for(meta, diff):
@@ -109,15 +121,17 @@ def _notes_for(meta, diff):
             segs_raw = nd.get('Segments')
             segs = []
             end_t = z
+            off = _off_grid(float(pos[1]))
             if segs_raw:
                 for s in segs_raw:
                     segs.append((float(s[2]), float(s[0]), _row_of(float(s[1]))))
+                    off = off or _off_grid(float(s[1]))
                 end_t = segs[-1][0] if segs else z
             out.append({
                 't': z, 'beat': (z / 20.0) * bps, 'x': float(pos[0]),
                 'row': _row_of(float(pos[1])), 'type': int(nd.get('Type', 0)),
                 'is_rail': bool(segs_raw), 'end_t': end_t,
-                'end_beat': (end_t / 20.0) * bps, 'segs': segs,
+                'end_beat': (end_t / 20.0) * bps, 'segs': segs, 'off_grid': off,
             })
     out.sort(key=lambda n: n['t'])
     return out, bps
@@ -223,9 +237,13 @@ def validate_diff(meta, diff, walls=None, song_dur=None):
         max_nps = max(max_nps, i - j + 1)
     # Longest noteless gap (seconds), within the mapped span.
     max_gap = max((b - a for a, b in zip(ts, ts[1:])), default=0)
-    # Row extremes (ceiling row 0 / floor row 7 in export's 8-row space).
+    # Row extremes (ceiling row 0 / floor row 10 in the app's 11-row space).
     ceil_pct  = round(100 * sum(1 for x in notes if x['row'] == 0) / n, 1)
-    floor_pct = round(100 * sum(1 for x in notes if x['row'] == 7) / n, 1)
+    floor_pct = round(100 * sum(1 for x in notes if x['row'] == FLOOR_ROW) / n, 1)
+    # Heights off the app's row grid: notes the player meets somewhere other than where the
+    # generator, critic and 3D preview put them. Soft, because hand-made maps from the
+    # official editor can legitimately use free positions.
+    off_grid = sum(1 for x in notes if x['off_grid'])
 
     # Render-window object count (synth_mapping_helper limits): peak objects simultaneously
     # on-screen = max in any forward RENDER_WINDOW_NOTES-second window (notes+rails+walls).
@@ -257,6 +275,8 @@ def validate_diff(meta, diff, walls=None, song_dur=None):
     if max_nps > NPS_SOFT.get(diff, 10): soft.append(f"maxNPS {max_nps} (>{NPS_SOFT.get(diff,10)} for {diff})")
     if max_gap > 6:      soft.append(f"noteless gap {round(max_gap,1)}s (>6 — dead air)")
     if ceil_pct > 4:     soft.append(f"ceiling {ceil_pct}% (>4 — too many top-row)")
+    if off_grid:         soft.append(f"ROW-GRID: {off_grid} note(s) with a height off the app's 11-row grid "
+                                     f"(pre-2026-11-21 8-row export, or hand-placed)")
 
     # ── Render/despawn limits (synth_mapping_helper analysis.py) ──────────────────────────
     if max_window > QUEST_RENDER_LIMIT:

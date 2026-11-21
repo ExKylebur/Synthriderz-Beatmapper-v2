@@ -3905,9 +3905,9 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
     }
   }
 
-  // Clamp rail endpoints to playable rows [1, 9]. Row 0 (Ceiling) and rows 9-10 (Floor)
-  // collapse to the same in-game position; starting/ending a rail there causes inconsistencies
-  // between rail.row and the arc's railSegments (which are always center-constrained to 1-9).
+  // Clamp rail endpoints to playable rows [1, 9]. Starting/ending a rail at row 0 (Ceiling) or
+  // row 10 (Floor) causes inconsistencies between rail.row and the arc's railSegments (which
+  // are always center-constrained to 1-9).
   // This is the single source of truth — every C1 cascade we've debugged ultimately traced
   // back to rails starting at row 0, which is now impossible.
   rowStart = Math.max(1, Math.min(9, rowStart));
@@ -4207,8 +4207,10 @@ async function analyseAudioServer(bpm, statusEl, enabledStems) {
 }
 
 // Target row distribution — mirrors the in-game COMFORTABLE/MODERATE/INTENSE comfort zones.
-// The game grid has 8 usable rows (0=top, 7=bottom); rows 8-10 in our client editor all
-// collapse to game row 7 (lowest position), so they are kept extremely rare.
+// All 11 rows are distinct in-game heights (ROW_Y; server.py exports the same table). Until
+// 2026-11-21 the export used a stale 8-row table that put rows 7-10 all on the floor, which
+// is where the old "rows 8-10 collapse to game row 7" note came from. Rows 8-10 stay rare
+// because they are physically demanding, not because they are unreachable.
 // Peak at rows 4-5 (chest/waist height = COMFORTABLE inner zone).
 // Rows 0 & 8-10 map to physically demanding extremes (INTENSE outer zone).
 const ROW_WEIGHTS = [0.01, 0.03, 0.08, 0.14, 0.21, 0.22, 0.16, 0.08, 0.04, 0.02, 0.01];
@@ -4392,7 +4394,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   let row0Count = 0, row8plusCount = 0; // C4: track extreme-layer usage
   let lowRowRun  = 0; // consecutive notes at rows 6-10 — triggers mid-range pull
   let highRowRun = 0; // consecutive notes at rows 0-4  — triggers mid-range pull (mirror)
-  // rows 8-10 in client all collapse to game row 7 (floor) — cap them as a group
+  // rows 8-10 (the low, physically demanding end) are capped as a group
   // ── Placement debug log — collects spatial events for this generation pass ──
   const _placementLog = []; // { t, beat, hand, ... }
   // Helper: convert X value back to nearest column index
@@ -4766,12 +4768,12 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       highRowRun = 0; lowRowRun = 0;
     }
 
-    // C4: cap extreme layers — 2% max for top (row 0) and 2% combined for floor rows (8-10).
-    // Rows 8-10 all collapse to the same game floor position, so they are capped as a group.
+    // C4: cap extreme layers — 2% max for top (row 0) and 2% combined for low rows (8-10),
+    // capped as a group because they are all a deep reach.
     // extremeCapPct may be tightened by the localStorage learning system.
     const extremeLimit = Math.max(1, Math.floor(result.length * extremeCapPct));
     if (row === 0 && row0Count     >= extremeLimit) row = 1;
-    if (row >= 8  && row8plusCount >= extremeLimit) row = 7; // push to last valid game row
+    if (row >= 8  && row8plusCount >= extremeLimit) row = 7; // pull up to the lowest uncapped row
 
     // 1/8th-note accent: occasionally lock row to create short rhythmic pulses.
     // Disabled at Expert/Master (diff >= 8) — at high density the 30% lock chance
@@ -7940,14 +7942,18 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   clampC3Jumps(result, bps);
 
   // ── [RowLift] shift the whole map up by ROW_LIFT rows — the final spatial word ───────
-  // Row 0 = top (physically highest in VR); a higher row index = lower. In-game the note
-  // distribution sat too low, so translate EVERYTHING up uniformly as the last pass. A
-  // CONSTANT offset can't break any clearance: rail/companion alignment, C1, and C2 are all
-  // beat- or relative-row-based, and a rail's start row, end row, and waypoint rows all shift
+  // Row 0 = top (physically highest in VR); a higher row index = lower. A CONSTANT offset
+  // can't break any clearance: rail/companion alignment, C1, and C2 are all beat- or
+  // relative-row-based, and a rail's start row, end row, and waypoint rows all shift
   // together. Clamped to diffRowMin so lower difficulties keep their "nothing at the very
-  // top" floor (Master diffRowMin=0). Tune ROW_LIFT if 1 row isn't enough / too much.
+  // top" floor (Master diffRowMin=0).
+  // ROW_LIFT was 1 because maps "sat too low in VR". That was the export bug: server.py wrote
+  // an 8-row table that put the centre row 0.29 units low (average height −0.24 on a real
+  // Master map). With the export fixed (2026-11-21), a lift of 1 would put that map at
+  // +0.16, higher than any map ever play-tested. 0 gives +0.03, the designed centre, vs the
+  // −0.06 that was signed off in VR. Raise it again only on new VR feedback.
   {
-    const ROW_LIFT = 1;
+    const ROW_LIFT = 0;
     const _lift = r => Math.max(diffRowMin, (r | 0) - ROW_LIFT);
     for (const n of result) {
       if (typeof n.row        === 'number') n.row        = _lift(n.row);
@@ -7955,7 +7961,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       if (Array.isArray(n.railSegments))
         for (const s of n.railSegments) if (typeof s.row === 'number') s.row = _lift(s.row);
     }
-    console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (was sitting too low in VR; clamped at row ${diffRowMin})`);
+    console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (clamped at row ${diffRowMin})`);
   }
   { const _ms = motifMemory.stats(); if (_ms.roots) console.log(`[MotifMemory] roots=${_ms.roots} recorded=${_ms.recorded} replayed=${_ms.replayed}`); }
 

@@ -31,6 +31,7 @@ import re
 import struct
 import io
 import json
+import math
 import urllib.parse
 from pathlib import Path
 
@@ -1272,6 +1273,92 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
             'candidates': cands}
 
 
+# ── .synth coordinate constants (match the official editor) ──────────────────
+# ROW_Y must equal `const ROW_Y` in synthriders-creator.html, which is what the generator,
+# the 3D preview and the clipboard copy all use: 11 rows, step 0.1365, row 0 = ceiling,
+# row 10 = floor. tests/rows.test.mjs fails if the two tables ever differ.
+# (Until 2026-11-21 this was an older 8-row table, step 0.195, with rows clamped to 0-7:
+# every exported map sat lower than designed and rows 7-10 all landed on the floor.)
+ROW_Y = [
+     0.6825,  0.5460,  0.4095,  0.2730,  0.1365,
+     0.0,
+    -0.1365, -0.2730, -0.4095, -0.5460, -0.6825,
+]
+X_OFFSET   = 0.002
+Y_OFFSET   = 0.0012
+TIME_SCALE = 20.0
+NOTE_TYPES = ('RightHanded', 'LeftHanded', 'OneHandSpecial', 'BothHandsSpecial')
+
+
+def row_y(row) -> float:
+    """World Y for an app row (0 = ceiling … 10 = floor), clamped to the grid.
+    Rounds half up like JS Math.round, so a fractional rail row lands where the
+    3D preview draws it."""
+    r = math.floor(float(row) + 0.5)
+    return ROW_Y[max(0, min(len(ROW_Y) - 1, r))]
+
+
+def build_note_track(notes: list, bpm: float) -> dict:
+    """Convert the page's raw notes into a beatmap.meta.bin Track dict.
+
+    Track = { beat_index: [note_dict, ...] }, beat_index = beat * 64 (int when whole).
+    Position = [x, y, z] with z = time_seconds * TIME_SCALE. Rails carry Segments
+    (waypoints + end point), each [x, y, z] with its own _x.
+    """
+    bps = bpm / 60.0
+    new_notes = {}
+    for note in notes:
+        beat  = float(note['beat'])
+        ntype = int(note.get('type', 0))
+        nx    = float(note.get('_x', 0.0))
+
+        pos = [
+            round(nx + X_OFFSET, 6),
+            round(row_y(note.get('row', 5)) + Y_OFFSET, 6),
+            round((beat / bps) * TIME_SCALE, 6),
+        ]
+
+        beat_idx = beat * 64
+        beat_key = int(beat_idx) if beat_idx == int(beat_idx) else round(beat_idx, 6)
+
+        # Build Segments for rail notes (waypoints + end point)
+        # Each waypoint carries its own _x (column sweep); fall back to start nx if missing.
+        segments = None
+        rail_end_beat = note.get('railEndBeat')
+        rail_end_row  = note.get('railEndRow')
+        if rail_end_beat is not None and rail_end_row is not None:
+            raw_waypoints = note.get('railSegments') or []
+            rail_end_x = note.get('railEnd_x')  # true end column (different from start)
+            tail_wp = {'beat': rail_end_beat, 'row': rail_end_row}
+            if rail_end_x is not None:
+                tail_wp['_x'] = rail_end_x
+            elif raw_waypoints:
+                tail_wp['_x'] = raw_waypoints[-1].get('_x', nx)
+            all_wp = list(raw_waypoints) + [tail_wp]
+            segments = []
+            for wp in all_wp:
+                wp_beat = float(wp['beat'])
+                wp_x    = float(wp['_x']) if '_x' in wp else nx
+                segments.append([  # float[,] → [[x,y,z], ...]
+                    round(wp_x + X_OFFSET, 6),
+                    round(row_y(wp['row']) + Y_OFFSET, 6),
+                    round((wp_beat / bps) * TIME_SCALE, 6),
+                ])
+
+        type_str = NOTE_TYPES[ntype] if 0 <= ntype < 4 else 'RightHanded'
+        bucket   = new_notes.setdefault(beat_key, [])
+        bucket.append({
+            'Id':       f'Note_{beat_key}{type_str}{len(bucket)}',
+            'ComboId':  -1 if segments else (0 if ntype == 2 else (1 if ntype == 3 else -1)),
+            'Position': pos,
+            'Segments': segments,
+            'Type':     ntype,
+            'Direction': 0,  # NoteDirection.None = 0
+        })
+
+    return dict(sorted(new_notes.items(), key=lambda kv: float(kv[0])))
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -2034,72 +2121,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if diff_name not in DIFFICULTIES:
                 diff_name = 'Expert'
 
-            # ── coordinate constants (match official editor) ───────────────
-            X_OFFSET   = 0.002
-            Y_OFFSET   = 0.0012
-            TIME_SCALE = 20.0
-            bps        = bpm / 60.0
-            ROW_Y      = [0.6825, 0.4875, 0.2925, 0.0975, -0.0975, -0.2925, -0.4875, -0.6825]
-            NOTE_TYPES = ('RightHanded','LeftHanded','OneHandSpecial','BothHandsSpecial')
-
-            # ── convert notes to new format ────────────────────────────────
-            # Track[diff] = { beat_index: [note_dict, ...] }
-            # beat_index  = beat * 64  (int when whole, float otherwise)
-            # Position    = [x, y, z]  where z = time_seconds * TIME_SCALE
-            new_notes = {}
-            for note in notes:
-                beat  = float(note['beat'])
-                row   = max(0, min(7, int(note.get('row', 4))))
-                ntype = int(note.get('type', 0))
-                nx    = float(note.get('_x', 0.0))
-                ny    = ROW_Y[row]
-
-                pos = [
-                    round(nx + X_OFFSET, 6),
-                    round(ny + Y_OFFSET, 6),
-                    round((beat / bps) * TIME_SCALE, 6),
-                ]
-
-                beat_idx = beat * 64
-                beat_key = int(beat_idx) if beat_idx == int(beat_idx) else round(beat_idx, 6)
-
-                # Build Segments for rail notes (waypoints + end point)
-                # Each waypoint carries its own _x (column sweep); fall back to start nx if missing.
-                segments = None
-                rail_end_beat = note.get('railEndBeat')
-                rail_end_row  = note.get('railEndRow')
-                if rail_end_beat is not None and rail_end_row is not None:
-                    raw_waypoints = note.get('railSegments') or []
-                    rail_end_x = note.get('railEnd_x')  # true end column (different from start)
-                    tail_wp = {'beat': rail_end_beat, 'row': rail_end_row}
-                    if rail_end_x is not None:
-                        tail_wp['_x'] = rail_end_x
-                    elif raw_waypoints:
-                        tail_wp['_x'] = raw_waypoints[-1].get('_x', nx)
-                    all_wp = list(raw_waypoints) + [tail_wp]
-                    segments = []
-                    for wp in all_wp:
-                        wp_beat = float(wp['beat'])
-                        wp_row  = max(0, min(7, int(wp['row'])))
-                        wp_x    = float(wp['_x']) if '_x' in wp else nx
-                        segments.append([  # float[,] → [[x,y,z], ...]
-                            round(wp_x + X_OFFSET, 6),
-                            round(ROW_Y[wp_row] + Y_OFFSET, 6),
-                            round((wp_beat / bps) * TIME_SCALE, 6),
-                        ])
-
-                type_str = NOTE_TYPES[ntype] if 0 <= ntype < 4 else 'RightHanded'
-                bucket   = new_notes.setdefault(beat_key, [])
-                bucket.append({
-                    'Id':       f'Note_{beat_key}{type_str}{len(bucket)}',
-                    'ComboId':  -1 if segments else (0 if ntype == 2 else (1 if ntype == 3 else -1)),
-                    'Position': pos,
-                    'Segments': segments,
-                    'Type':     ntype,
-                    'Direction': 0,  # NoteDirection.None = 0
-                })
-
-            sorted_track = dict(sorted(new_notes.items(), key=lambda kv: float(kv[0])))
+            # Coordinate constants (ROW_Y, X/Y_OFFSET, TIME_SCALE) and the note conversion
+            # live at module level (build_note_track) so tests exercise the real export.
+            bps          = bpm / 60.0
+            sorted_track = build_note_track(notes, bpm)
 
             # ── convert walls ───────────────────────────────────────────────
             raw_crouchs = track_obj.get('crouchs', [])
@@ -2310,7 +2335,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pass
 
             audio_info = f'{len(audio_bytes)//1024} KB' if audio_bytes else 'MISSING — no audio in ZIP!'
-            print(f"  Title={title!r}  Artist={artist!r}  Diff={diff_name}  Notes={len(new_notes)}  Audio={audio_info}")
+            print(f"  Title={title!r}  Artist={artist!r}  Diff={diff_name}  Notes={len(sorted_track)}  Audio={audio_info}")
 
             # ── Batch mode: save to disk instead of streaming back ─────────────
             # When the client sends a save_path field, write the synth file to that
