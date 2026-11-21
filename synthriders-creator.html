@@ -1440,6 +1440,39 @@ function handZoneCols(hand, cross = false) {
                     : { colMin: 0,         colMax: 7 + reach };
 }
 
+// ── Rail shape palette — length tiers ────────────────────────────────────────
+// Single source for generateRailArc's roll AND for chorus-motif replay, which must fit a
+// recorded shape into a slot of a different length. A rail's beat length sets its waypoint
+// budget and therefore which shapes can read (see generateRailArc's palette comment).
+const RAIL_SHAPE_TIERS = {
+  short: ['ellipse', 'hook', 'flick'],
+  mid:   ['ellipse', 'wave', 'zigzag', 'pendulum', 'switchback', 'ramp'],
+  long:  ['ellipse', 'spiral', 'figure8', 'staircase'],
+};
+function railTierOf(len) { return len < 2.5 ? 'short' : len < 8.0 ? 'mid' : 'long'; }
+// Weighted roll — thresholds identical to the pre-2026-11-21 inline roll, so single-shape
+// rails keep their exact distribution (tests/rail-shapes pins seeded output vs acd1853).
+function pickRailShape(len, roll) {
+  if (len < 2.5) return roll < 0.50 ? 'ellipse' : roll < 0.78 ? 'hook' : 'flick';
+  if (len < 8.0) return roll < 0.34 ? 'ellipse' : roll < 0.52 ? 'wave' : roll < 0.66 ? 'zigzag'
+                      : roll < 0.78 ? 'pendulum' : roll < 0.90 ? 'switchback' : 'ramp';
+  return roll < 0.34 ? 'ellipse' : roll < 0.58 ? 'spiral' : roll < 0.80 ? 'figure8' : 'staircase';
+}
+// One tier down, nearest in feel: long → mid analogue, mid → short analogue.
+const RAIL_SHAPE_DOWNGRADE = {
+  spiral: 'ellipse', figure8: 'pendulum', staircase: 'switchback',
+  wave: 'flick', zigzag: 'flick', ramp: 'flick', pendulum: 'hook', switchback: 'hook',
+};
+function fitShapeToLength(shape, len) {
+  const ok = RAIL_SHAPE_TIERS[railTierOf(len)];
+  let s = shape;
+  while (!ok.includes(s)) {
+    s = RAIL_SHAPE_DOWNGRADE[s];
+    if (!s) return 'ellipse';            // e.g. hook/flick in a long slot — ellipse is in every tier
+  }
+  return s;
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
