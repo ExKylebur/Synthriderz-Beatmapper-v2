@@ -1511,6 +1511,49 @@ function fitRailPlan(recorded, len, rnd = Math.random) {
     raw.map((f, k) => ({ frac: minF + spare * f / rSum, shape: recorded[k].shape })), len, rnd);
 }
 
+// ── Chorus motif memory (per Generate call — created inside onsetsToNotes) ──────────────
+// The first occurrence of a chorus-like section records its choreography choices (rail
+// plans, sweep move indices, gold shapes); later occurrences with the same root replay them
+// in order, so repeated music gets recognisably repeated choreography. CHORUS_RE is shared
+// with the "Progressive chorus variation" pass.
+const CHORUS_RE = /chorus|drop|climax|hook|refrain/i;
+function chorusRootKey(name) {
+  const s = String(name || '').toLowerCase();
+  if (!CHORUS_RE.test(s) || /pre/.test(s)) return null;
+  return s.replace(/\(.*?\)/g, '').replace(/\bx\d+\b/g, '').replace(/[\s_-]*\d+\s*$/, '').trim();
+}
+function createMotifMemory(sections) {
+  const owner = new Map();                                     // root -> first section (by startBeat)
+  for (const s of [...(sections || [])].sort((a, b) => a.startBeat - b.startBeat)) {
+    const k = chorusRootKey(s.name);
+    if (k && !owner.has(k)) owner.set(k, s);
+  }
+  const store = new Map();                                     // root -> { kind: [values] }
+  const cursor = new Map();                                    // section -> { kind: index }
+  let recorded = 0, replayed = 0;
+  return {
+    replay(sec, kind) {
+      const k = chorusRootKey(sec?.name);
+      if (!k || owner.get(k) === sec) return null;
+      const list = store.get(k)?.[kind];
+      if (!list || !list.length) return null;
+      if (!cursor.has(sec)) cursor.set(sec, {});
+      const c = cursor.get(sec);
+      c[kind] = (c[kind] ?? -1) + 1;
+      replayed++;
+      return list[c[kind] % list.length];
+    },
+    record(sec, kind, value) {
+      const k = chorusRootKey(sec?.name);
+      if (!k || owner.get(k) !== sec || value == null) return;
+      if (!store.has(k)) store.set(k, {});
+      (store.get(k)[kind] ??= []).push(value);
+      recorded++;
+    },
+    stats() { return { roots: owner.size, recorded, replayed }; },
+  };
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
@@ -6611,7 +6654,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // Falls back to energy-peak detection if no section is named chorus/drop.
   if (!hints.noGold) {
     let choruses = sections.filter(s =>
-      /chorus|drop|climax|hook|refrain/i.test(s.name || '') && !/pre/i.test(s.name || '')
+      CHORUS_RE.test(s.name || '') && !/pre/i.test(s.name || '')
     ).sort((a, b) => a.startBeat - b.startBeat);
     // Fallback: if the LLM didn't use chorus-style names, use the top energy sections.
     if (choruses.length < 2 && sections.length >= 3) {
