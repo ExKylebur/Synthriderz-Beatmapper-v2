@@ -1427,6 +1427,291 @@ const OBSTACLE_BUFFER_BEATS = 2;
 // reads and enters the obstacle. Adjustable.
 const OBSTACLE_LEAD_BEATS = 2;
 
+// ── Cross-centre reach — how far a hand may go PAST centre (col 7) ─────────────
+// Matches the deliberate [Crossover] targets (cols 5-6 / 8-9), DenseSweep's crossReturn
+// move, and validate.py's ZONE check (3+ cols past centre = unreachable → HARD fail).
+// handZoneCols() is the single source for a hand's column range; cross=true widens it by
+// this reach, never to the full grid. A full 0-14 zone let single-arm rails travel to
+// col 13 / col 1 (lateral shapes target zone-edge ∓ 1), which validate flagged as ZONE.
+const CROSS_REACH_COLS = 2;
+function handZoneCols(hand, cross = false) {
+  const reach = cross ? CROSS_REACH_COLS : 0;
+  return hand === 0 ? { colMin: 7 - reach, colMax: 14 }
+                    : { colMin: 0,         colMax: 7 + reach };
+}
+
+// ── Rail shape palette — length tiers ────────────────────────────────────────
+// Single source for generateRailArc's roll AND for chorus-motif replay, which must fit a
+// recorded shape into a slot of a different length. A rail's beat length sets its waypoint
+// budget and therefore which shapes can read (see generateRailArc's palette comment).
+const RAIL_SHAPE_TIERS = {
+  short: ['ellipse', 'hook', 'flick'],
+  mid:   ['ellipse', 'wave', 'zigzag', 'pendulum', 'switchback', 'ramp'],
+  long:  ['ellipse', 'spiral', 'figure8', 'staircase'],
+};
+function railTierOf(len) { return len < 2.5 ? 'short' : len < 8.0 ? 'mid' : 'long'; }
+// Weighted roll — thresholds identical to the pre-2026-11-21 inline roll, so single-shape
+// rails keep their exact distribution (tests/rail-shapes pins seeded output vs acd1853).
+function pickRailShape(len, roll) {
+  if (len < 2.5) return roll < 0.50 ? 'ellipse' : roll < 0.78 ? 'hook' : 'flick';
+  if (len < 8.0) return roll < 0.34 ? 'ellipse' : roll < 0.52 ? 'wave' : roll < 0.66 ? 'zigzag'
+                      : roll < 0.78 ? 'pendulum' : roll < 0.90 ? 'switchback' : 'ramp';
+  return roll < 0.34 ? 'ellipse' : roll < 0.58 ? 'spiral' : roll < 0.80 ? 'figure8' : 'staircase';
+}
+// One tier down, nearest in feel: long → mid analogue, mid → short analogue.
+const RAIL_SHAPE_DOWNGRADE = {
+  spiral: 'ellipse', figure8: 'pendulum', staircase: 'switchback',
+  wave: 'flick', zigzag: 'flick', ramp: 'flick', pendulum: 'hook', switchback: 'hook',
+};
+function fitShapeToLength(shape, len) {
+  const ok = RAIL_SHAPE_TIERS[railTierOf(len)];
+  let s = shape;
+  while (!ok.includes(s)) {
+    s = RAIL_SHAPE_DOWNGRADE[s];
+    if (!s) return 'ellipse';            // e.g. hook/flick in a long slot — ellipse is in every tier
+  }
+  return s;
+}
+
+// ── Multi-segment rail plans ─────────────────────────────────────────────────
+// A plan is [{ frac, shape }] (fracs sum to 1). Rails >= 6 beats chain 2 (6-12) or 3 (12+)
+// shapes; every segment is >= 2.5 beats so it reaches the mid tier; adjacent shapes differ.
+const RAIL_SEG_MIN_BEATS = 2.5;
+const RAIL_MULTISEG_MIN_BEATS = 6;
+function assignSegmentShapes(plan, len, rnd = Math.random) {
+  for (let k = 0; k < plan.length; k++) {
+    const segLen = plan[k].frac * len;
+    const prev = k > 0 ? plan[k - 1].shape : null;
+    let s = plan[k].shape ? fitShapeToLength(plan[k].shape, segLen) : pickRailShape(segLen, rnd());
+    for (let tries = 0; s === prev && tries < 6; tries++) s = pickRailShape(segLen, rnd());
+    if (s === prev) s = RAIL_SHAPE_TIERS[railTierOf(segLen)].find(x => x !== prev);
+    plan[k] = { frac: plan[k].frac, shape: s };
+  }
+  return plan;
+}
+// Affine map w -> minF + spare*w keeps every segment >= minF AND the sum exactly 1.
+function planRailSegments(len, rnd = Math.random) {
+  if (len < RAIL_MULTISEG_MIN_BEATS) return null;           // single-shape rail (legacy path)
+  const n = len >= 12 ? 3 : 2;
+  const minF = RAIL_SEG_MIN_BEATS / len, spare = 1 - n * minF;
+  const w = Array.from({ length: n }, () => 0.5 + rnd());
+  const wSum = w.reduce((a, b) => a + b, 0);
+  return assignSegmentShapes(w.map(x => ({ frac: minF + spare * x / wSum, shape: null })), len, rnd);
+}
+// Chorus-motif replay: a recorded plan's shapes + proportions on a rail of a new length.
+function fitRailPlan(recorded, len, rnd = Math.random) {
+  if (!recorded || !recorded.length) return null;
+  if (len < RAIL_MULTISEG_MIN_BEATS || recorded.length === 1)
+    return [{ frac: 1, shape: fitShapeToLength(recorded[0].shape, len) }];
+  const n = Math.min(recorded.length, len >= 12 ? 3 : 2);
+  const raw = recorded.slice(0, n).map(s => s.frac);
+  const rSum = raw.reduce((a, b) => a + b, 0);
+  const minF = RAIL_SEG_MIN_BEATS / len, spare = 1 - n * minF;
+  return assignSegmentShapes(
+    raw.map((f, k) => ({ frac: minF + spare * f / rSum, shape: recorded[k].shape })), len, rnd);
+}
+
+// ── Chorus motif memory (per Generate call — created inside onsetsToNotes) ──────────────
+// The first occurrence of a chorus-like section records its choreography choices (rail
+// plans, sweep move indices, gold shapes); later occurrences with the same root replay them
+// in order, so repeated music gets recognisably repeated choreography. CHORUS_RE is shared
+// with the "Progressive chorus variation" pass.
+const CHORUS_RE = /chorus|drop|climax|hook|refrain/i;
+function chorusRootKey(name) {
+  const s = String(name || '').toLowerCase();
+  if (!CHORUS_RE.test(s) || /pre/.test(s)) return null;
+  return s.replace(/\(.*?\)/g, '').replace(/\bx\d+\b/g, '').replace(/[\s_-]*\d+\s*$/, '').trim();
+}
+function createMotifMemory(sections) {
+  const owner = new Map();                                     // root -> first section (by startBeat)
+  for (const s of [...(sections || [])].sort((a, b) => a.startBeat - b.startBeat)) {
+    const k = chorusRootKey(s.name);
+    if (k && !owner.has(k)) owner.set(k, s);
+  }
+  const store = new Map();                                     // root -> { kind: [values] }
+  const cursor = new Map();                                    // section -> { kind: index }
+  let recorded = 0, replayed = 0;
+  return {
+    replay(sec, kind) {
+      const k = chorusRootKey(sec?.name);
+      if (!k || owner.get(k) === sec) return null;
+      const list = store.get(k)?.[kind];
+      if (!list || !list.length) return null;
+      if (!cursor.has(sec)) cursor.set(sec, {});
+      const c = cursor.get(sec);
+      c[kind] = (c[kind] ?? -1) + 1;
+      replayed++;
+      return list[c[kind] % list.length];
+    },
+    record(sec, kind, value) {
+      const k = chorusRootKey(sec?.name);
+      if (!k || owner.get(k) !== sec || value == null) return;
+      if (!store.has(k)) store.set(k, {});
+      (store.get(k)[kind] ??= []).push(value);
+      recorded++;
+    },
+    stats() { return { roots: owner.size, recorded, replayed }; },
+  };
+}
+
+// ── Two-hand move library — shared by [DenseSweep] and [SparseSweep] ─────────────────────
+// Each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null } steps (col 0-14,
+// row 1-9). `cross` lets a move reach across the centre line. Previewed in move_playbook.html.
+function buildDanceMoves() {
+  const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
+  const MOVES = [];
+  const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
+  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
+  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
+  { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
+  { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
+  { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
+  { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
+  { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const t = k / (N - 1), row = cc(5 - 3 * Math.sin(t * 2 * Math.PI), 1, 9); s.push({ l: [cc(1 + 5 * t, 0, 7), row], r: [cc(13 - 5 * t, 7, 14), row] }); } addMove('mirrorWings', false, s); }
+  { const a = [3, 5, 7, 9, 7, 5, 3], b = [11, 9, 7, 5, 7, 9, 11]; addMove('crossReturn', true, a.map((v, k) => ({ l: [v, 4], r: [b[k], 6] }))); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const a = k / (N - 1) * 2 * Math.PI, t = k / (N - 1); s.push({ l: [cc(2 + 4 * t, 0, 7), cc(5 - 3 * Math.sin(a), 1, 9)], r: [cc(8 + 4 * t, 7, 14), cc(5 - 3 * Math.sin(a + Math.PI), 1, 9)] }); } addMove('dnaHelix', false, s); }
+  { let s = []; const N = 8; for (let k = 0; k < N; k++) { const p = Math.sin(k / (N - 1) * 2 * Math.PI), sh = Math.round(3 * p), row = cc(4 + 1.8 * Math.abs(p), 1, 9); s.push({ l: [cc(4 + sh, 0, 7), row], r: [cc(10 + sh, 7, 14), row] }); } addMove('pendulum', false, s); }
+  { addMove('outwardBloom', false, [{ l: [6, 5], r: [8, 5] }, { l: [3, 3], r: [11, 3] }, { l: [1, 1], r: [13, 1] }, { l: [3, 3], r: [11, 3] }, { l: [6, 5], r: [8, 5] }, { l: [3, 7], r: [11, 7] }, { l: [1, 9], r: [13, 9] }, { l: [3, 7], r: [11, 7] }]); }
+  { const Ls = [[2, 3], [5, 3], [5, 6], [2, 6]], Rs = [[9, 3], [12, 3], [12, 6], [9, 6]]; let s = []; for (let k = 0; k < 8; k++) { const ix = k % 4; s.push({ l: Ls[ix], r: Rs[ix] }); } addMove('boxStep', false, s); }
+  { const rw = [8, 2, 8, 2, 7, 3]; addMove('heartbeat', false, rw.map(v => ({ l: [4, v], r: [10, v] }))); }
+  return MOVES;
+}
+const DANCE_MOVES = buildDanceMoves();
+
+// Notes whose position is owned by a two-hand choreography move. Obstacle occlusion clamps
+// them instead of re-scattering (_toBand), C3 prefers to move loose notes over them, and
+// boundary smoothing treats them as anchors. GoldSweep is NOT included: it is gold-only and
+// has its own handling everywhere it matters.
+function isPattern(n) { return !!(n && (n._denseSweep || n._sparseSweep)); }
+
+// Pattern-edge smoothing. Where exactly one of a consecutive same-hand pair is
+// pattern-tagged and the jump exceeds C3 (>7 cols or >5 rows), nudge the LOOSE note to
+// exactly the limit — minimal displacement, choreography untouched. `orbs` = beat-sorted
+// free orbs. Returns the number of notes nudged.
+function smoothPatternBoundaries(orbs) {
+  const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  let clamped = 0;
+  for (let h = 0; h <= 1; h++) {
+    const hn = orbs.filter(n => n.type === h);
+    for (let k = 1; k < hn.length; k++) {
+      const a = hn[k - 1], b = hn[k];
+      if (isPattern(a) === isPattern(b)) continue;
+      const loose = isPattern(a) ? b : a, anchor = isPattern(a) ? a : b;
+      const dC = xCol(loose._x) - xCol(anchor._x), dR = (loose.row || 0) - (anchor.row || 0);
+      if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
+      let nc = xCol(anchor._x) + Math.max(-7, Math.min(7, dC));
+      const nr = (anchor.row || 0) + Math.max(-5, Math.min(5, dR));
+      nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc));
+      loose._x = COL_X[nc];
+      loose.row = Math.max(0, Math.min(10, nr));
+      clamped++;
+    }
+  }
+  return clamped;
+}
+
+// ── [SparseSweep] choreograph LOOSE runs with the same move library ─────────────────────
+// [DenseSweep] only takes runs at <=0.5-beat spacing; looser runs fell back to per-note
+// naturalX arcs + jitter, the source of most "random-feeling" stretches. A sparse run is
+// consecutive untagged free orbs with every gap <= maxGap, >= minRun orbs over >= minSpan
+// beats. One move step per onset (new beat). A sparse hand has more time between notes, so
+// the per-step Manhattan cap scales with the gap: min(5, 3 + floor(gapBeats)). Zone via
+// handZoneCols (cross moves reach <= CROSS_REACH_COLS past centre), rows clamped to
+// [rowLo,rowHi]. Records a _preSweep snapshot so [PatternCoverage] can demote the run.
+const SSW_MAXGAP = 1.5;   // max beats between consecutive orbs in a sparse run
+const SSW_MINRUN = 4;     // min orbs
+const SSW_MINSPAN = 4;    // min beats spanned
+function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, minRun = SSW_MINRUN,
+                                    minSpan = SSW_MINSPAN, sectionAt = () => null,
+                                    pickMove = (_sec, reg) => reg % DANCE_MOVES.length } = {}) {
+  const orbs = result
+    .filter(n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
+    .sort((a, b) => a.beat - b.beat);
+  let runs = 0, tagged = 0, reg = 0, i = 0;
+  while (i < orbs.length) {
+    if (isPattern(orbs[i])) { i++; continue; }
+    let j = i;
+    while (j + 1 < orbs.length && !isPattern(orbs[j + 1]) && orbs[j + 1].beat - orbs[j].beat <= maxGap) j++;
+    const run = orbs.slice(i, j + 1);
+    if (run.length >= minRun && run[run.length - 1].beat - run[0].beat >= minSpan) {
+      let mvIdx = pickMove(sectionAt(run[0].beat), reg) % DANCE_MOVES.length;
+      let mv = DANCE_MOVES[mvIdx], k = 0, lastBk = null, prevL = null, prevR = null;
+      for (const o of run) {
+        const bk = Math.round(o.beat * 64);
+        if (lastBk !== null && bk !== lastBk) {
+          k++;
+          if (k >= mv.steps.length) { mvIdx = (mvIdx + 1) % DANCE_MOVES.length; mv = DANCE_MOVES[mvIdx]; k = 0; }
+        }
+        lastBk = bk;
+        const isR = o.type === 0, st = mv.steps[k];
+        const want = (isR ? st.r : st.l) || (isR ? (prevR || [10, 5]) : (prevL || [4, 5]));
+        let col = want[0], row = want[1];
+        const prev = isR ? prevR : prevL;
+        if (prev) {
+          const cap = Math.min(5, 3 + Math.floor(o.beat - prev[2]));
+          const dC = col - prev[0], dR = row - prev[1], manh = Math.abs(dC) + Math.abs(dR);
+          if (manh > cap) { const sc = cap / manh; col = Math.round(prev[0] + dC * sc); row = Math.round(prev[1] + dR * sc); }
+        }
+        row = Math.max(rowLo, Math.min(rowHi, Math.round(row)));
+        const z = handZoneCols(isR ? 0 : 1, mv.cross);
+        col = Math.max(z.colMin, Math.min(z.colMax, col));
+        o._preSweep = o._preSweep || { x: o._x, row: o.row };
+        o._x = COL_X[col];
+        o.row = row;
+        o._sparseSweep = true;
+        if (mv.cross && ((isR && col < 7) || (!isR && col > 7))) o._crossover = true;
+        if (isR) prevR = [col, row, o.beat]; else prevL = [col, row, o.beat];
+        tagged++;
+      }
+      runs++; reg++;
+    }
+    i = j + 1;
+  }
+  return { runs, tagged, smoothed: smoothPatternBoundaries(orbs) };
+}
+
+// ── [PatternCoverage] keep choreographed coverage in band ─────────────────────────────
+// Coverage = share of ALL notes owned by a shape: rails (heads + companions), DenseSweep,
+// SparseSweep, GoldSweep. Under the band: one promotion attempt (caller passes a relaxed
+// SparseSweep). Over the band: demote SparseSweep runs (shortest first), then DenseSweep,
+// restoring each note's pre-sweep position. Rails and GoldSweep are never touched.
+const PATTERN_COVERAGE_BAND = { lo: 0.60, hi: 0.80 };
+function isCoverageNote(n) { return n.railEndBeat !== undefined || !!n._comp || isPattern(n) || !!n._goldSweep; }
+function patternCoverage(notes) { return notes.length ? notes.filter(isCoverageNote).length / notes.length : 0; }
+// Runs of `tag`-tagged notes split at gaps > 2 beats.
+function patternRuns(notes, tag) {
+  const tagged = notes.filter(n => n[tag]).sort((a, b) => a.beat - b.beat);
+  const runs = [];
+  for (const n of tagged) {
+    const cur = runs[runs.length - 1];
+    if (cur && n.beat - cur[cur.length - 1].beat <= 2) cur.push(n); else runs.push([n]);
+  }
+  return runs;
+}
+function enforcePatternCoverage(result, { band = PATTERN_COVERAGE_BAND, promote = () => ({ tagged: 0 }) } = {}) {
+  const before = patternCoverage(result);
+  let promoted = 0, demoted = 0;
+  if (before < band.lo) promoted = promote().tagged || 0;
+  const floorCount = Math.ceil(band.lo * result.length);
+  let covered = result.filter(isCoverageNote).length;
+  let excess = covered - Math.floor(band.hi * result.length);
+  for (const tag of ['_sparseSweep', '_denseSweep']) {
+    if (excess <= 0) break;
+    for (const run of patternRuns(result, tag).sort((a, b) => a.length - b.length)) {
+      if (excess <= 0) break;
+      if (covered - run.length < floorCount) continue;        // would overshoot BELOW the band — skip
+      covered -= run.length;
+      for (const n of run) {
+        if (n._preSweep) { n._x = n._preSweep.x; n.row = n._preSweep.row; }
+        delete n[tag]; delete n._preSweep; delete n._crossover;
+        if (!isCoverageNote(n)) { excess--; demoted++; }
+      }
+    }
+  }
+  return { before, after: patternCoverage(result), promoted, demoted };
+}
+
 let notes = [];
 let walls = [];      // [{beat, wallType, duration}]  wallType: 'crouch'|'slide'|'leanLeft'|'leanRight'
 let lastGenScore  = null; // score from most recent generation — read by export handler for BeatNotes
@@ -3452,6 +3737,130 @@ function computeEnergyCurve(mono, sr, beatDur, numBeats) {
 
 // ── Helper: curved waypoints for auto-generated rails ────────
 // Returns an array of { beat, row } intermediate waypoints.
+// Rail path for ONE shape: t in [0,1] -> { col, row } (unclamped), anchored at (startCol,
+// rowStart) at t=0. `rng` is the caller's pre-drawn random (legacy order: rng, then shape
+// roll, then any Math.random() calls inside the branch). Extracted from generateRailArc so
+// multi-segment rails can draw several shapes back to back.
+function buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng) {
+  const triS = u => { const ph = ((u % 1) + 1) % 1;
+    return ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4; };
+  const zoneMid  = (colMin + colMax) / 2;
+  const farSide  = startCol < zoneMid ? colMax - 1 : colMin + 1;
+  const zoneHalf = (colMax - colMin) / 2;
+  let stairSteps = 0;
+  let posAt;
+  if (railShape === 'ellipse') {
+    let totalRotation;
+    if      (len < 2.5)  totalRotation = Math.PI * (0.75 + rng * 0.75);
+    else if (len < 5)    totalRotation = Math.PI * (1.00 + rng * 0.75);
+    else if (len < 8)    totalRotation = Math.PI * (1.25 + rng * 0.75);
+    else if (len < 12)   totalRotation = Math.PI * (1.75 + rng * 0.25);
+    else                 totalRotation = Math.PI * (2.00 + rng * 0.50);
+    if (Math.random() < 0.5) totalRotation = -totalRotation;
+    const radiusCol = Math.min(zoneHalf * 0.55, Math.max(1, (1 + Math.floor(rng * 3)) * swayBoost));
+    const radiusRow = Math.min(4, Math.max(1, (1 + Math.floor(Math.random() * 3)) * swayBoost));
+    const startAngle = Math.random() * 2 * Math.PI;
+    const centerCol = startCol - radiusCol * Math.cos(startAngle);
+    const centerRow = Math.max(1 + radiusRow, Math.min(8 - radiusRow,
+                        rowStart - radiusRow * Math.sin(startAngle)));
+    posAt = t => {
+      const a = startAngle + t * totalRotation;
+      return { col: centerCol + radiusCol * Math.cos(a), row: centerRow + radiusRow * Math.sin(a) };
+    };
+  } else if (railShape === 'wave' || railShape === 'zigzag' || railShape === 'ramp') {
+    const amp = Math.min(3, Math.max(1.5, 1.5 * swayBoost));
+    if (railShape === 'wave') {
+      const cyc = Math.max(1, Math.round(len / 4));
+      posAt = t => ({ col: startCol + (farSide - startCol) * t,
+                      row: rowStart + amp * Math.sin(t * cyc * 2 * Math.PI) });
+    } else if (railShape === 'zigzag') {
+      const zigs = Math.max(2, Math.round(len / 1.5));
+      posAt = t => ({ col: startCol + (farSide - startCol) * t,
+                      row: rowStart + amp * triS(t * zigs / 2) });
+    } else {
+      const zigs = Math.max(2, Math.round(len / 2));
+      posAt = t => ({ col: startCol + (farSide - startCol) * t,
+                      row: rowStart + (0.35 + 0.95 * t) * amp * triS(t * zigs / 2) });
+    }
+  } else if (railShape === 'pendulum') {
+    const swing = Math.min(zoneHalf * 0.8, 2 + 2 * swayBoost);
+    const cyc   = Math.max(1, Math.round(len / 5));
+    posAt = t => {
+      const s = Math.sin(t * cyc * 2 * Math.PI);
+      return { col: startCol + swing * s, row: rowStart + 2 * Math.abs(s) };
+    };
+  } else if (railShape === 'hook') {
+    const dir   = startCol < zoneMid ? 1 : -1;
+    const reach = Math.max(2, Math.min(4, zoneHalf * 0.7));
+    const midCol = startCol + dir * reach, endCol = midCol - dir * reach * 0.4;
+    const midRow = rowStart - 2.2,         endRow = rowStart + 2.4;
+    posAt = t => t < 0.5
+      ? { col: startCol + (midCol - startCol) * (t / 0.5), row: rowStart + (midRow - rowStart) * (t / 0.5) }
+      : { col: midCol + (endCol - midCol) * ((t - 0.5) / 0.5), row: midRow + (endRow - midRow) * ((t - 0.5) / 0.5) };
+  } else if (railShape === 'flick') {
+    const dir   = startCol < zoneMid ? 1 : -1;
+    const reach = Math.max(2, Math.min(4, zoneHalf * 0.7));
+    const peakCol = startCol + dir * reach;
+    posAt = t => t < 0.65
+      ? { col: startCol + (peakCol - startCol) * (t / 0.65), row: rowStart - 1.2 * (t / 0.65) }
+      : { col: peakCol - dir * reach * 0.28 * ((t - 0.65) / 0.35), row: rowStart - 1.2 + 3.0 * ((t - 0.65) / 0.35) };
+  } else if (railShape === 'switchback') {
+    const amp   = Math.min(3.2, Math.max(1.8, 1.8 * swayBoost));
+    const knots = [[0, 0], [0.34, 1], [0.67, -1], [1, 0.35]];
+    posAt = t => {
+      let s = 0;
+      while (s < knots.length - 2 && t > knots[s + 1][0]) s++;
+      const [t0, v0] = knots[s], [t1, v1] = knots[s + 1];
+      const u = (t - t0) / (t1 - t0 || 1);
+      return { col: startCol + (farSide - startCol) * t, row: rowStart + amp * (v0 + (v1 - v0) * u) };
+    };
+  } else if (railShape === 'spiral') {
+    const rot = Math.PI * 2 * (2 + rng * 1.5) * (Math.random() < 0.5 ? -1 : 1);
+    const rc0 = Math.min(zoneHalf * 0.75, Math.max(1.5, 2.5 * swayBoost));
+    const rr0 = Math.min(3.4, Math.max(1.5, 2.4 * swayBoost));
+    const a0  = Math.random() * 2 * Math.PI;
+    const cCol = startCol - rc0 * Math.cos(a0);
+    const cRow = Math.max(1 + rr0, Math.min(8 - rr0, rowStart - rr0 * Math.sin(a0)));
+    posAt = t => {
+      const a = a0 + t * rot, k = 1 - 0.75 * t;
+      return { col: cCol + rc0 * k * Math.cos(a), row: cRow + rr0 * k * Math.sin(a) };
+    };
+  } else if (railShape === 'figure8') {
+    const w8 = Math.min(zoneHalf * 0.8, Math.max(2, 3 * swayBoost));
+    const h8 = Math.min(3.2, Math.max(1.5, 2.2 * swayBoost));
+    posAt = t => {
+      const u = t * 2 * Math.PI;
+      return { col: startCol + w8 * Math.sin(2 * u), row: rowStart + h8 * Math.sin(u) };
+    };
+  } else {
+    stairSteps = Math.max(3, Math.min(6, Math.round(len / 2.5)));
+    const rowDir = rowStart > 4 ? -1 : 1;
+    const colAt = j => startCol + (farSide - startCol) * (j / stairSteps);
+    const rowAt = j => rowStart + rowDir * Math.min(3, j * 0.9);
+    posAt = t => {
+      const k = Math.min(stairSteps - 1e-6, t * stairSteps);
+      const i = Math.floor(k), f = k - i;
+      return f < 0.5
+        ? { col: colAt(i) + (colAt(i + 1) - colAt(i)) * (f / 0.5), row: rowAt(i) }
+        : { col: colAt(i + 1), row: rowAt(i) + (rowAt(i + 1) - rowAt(i)) * ((f - 0.5) / 0.5) };
+    };
+  }
+  return { posAt, stairSteps };
+}
+
+// Waypoints for one shape: corners need a node ON each corner; cap 12 (render limit).
+function railWaypointCount(railShape, len, stairSteps) {
+  return Math.min(12, Math.max(2,
+      railShape === 'zigzag'     ? Math.max(Math.round(len / 1.5) * 2, Math.round(len))
+    : railShape === 'staircase'  ? stairSteps * 2
+    : railShape === 'hook'       ? 3
+    : railShape === 'flick'      ? 3
+    : railShape === 'switchback' ? 4
+    : len < 3                    ? Math.round(len * 3)
+                                 : Math.round(len * 1.2)
+  ));
+}
+
 // Creates a smooth arc (sine-shaped) between start and end row.
 // arcAmp > 0 → arc dips lower (higher row number = physically lower in VR)
 // arcAmp < 0 → arc rises higher (lower row number = physically higher)
@@ -3461,7 +3870,7 @@ function computeEnergyCurve(mono, sr, beatDur, numBeats) {
 // Rails travel from xStart to a chosen xEnd column, like Y travels from rowStart to rowEnd.
 // hand: 0 = right, 1 = left. allowCrossCenter: single-arm sections may sweep across X=0.
 // bpm: used to guarantee at least 1 waypoint per second of rail duration.
-function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 0, hand = 0, allowCrossCenter = false, swayBoost = 1.0, bpm = 120, obstacleConstraints = null) {
+function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 0, hand = 0, allowCrossCenter = false, swayBoost = 1.0, bpm = 120, obstacleConstraints = null, walls = null, motifPlan = null) {
   const len = endBeat - startBeat;
   if (len < 1.0) return { waypoints: [], xEnd: xStart, rowEnd };
 
@@ -3472,8 +3881,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   // free-orb occlusion all exclude the same 4-column band.
   let colMinConstraint = null, colMaxConstraint = null;
   if (obstacleConstraints) {
-    const colMin = allowCrossCenter ? 0  : (hand === 0 ? 7  : 0);
-    const colMax = allowCrossCenter ? 14 : (hand === 0 ? 14 : 7);
+    const { colMin, colMax } = handZoneCols(hand, allowCrossCenter);
     // Check if obstacles exist on far-right (cols 11-14 for right hand) or far-left (cols 0-3 for left hand)
     const hasRightObs = obstacleConstraints.hasRightObs;
     const hasLeftObs  = obstacleConstraints.hasLeftObs;
@@ -3501,108 +3909,106 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
     return best;
   }
 
-  let colMin = allowCrossCenter ? 0  : (hand === 0 ? 7  : 0);
-  let colMax = allowCrossCenter ? 14 : (hand === 0 ? 14 : 7);
+  let { colMin, colMax } = handZoneCols(hand, allowCrossCenter);
   // [FEAT-1] Apply obstacle constraints if provided
   if (colMinConstraint !== null) colMin = Math.max(colMin, colMinConstraint);
   if (colMaxConstraint !== null) colMax = Math.min(colMax, colMaxConstraint);
   const startCol = colIdxOf(xStart);
 
+  // Per-point clamp: hand zone, playable rows, then the row-aware obstacle band when real
+  // walls are known. The obstacle step is what lets the wider-travelling shapes above be
+  // safe — a spiral or figure8 reaching a high row near the zone edge is exactly the path
+  // that lands in a lean prism's full-width top.
+  const clampPt = (col, row, beat) => {
+    const r = Math.max(1, Math.min(8, Math.round(row)));
+    let c = Math.max(colMin, Math.min(colMax, Math.round(col)));
+    if (walls && walls.length) {
+      const band = obstacleBandAt(walls, beat, beat, r, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+      c = Math.max(band.minCol, Math.min(band.maxCol, c));
+    }
+    return { col: c, row: r };
+  };
+
   // ── Rail path parametrization — shape palette ───────────────────────────────
-  // The rail traces a path in col x row space parametrized over t in [0,1]. The classic
-  // shape is an elliptical arc (totalRotation bands by length, up to a full spiral); it
-  // stays DOMINANT (50%), with three new shapes for variety on medium/long rails, same
-  // philosophy as [DenseSweep]'s move library:
-  //   wave     — lateral travel across the zone with a sine row contour (S-curve)
-  //   zigzag   — lateral travel with a triangle row contour (sawtooth; sharper feel)
-  //   pendulum — side-to-side sway around the start col, dipping at the extremes
-  // All shapes are anchored at (startCol, rowStart) at t=0, clamped per-waypoint to the
-  // zone [colMin,colMax] and rows [1,8] (same band the ellipse centre-constraint enforced,
-  // keeping companions/fixC1 and the C4 floor budget safe), and share the waypoint cadence
-  // (node gaps stay renderable). Short rails (<2.5 beats) always use the ellipse — the new
-  // shapes need travel room to read.
+  // The rail traces a path in col x row space parametrized over t in [0,1]. Shapes are
+  // picked from a LENGTH TIER, because a rail's beat length sets its waypoint budget and
+  // therefore which shapes can actually read. Previously one roll served every length and
+  // rails under 2.5 beats were forced to the ellipse, so short rails had no variety at all
+  // and long rails only got a longer version of the same loop.
+  //   short (<2.5 beats) — ellipse · hook · flick
+  //     An ellipse has too little travel here to look like anything but a diagonal; the two
+  //     new shapes are deliberately angular so they register at a few waypoints.
+  //   mid (2.5-8) — ellipse · wave · zigzag · pendulum · switchback · ramp
+  //     The four originals are all continuous curves at constant amplitude. switchback adds
+  //     hard corners with only two reversals; ramp grows its amplitude so the rail builds.
+  //   long (8+) — ellipse · spiral · figure8 · staircase
+  //     Structurally different curves that need a long rail's waypoints to draw at all.
+  // All shapes are anchored at (startCol, rowStart) at t=0, clamped per-waypoint to the zone
+  // [colMin,colMax], rows [1,8] (keeping companions/fixC1 and the C4 floor budget safe) AND
+  // to the row-aware obstacle band when real walls are known — the wider row/column travel
+  // these shapes use is exactly what walks into a lean prism's wide top otherwise.
+  // Rails >= 6 beats chain 2-3 of these shapes (planRailSegments); see the multi-segment block below.
   const rng = Math.random();
   const _shapeRoll = Math.random();
-  const railShape = (len < 2.5 || _shapeRoll < 0.50) ? 'ellipse'
-                  : _shapeRoll < 0.75 ? 'wave'
-                  : _shapeRoll < 0.90 ? 'zigzag'
-                  :                     'pendulum';
-  let posAt;                                       // t in [0,1] -> { col, row } (unclamped)
-  if (railShape === 'ellipse') {
-    // Rotation bands by rail length (beats): short rails get aggressive curvature so they
-    // feel like distinct curves; long rails sweep up to a full circle + spiral overlap.
-    let totalRotation;
-    if      (len < 2.5)  totalRotation = Math.PI * (0.75 + rng * 0.75);   // 135-270 deg
-    else if (len < 5)    totalRotation = Math.PI * (1.00 + rng * 0.75);   // 180-315 deg
-    else if (len < 8)    totalRotation = Math.PI * (1.25 + rng * 0.75);   // 225-360 deg
-    else if (len < 12)   totalRotation = Math.PI * (1.75 + rng * 0.25);   // 315-360 deg
-    else                 totalRotation = Math.PI * (2.00 + rng * 0.50);   // 360-450 deg
-    if (Math.random() < 0.5) totalRotation = -totalRotation;              // random CW/CCW
-    // Ellipse radii — capped so the arc stays within a playable reach envelope;
-    // swayBoost (critic hint) amplifies for more dramatic arcs.
-    const zoneHalf  = (colMax - colMin) / 2;
-    const radiusCol = Math.min(zoneHalf * 0.55, Math.max(1, (1 + Math.floor(rng * 3)) * swayBoost));
-    // Cap radiusRow at 4 so centerRow constraint [1+r, 8-r] always has a valid range.
-    const radiusRow = Math.min(4, Math.max(1, (1 + Math.floor(Math.random() * 3)) * swayBoost));
-    const startAngle = Math.random() * 2 * Math.PI;
-    // Centre derived from start position + angle; centerRow constrained so the whole arc
-    // (centerRow +/- radiusRow) stays within rows 1-8 (row 9/10 = C4 floor group).
-    const centerCol = startCol - radiusCol * Math.cos(startAngle);
-    const centerRow = Math.max(1 + radiusRow, Math.min(8 - radiusRow,
-                        rowStart - radiusRow * Math.sin(startAngle)));
-    posAt = t => {
-      const a = startAngle + t * totalRotation;
-      return { col: centerCol + radiusCol * Math.cos(a), row: centerRow + radiusRow * Math.sin(a) };
-    };
-  } else if (railShape === 'wave' || railShape === 'zigzag') {
-    // Lateral travel from startCol toward the far side of the zone, with a row contour.
-    const target = startCol < (colMin + colMax) / 2 ? colMax - 1 : colMin + 1;
-    const amp    = Math.min(3, Math.max(1.5, 1.5 * swayBoost));
-    if (railShape === 'wave') {
-      const cyc = Math.max(1, Math.round(len / 4));          // one sine cycle per ~4 beats
-      posAt = t => ({ col: startCol + (target - startCol) * t,
-                      row: rowStart + amp * Math.sin(t * cyc * 2 * Math.PI) });
-    } else {
-      const zigs = Math.max(2, Math.round(len / 1.5));       // direction change per ~1.5 beats
-      const triS = u => { const ph = ((u % 1) + 1) % 1;      // signed triangle: 0 -> 1 -> -1 -> 0
-        return ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4; };
-      posAt = t => ({ col: startCol + (target - startCol) * t,
-                      row: rowStart + amp * triS(t * zigs / 2) });
+  // Multi-segment plan for rails >= 6 beats (or a replayed chorus motif). Below 6 beats with
+  // no motif this is null and the legacy single-shape path runs with an identical RNG
+  // sequence (golden test vs acd1853).
+  const plan = motifPlan ? fitRailPlan(motifPlan, len) : planRailSegments(len);
+
+  if (!plan || plan.length === 1) {
+    const railShape = plan ? plan[0].shape : pickRailShape(len, _shapeRoll);
+    const { posAt, stairSteps } = buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng);
+    const numWP = railWaypointCount(railShape, len, stairSteps);
+    const waypoints = [];
+    for (let i = 1; i <= numWP; i++) {
+      const t    = i / (numWP + 1);
+      const p    = posAt(t);
+      const beat = Math.round((startBeat + len * t) / snapSz) * snapSz;
+      const wp   = clampPt(p.col, p.row, beat);
+      waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
     }
-  } else {
-    // Pendulum: sway around the start col, dipping (rows increase) at the swing extremes.
-    const zoneHalf = (colMax - colMin) / 2;
-    const swing = Math.min(zoneHalf * 0.8, 2 + 2 * swayBoost);
-    const cyc   = Math.max(1, Math.round(len / 5));
-    posAt = t => {
-      const s = Math.sin(t * cyc * 2 * Math.PI);
-      return { col: startCol + swing * s, row: rowStart + 2 * Math.abs(s) };
-    };
+    const pEnd = posAt(1);
+    const end  = clampPt(pEnd.col, pEnd.row, endBeat);
+    return { waypoints, xEnd: COL_X[end.col], rowEnd: end.row,
+             plan: [{ frac: 1, shape: railShape }],
+             segments: [{ shape: railShape, startCol, startRow: rowStart, endCol: end.col, endRow: end.row, count: numWP + 1 }] };
   }
 
-  // Waypoints: short rails get more per beat so tight curves render smoothly; zigzag needs
-  // nodes at its direction changes; everything else scales with length. Cap 12 (render limit).
-  const numWP = Math.min(12, Math.max(2,
-    railShape === 'zigzag' ? Math.max(Math.round(len / 1.5) * 2, Math.round(len))
-    : len < 3              ? Math.round(len * 3)
-                           : Math.round(len * 1.2)
-  ));
-
-  const waypoints = [];
-  for (let i = 1; i <= numWP; i++) {
-    const t   = i / (numWP + 1);
-    const p   = posAt(t);
-    const wpCol = Math.max(colMin, Math.min(colMax, Math.round(p.col)));
-    const wpRow = Math.max(1, Math.min(8, Math.round(p.row)));
-    const beat  = Math.round((startBeat + len * t) / snapSz) * snapSz;
-    waypoints.push({ beat, row: wpRow, _x: COL_X[wpCol] });
+  // Multi-segment: share the 12-waypoint render cap in proportion to segment length, >= 3 per
+  // segment so corner shapes keep a node on their corner. Each segment's LAST waypoint lands
+  // exactly on its end (t=1) and the next segment seeds from that CLAMPED point — seeding
+  // from the unclamped posAt(1) would leave a gap at the seam whenever a wall clamped it.
+  const nSeg   = plan.length;
+  const budget = Math.min(12, Math.max(3 * nSeg, Math.round(len * 1.2)));
+  const counts = plan.map(s => Math.max(3, Math.round(budget * s.frac)));
+  while (counts.reduce((a, b) => a + b, 0) > 12) counts[counts.indexOf(Math.max(...counts))]--;
+  const waypoints = [], segments = [];
+  let segStart = startBeat, curCol = startCol, curRow = rowStart;
+  for (let k = 0; k < nSeg; k++) {
+    const segLen = len * plan[k].frac;
+    const { posAt: rawAt } = buildRailPath(plan[k].shape, segLen, curCol, curRow, colMin, colMax, swayBoost, Math.random());
+    // Anchor to the seam. Some shapes do NOT pass through their own start: the ellipse/spiral
+    // clamp their centre row into [1+r, 8-r], so a segment seeded near the floor begins its
+    // loop up to ~6 rows away (seen at k=167 in tests: row 8 → row 2). A single rail hides that
+    // behind its head; at a seam it is a real jump. Fade the offset (1-t) so t=0 sits exactly
+    // on the seam and t=1 is the shape's own endpoint.
+    const p0 = rawAt(0), dC0 = curCol - p0.col, dR0 = curRow - p0.row;
+    const posAt = t => { const p = rawAt(t); return { col: p.col + dC0 * (1 - t), row: p.row + dR0 * (1 - t) }; };
+    let last = null;
+    for (let i = 1; i <= counts[k]; i++) {
+      const t    = i / counts[k];
+      const p    = posAt(t);
+      const beat = k === nSeg - 1 && i === counts[k] ? endBeat
+                 : Math.round((segStart + segLen * t) / snapSz) * snapSz;
+      last = clampPt(p.col, p.row, beat);
+      waypoints.push({ beat, row: last.row, _x: COL_X[last.col] });
+    }
+    segments.push({ shape: plan[k].shape, startCol: curCol, startRow: curRow, endCol: last.col, endRow: last.row, count: counts[k] });
+    curCol = last.col; curRow = last.row;
+    segStart += segLen;
   }
-
-  // Path-determined endpoint so callers can store the true end position
-  const pEnd = posAt(1);
-  const arcEndCol = Math.max(colMin, Math.min(colMax, Math.round(pEnd.col)));
-  const arcEndRow = Math.max(1, Math.min(8, Math.round(pEnd.row)));
-  return { waypoints, xEnd: COL_X[arcEndCol], rowEnd: arcEndRow };
+  const endWp = waypoints.pop();             // the final point IS the rail end, not a waypoint
+  return { waypoints, xEnd: endWp._x, rowEnd: endWp.row, plan, segments };
 }
 
 async function analyseAudio(buffer, bpm, statusEl) {
@@ -3855,7 +4261,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const focusEnd   = hints.focusSectionEndBeat   ??  Infinity;
   function inFocus(beat) { return beat >= focusStart && beat <= focusEnd; }
 
+  // snapBeat takes SECONDS (onset times) → snapped beat. snapToGrid takes a BEAT → snapped beat.
+  // Passing a beat to snapBeat multiplies it by bps (~2-3x): that bug sat in 8 call sites since
+  // the v2 baseline — gold accents/climax landed past the song end, the rail-synthesis fallback
+  // broke out of its candidate loop immediately (so under-railed sections never got rails), and
+  // solo-density fills / chorus-buildup golds missed their sections. Found 2026-11-21.
   function snapBeat(t)    { return Math.round(t * bps / snapSize) * snapSize; }
+  function snapToGrid(b)  { return Math.round(b / snapSize) * snapSize; }
   function energyAt(beat) {
     if (!energyCurve?.length) return 0.5;
     return energyCurve[Math.min(Math.floor(beat), energyCurve.length - 1)];
@@ -3864,6 +4276,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (const s of sections) if (beat >= s.startBeat && beat < s.endBeat) return s;
     return sections[sections.length - 1] || { avgRow: 5, rowVariance: 2, startBeat: 0, endBeat: totalBeats };
   }
+  const motifMemory = createMotifMemory(sections);   // per Generate call (spec decision 2026-11-21)
+
 
   const events = extractNoteEvents(analysis, bpm, diff, { ...hints, _sections: sections });
   if (events.length < 10) {
@@ -4575,7 +4989,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         arcRowEnd   = Math.max(diffRowMin, Math.min(2, 1 + Math.floor(Math.random() * 2)));
       }
 
-      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint);
+      const _motifSec = sectionAt(beat);
+      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
+      motifMemory.record(_motifSec, 'rails', _arc.plan);
 
       // [FEAT-6] For elevate rails, blend the circular arc waypoints with a linear
       // upward ramp so the rail visually and physically ascends from start to end.
@@ -5232,8 +5648,16 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           // varies. Gap-fill notes sit in silence with generous spacing (≥
           // gapThreshBeats*0.5 apart), so a modest ±1-3 row step has plenty of time
           // to read as a real move rather than a jump.
-          const row = clampRow(Math.max(diffRowMin, Math.min(diffRowMax,
-            (lastHandRow[hand] ?? 5) + (Math.floor(Math.random() * 5) - 2))));
+          // Bounded to the comfortable band (rows 2-8, same as [DenseSweep]) with a gentle
+          // pull toward mid-height. A walk clamped only at diffRowMin piles up against the
+          // edge — at Master that edge is row 0, and [RowLift] then lifts row 1 into it too.
+          // Measured on Another Life (Master): 10 of the 14 ceiling notes were gap-fill,
+          // tripping CRITICAL C4 (ceiling >2%) on 4 of 5 critique iterations.
+          const _gfLo = Math.max(diffRowMin, 2), _gfHi = Math.min(diffRowMax, 8);
+          const _gfPrev = lastHandRow[hand] ?? 5;
+          const _gfPull = _gfPrev <= 3 ? 1 : _gfPrev >= 7 ? -1 : 0;
+          const row = clampRow(Math.max(_gfLo, Math.min(_gfHi,
+            _gfPrev + (Math.floor(Math.random() * 5) - 2) + _gfPull)));
           const x   = naturalX(hand, row, energyAt(ev.beat), false);
           result.push({ beat: ev.beat, row, type: hand, _x: x,
                         stemSource: ev.stemSource, _gapFill: true });
@@ -5476,7 +5900,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const fillStep = secBeats / (needed + 1);
       for (let fi = 1; fi <= needed; fi++) {
         const fb  = sec.startBeat + fillStep * fi;
-        const fbs = snapBeat(fb);
+        const fbs = snapToGrid(fb);
         const fk  = Math.round(fbs * 100);
         if (beatOccupied.has(fk) || fbs >= sec.endBeat) continue;
         const fillRow = Math.max(diffRowMin, Math.min(diffRowMax,
@@ -5513,6 +5937,18 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const applyObstacleOcclusion = (freeOrbsOnly = false) => {
     if (hints.noObstacles) return;
     const _skip = n => n.railEndBeat !== undefined || (freeOrbsOnly && n._comp);
+    // Relocate note n (currently at `col`) into the safe column band [lo, hi].
+    // Loose notes get a random column in the band (spread, so a cluster doesn't pile onto
+    // one column). Pattern notes (isPattern: DenseSweep/SparseSweep) are CLAMPED to the nearest band edge instead: a dense
+    // run is a choreographed move whose per-beat steps are reachability-capped, and an
+    // independent random pick per note scrambled it into jitter. Measured on Painkiller
+    // (Master, 76% dense): 13.9% of dense steps broke the move's step cap inside side-wall
+    // windows vs 8.3% outside. Clamping is 1-Lipschitz — it can only shrink the distance
+    // between two neighbours, never grow it — so occlusion cannot add a jump to a dense run.
+    const _toBand = (n, col, lo, hi) => {
+      n._x = COL_X[isPattern(n) ? Math.max(lo, Math.min(hi, col))
+                                 : lo + Math.floor(Math.random() * (hi - lo + 1))];
+    };
     for (const w of autoWalls) {
       // Symmetric clearance window: lead-in BEFORE + reaction buffer AFTER, so the
       // obstacle-side columns are clear as the player approaches, holds, and exits.
@@ -5523,7 +5959,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue; // rail heads stay (arc sweeps overhead)
-          if (n.row <= 3) n.row = 4 + Math.floor(Math.random() * 4); // rows 4-7
+          if (n.row <= 3) n.row = isPattern(n) ? 4 : 4 + Math.floor(Math.random() * 4); // rows 4-7 (dense: nearest safe row, see _toBand)
         }
       } else if (w.wallType === 'leanLeft') {
         // LeanLeft: obstacle on the RIGHT side. Player leans LEFT (AWAY from the obstacle).
@@ -5537,13 +5973,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 0) {
-            if (col > 8) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 8–10)
+            if (col > 8) _toBand(n, col, 6, 8); // cols 6–8 (was 8–10)
           } else if (n.type === 1) {
-            if (col > 5 || col < 2) n._x = COL_X[2 + Math.floor(Math.random() * 4)]; // cols 2–5
+            if (col > 5 || col < 2) _toBand(n, col, 2, 5); // cols 2–5
           } else if (n.type === 2) {
-            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
+            if (col < 5 || col > 8) _toBand(n, col, 5, 8); // cols 5–8
           } else if (n.type === 3) {
-            if (col < 5 || col > 8) n._x = COL_X[5 + Math.floor(Math.random() * 4)]; // cols 5–8
+            if (col < 5 || col > 8) _toBand(n, col, 5, 8); // cols 5–8
           }
         }
       } else if (w.wallType === 'leanRight') {
@@ -5556,40 +5992,57 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
           if (n.type === 1) {
-            if (col < 6) n._x = COL_X[6 + Math.floor(Math.random() * 3)]; // cols 6–8 (was 4–6)
+            if (col < 6) _toBand(n, col, 6, 8); // cols 6–8 (was 4–6)
           } else if (n.type === 0) {
-            if (col < 9) n._x = COL_X[9 + Math.floor(Math.random() * 4)]; // cols 9–12
+            if (col < 9) _toBand(n, col, 9, 12); // cols 9–12
           } else if (n.type === 2) {
-            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
+            if (col < 6 || col > 9) _toBand(n, col, 6, 9); // cols 6–9
           } else if (n.type === 3) {
-            if (col < 6 || col > 9) n._x = COL_X[6 + Math.floor(Math.random() * 4)]; // cols 6–9
+            if (col < 6 || col > 9) _toBand(n, col, 6, 9); // cols 6–9
           }
         }
       } else if (w.wallType === 'slide') {
-        // slideType 0 = Slide Right → box on the RIGHT (cols 10-14 blocked)
-        // slideType 4 = Slide Left  → box on the LEFT  (cols 0-4 blocked)
-        // slideType 3 = Center      → full-width low barrier
-        // Calibrated to the 3D renderer + play-test: slideType 0 uses boxX=-1.9 (same as
-        // leanLeft), which the P3D.x=-3.5 flip renders on the screen-RIGHT — so clear the
-        // RIGHT side. (Was inverted; right-hand notes landed buried inside the box.)
+        // slideType 0 = box on the HIGH-column side, 4 = LOW-column side, 3 = centre barrier.
+        // Side mapping calibrated to the 3D renderer + play-test and now shared with
+        // obstacleSide(). A slide is a PLAIN BOX (no lean taper), and measuring it against
+        // the renderer showed it spans cols ~8-14 (or ~0-6) at EVERY row — so the old
+        // "clear to cols 7-10 / 4-7" targets were dropping notes straight back inside it.
+        // Safe columns are ≤7 / ≥7; the affected hand comes to centre, which is where the
+        // player's body is going anyway as they duck away from the box.
         const sType = w.slideType ?? 0;
         for (const n of result) {
           if (n.beat < wStart || n.beat >= wEnd) continue;
           if (_skip(n)) continue;
           const col = xToCol(n._x ?? 0);
-          if (sType === 0) {            // box on RIGHT — clear right-side notes
-            if (n.type === 0 && col > 10) n._x = COL_X[7 + Math.floor(Math.random() * 4)]; // cols 7–10
-            if (n.type === 2 && col > 10) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
-            if (n.type === 3 && col > 9)  n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
-          } else if (sType === 4) {     // box on LEFT — clear left-side notes
-            if (n.type === 1 && col < 4) n._x = COL_X[4 + Math.floor(Math.random() * 4)]; // cols 4–7
-            if (n.type === 2 && col < 4) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
-            if (n.type === 3 && col < 5) n._x = COL_X[5 + Math.floor(Math.random() * 5)]; // cols 5–9
+          if (sType === 0) {            // box on the HIGH-column side
+            if ((n.type === 0 || n.type === 2 || n.type === 3) && col > 7)
+              _toBand(n, col, 5, 7);                 // cols 5–7
+          } else if (sType === 4) {     // box on the LOW-column side
+            if ((n.type === 1 || n.type === 2 || n.type === 3) && col < 7)
+              _toBand(n, col, 7, 9);                 // cols 7–9
           } else if (sType === 3) {
             if (n.row >= 4 && n.row <= 6) n.row = Math.random() < 0.5
               ? Math.max(diffRowMin, n.row - 3)
               : Math.min(diffRowMax, n.row + 3);
           }
+        }
+      }
+      // Geometric safety net. The bands above encode where a hand SHOULD go ergonomically
+      // during a lean (the reachable zone shifts toward the lean direction); this guarantees
+      // that wherever a note ended up is actually OUTSIDE the wall volume. Row-aware, so a
+      // note near the ceiling — where a lean prism is at full width — is pulled further in
+      // than one near the floor, which the single flat band per wall could never express.
+      if (obstacleSide(w)) {
+        for (const n of result) {
+          if (n.beat < wStart || n.beat >= wEnd) continue;
+          if (_skip(n)) continue;
+          const lim = obstacleColLimit(w, n.row);
+          if (!lim) continue;
+          const c = xToCol(n._x ?? 0);
+          let nc = c;
+          if (lim.maxCol !== undefined && c > lim.maxCol) nc = lim.maxCol;
+          if (lim.minCol !== undefined && c < lim.minCol) nc = lim.minCol;
+          if (nc !== c) n._x = COL_X[nc];
         }
       }
     }
@@ -5615,7 +6068,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     // Gather high-energy candidates (quarter-note steps, energy ≥ 0.70)
     const gaCandidates = [];
     for (let b = 8; b < totalBeats - 8; b += 4) {
-      const bs = snapBeat(b);
+      const bs = snapToGrid(b);
       if (energyAt(bs) < 0.70) continue;
       if (beatOccupied.has(Math.round(bs * 100))) continue;
       if (result.some(n => n.railEndBeat !== undefined && bs >= n.beat && bs <= n.railEndBeat)) continue;
@@ -5647,7 +6100,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const sweepSteps = [];
       let col = startCol, b = startBeat;
       while (goLeft ? col <= endCol : col >= endCol) {
-        sweepSteps.push({ beat: snapBeat(b), col });
+        sweepSteps.push({ beat: snapToGrid(b), col });
         col += 2 * colDir;
         b   += stepSize;
       }
@@ -6363,7 +6816,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // Falls back to energy-peak detection if no section is named chorus/drop.
   if (!hints.noGold) {
     let choruses = sections.filter(s =>
-      /chorus|drop|climax|hook|refrain/i.test(s.name || '') && !/pre/i.test(s.name || '')
+      CHORUS_RE.test(s.name || '') && !/pre/i.test(s.name || '')
     ).sort((a, b) => a.startBeat - b.startBeat);
     // Fallback: if the LLM didn't use chorus-style names, use the top energy sections.
     if (choruses.length < 2 && sections.length >= 3) {
@@ -6388,7 +6841,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       for (let inj = 0; inj < needed; inj++) {
         const pct = (inj + 1) / (needed + 1);
         const targetBeat = sec.startBeat + (sec.endBeat - sec.startBeat) * pct;
-        const bs = snapBeat(targetBeat);
+        const bs = snapToGrid(targetBeat);
         // Find a nearby orb to upgrade
         const idx = result.findIndex(n =>
           (n.type === 0 || n.type === 1) && n.railEndBeat === undefined &&
@@ -6439,7 +6892,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const e = energyAt(b);
       if (e > bestE) { bestE = e; bestBeat = b; }
     }
-    const bs = snapBeat(bestBeat);
+    const bs = snapToGrid(bestBeat);
     // Is there already a gold at/near the climax peak? (within 2 beats)
     const goldAtPeak = result.find(n => n.type === 3 && Math.abs(n.beat - bs) < 2.0);
     if (!goldAtPeak) {
@@ -6522,7 +6975,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const step = snapSize * 4; // quarter-note steps
       const candidates = [];
       for (let b = sStart; b < sEnd - MIN_RAIL_DUR; b += step) {
-        const bs = snapBeat(b);
+        const bs = snapToGrid(b);
         if (bs >= sEnd - MIN_RAIL_DUR) break;
         if (beatOccupied.has(Math.round(bs * 100))) continue;
         const insideRail = result.some(n => n.railEndBeat !== undefined &&
@@ -6554,11 +7007,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         // Duration: extend as far as possible (up to MAX_RAIL_DUR) before the next occupied beat
         let railDur = MIN_RAIL_DUR;
         for (let d = MIN_RAIL_DUR + snapSize; d <= MAX_RAIL_DUR; d += snapSize) {
-          const eb = snapBeat(rb + d);
+          const eb = snapToGrid(rb + d);
           if (eb >= sEnd || beatOccupied.has(Math.round(eb * 100))) break;
           railDur = d;
         }
-        const endBeat = Math.min(snapBeat(rb + railDur), sEnd - snapSize, totalBeats - snapSize);
+        const endBeat = Math.min(snapToGrid(rb + railDur), sEnd - snapSize, totalBeats - snapSize);
         if (endBeat - rb < MIN_RAIL_DUR) continue;
 
         const midRow = Math.max(diffRowMin, Math.min(diffRowMax, Math.round(win.avgRow ?? 5)));
@@ -6569,7 +7022,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           Math.round(midRow + (Math.random() - 0.5) * rowVar)));
         const xStart = hand === 0 ? COL_X[10] : COL_X[4];
 
-        const _arc = generateRailArc(rb, rowS, endBeat, rowS, snapSize, xStart, hand, false, swayBoost, bpm);
+        // autoWalls is fully built by this point, so this rail can be shaped around the real
+        // obstacles instead of relying on the [RailObstacle] clamp to flatten it afterwards.
+        const _arc = generateRailArc(rb, rowS, endBeat, rowS, snapSize, xStart, hand, false, swayBoost, bpm, null, autoWalls);
         result.push({
           beat: rb, row: rowS, type: hand, _x: xStart,
           stemSource: '_synth',
@@ -6722,7 +7177,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const xStartCol = sqHand === 0 ? 10 : 4; // start in mid-zone, not extreme
       const xStartVal = COL_X[xStartCol];
       const rowSq    = 5 + Math.floor(Math.random() * 2); // rows 5-6 (under squat barrier)
-      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSize, xStartVal, sqHand, true, 1.0, bpm);
+      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSize, xStartVal, sqHand, true, 1.0, bpm, null, autoWalls);
       // Remove any same-hand orbs inside this window — they'd violate C1 once the rail exists
       for (let j = result.length - 1; j >= 0; j--) {
         const m = result[j];
@@ -6978,51 +7433,21 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // window OFF the obstacle-side extreme, for the matching hand. Runs BEFORE the
   // FinalSweep so its fixC1 then re-snaps the rail's companions onto the corrected path.
   if (!hints.noObstacles) {
-    // For a given hand + wall, return a column limit or null:
-    //   right-side obstacle blocks right hand from far-right (cols 11-14) → maxCol 10
-    //   left-side  obstacle blocks left  hand from far-left  (cols 0-3)   → minCol 4
-    const railLimit = (hand, w) => {
-      // slideType 0 (Slide Right) renders box on the RIGHT, slideType 4 (Slide Left) on the LEFT
-      // — matches applyObstacleOcclusion's slide mapping (calibrated to the renderer + play-test).
-      const rightObs = w.wallType === 'leanLeft'  || (w.wallType === 'slide' && (w.slideType ?? 0) === 0);
-      const leftObs  = w.wallType === 'leanRight' || (w.wallType === 'slide' && (w.slideType ?? 0) === 4);
-      if (rightObs && hand === 0) return { maxCol: 10 };
-      if (leftObs  && hand === 1) return { minCol: 4 };
-      return null;
-    };
-    const clampXTo = (x, lim) => {
-      let c = xToCol(x ?? 0);
-      if (lim.maxCol !== undefined && c > lim.maxCol) c = lim.maxCol;
-      if (lim.minCol !== undefined && c < lim.minCol) c = lim.minCol;
-      return COL_X[c];
-    };
-    let _railPtsClamped = 0;
-    const _rails = result.filter(n => n.railEndBeat !== undefined && (n.type === 0 || n.type === 1));
-    for (const rail of _rails) {
-      for (const w of autoWalls) {
-        const lim = railLimit(rail.type, w);
-        if (!lim) continue;
-        const wStart = w.beat - OBSTACLE_LEAD_BEATS, wEnd = w.beat + w.duration + OBSTACLE_BUFFER_BEATS;
-        // Head
-        if (rail.beat >= wStart && rail.beat < wEnd) {
-          const nx = clampXTo(rail._x, lim);
-          if (nx !== rail._x) { rail._x = nx; _railPtsClamped++; }
-        }
-        // End
-        if (rail.railEndBeat >= wStart && rail.railEndBeat < wEnd && rail.railEnd_x !== undefined) {
-          const nx = clampXTo(rail.railEnd_x, lim);
-          if (nx !== rail.railEnd_x) { rail.railEnd_x = nx; _railPtsClamped++; }
-        }
-        // Waypoints
-        for (const seg of (rail.railSegments || [])) {
-          if (seg.beat >= wStart && seg.beat < wEnd) {
-            const nx = clampXTo(seg._x, lim);
-            if (nx !== seg._x) { seg._x = nx; _railPtsClamped++; }
-          }
-        }
-      }
-    }
-    if (_railPtsClamped > 0) console.log(`[RailObstacle] Clamped ${_railPtsClamped} rail point(s) out of obstacle-side extreme columns`);
+    // Clamp every rail point sitting inside an obstacle's volume back out of it, using the
+    // shared row-aware obstacleColLimit(). Three corrections over the previous flat-band pass,
+    // all measured against the renderer's actual wall geometry rather than assumed:
+    //   • ROW-AWARE. A lean is a triangular prism, widest at the TOP. The old flat maxCol 10 /
+    //     minCol 4 sat INSIDE the wall at rows 0-2 — and since the clamp DEPOSITS notes on the
+    //     limit, it was actively placing rail points in the wall's widest part. That is the
+    //     "rail/gold notes in the top corner during a lean" report.
+    //   • ALL RAIL TYPES. Gold (3) and green (2) rails were excluded by the old
+    //     `type === 0 || type === 1` filter, and applyObstacleOcclusion skips every rail — so
+    //     gold rails had no obstacle handling anywhere in the pipeline.
+    //   • ALL WALLS, not only the ones on a hand's "own" side. Rails built with
+    //     allowCrossCenter reach the far side, which the old per-hand mapping never tested.
+    // Runs BEFORE the FinalSweep so its fixC1 re-snaps companions onto the corrected path.
+    const { clamped: _railPtsClamped } = clampRailsToObstacles(result, autoWalls);
+    if (_railPtsClamped > 0) console.log(`[RailObstacle] Clamped ${_railPtsClamped} rail point(s) out of obstacle volumes`);
   }
 
   // ── [HandBalance] even out a lopsided L/R split ─────────────────────────────────────
@@ -7227,7 +7652,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       while (gj + 1 < golds.length && golds[gj + 1].beat - golds[gj].beat <= GS_GAP) gj++;
       const run = golds.slice(gi, gj + 1);
       if (run.length >= 3) {
-        const shape = gReshaped % GOLD_SHAPES;
+        const _gSec = sectionAt(run[0].beat);
+        const shape = motifMemory.replay(_gSec, 'gold') ?? (gReshaped % GOLD_SHAPES);
+        motifMemory.record(_gSec, 'gold', shape);
         const flip  = gReshaped % 2 === 0 ? 0 : 4;          // alternate start side per run
         let prevC = null, prevR = null;
         for (let k = 0; k < run.length; k++) {
@@ -7291,25 +7718,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_MAXSTEP = 3;
     const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
     const clRow = r => Math.max(dRowLo, Math.min(dRowHi, Math.round(r)));
-    const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
-    // Move library — each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null }
-    // steps (col 0-14, row 1-9, 5 = centre). `cross` lets a move reach across the centre line.
-    const MOVES = [];
-    const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
-    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
-    { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
-    { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
-    { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
-    { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
-    { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
-    { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const t = k / (N - 1), row = cc(5 - 3 * Math.sin(t * 2 * Math.PI), 1, 9); s.push({ l: [cc(1 + 5 * t, 0, 7), row], r: [cc(13 - 5 * t, 7, 14), row] }); } addMove('mirrorWings', false, s); }
-    { const a = [3, 5, 7, 9, 7, 5, 3], b = [11, 9, 7, 5, 7, 9, 11]; addMove('crossReturn', true, a.map((v, k) => ({ l: [v, 4], r: [b[k], 6] }))); }  // hands cross at DIFFERENT rows (4/6) — same-cell collision guard
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const a = k / (N - 1) * 2 * Math.PI, t = k / (N - 1); s.push({ l: [cc(2 + 4 * t, 0, 7), cc(5 - 3 * Math.sin(a), 1, 9)], r: [cc(8 + 4 * t, 7, 14), cc(5 - 3 * Math.sin(a + Math.PI), 1, 9)] }); } addMove('dnaHelix', false, s); }
-    { let s = []; const N = 8; for (let k = 0; k < N; k++) { const p = Math.sin(k / (N - 1) * 2 * Math.PI), sh = Math.round(3 * p), row = cc(4 + 1.8 * Math.abs(p), 1, 9); s.push({ l: [cc(4 + sh, 0, 7), row], r: [cc(10 + sh, 7, 14), row] }); } addMove('pendulum', false, s); }
-    { addMove('outwardBloom', false, [{ l: [6, 5], r: [8, 5] }, { l: [3, 3], r: [11, 3] }, { l: [1, 1], r: [13, 1] }, { l: [3, 3], r: [11, 3] }, { l: [6, 5], r: [8, 5] }, { l: [3, 7], r: [11, 7] }, { l: [1, 9], r: [13, 9] }, { l: [3, 7], r: [11, 7] }]); }
-    { const Ls = [[2, 3], [5, 3], [5, 6], [2, 6]], Rs = [[9, 3], [12, 3], [12, 6], [9, 6]]; let s = []; for (let k = 0; k < 8; k++) { const ix = k % 4; s.push({ l: Ls[ix], r: Rs[ix] }); } addMove('boxStep', false, s); }
-    { const rw = [8, 2, 8, 2, 7, 3]; addMove('heartbeat', false, rw.map(v => ({ l: [4, v], r: [10, v] }))); }
+    const MOVES = DANCE_MOVES;                       // shared library (buildDanceMoves)
 
     const orbs = result
       .filter(n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail)
@@ -7322,7 +7731,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const region = orbs.slice(i, j + 1);
       const beatKeys = new Set(region.map(o => Math.round(o.beat * 64)));
       if (region.length >= DSW_MINRUN && beatKeys.size >= 3) {
-        let mvIdx = _reg % MOVES.length, mv = MOVES[mvIdx], k = 0, lastBk = null;
+        const _dSec = sectionAt(region[0].beat);
+        let mvIdx = motifMemory.replay(_dSec, 'dense') ?? (_reg % MOVES.length);
+        motifMemory.record(_dSec, 'dense', mvIdx);
+        let mv = MOVES[mvIdx], k = 0, lastBk = null;
         let prevL = null, prevR = null;
         for (const o of region) {
           const bk = Math.round(o.beat * 64);
@@ -7345,6 +7757,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           if (mv.cross) col = Math.max(0, Math.min(14, col));             // crossover move: may pass the centre line
           else if (isR) col = Math.max(7, Math.min(14, col));             // otherwise keep each hand in its zone
           else          col = Math.max(0, Math.min(7, col));
+          o._preSweep = o._preSweep || { x: o._x, row: o.row };   // demotion snapshot ([PatternCoverage])
           o._x = COL_X[col];
           o.row = rowv;
           o._denseSweep = true;
@@ -7357,36 +7770,32 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     if (_dswRuns > 0) console.log(`[DenseSweep] Reshaped ${_dswRuns} dense region(s) (${_dswNotes} orbs) using ${MOVES.length} two-hand move types`);
 
-    // ── [DenseSweep] boundary smoothing ─────────────────────────────────────
-    // Reshaping moves pattern notes, but their LOOSE same-hand neighbours (region
-    // entry/exit) were placed with no knowledge of the new positions — leaking
-    // just-over-limit C3 jumps (consistently 8 cols) at recurring region-boundary
-    // timestamps (confirmed via nonpattern_big_jumps). Where exactly one of a
-    // consecutive same-hand pair is pattern-tagged and the jump exceeds C3 limits
-    // (>7 cols or >5 rows), nudge the LOOSE note just enough to get back under —
-    // the pattern choreography stays intact and the loose note barely moves
-    // (an 8-col jump = a 1-col nudge).
+    // ── [DenseSweep] boundary smoothing — shared smoothPatternBoundaries (also used by [SparseSweep]) ──
     {
-      const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
-      let _dswClamped = 0;
-      for (let h = 0; h <= 1; h++) {
-        const hn = orbs.filter(n => n.type === h);          // beat-sorted free orbs only
-        for (let k = 1; k < hn.length; k++) {
-          const a = hn[k - 1], b = hn[k];
-          if (!!a._denseSweep === !!b._denseSweep) continue; // need exactly one pattern note
-          const loose = a._denseSweep ? b : a, anchor = a._denseSweep ? a : b;
-          const dC = xCol(loose._x) - xCol(anchor._x), dR = (loose.row || 0) - (anchor.row || 0);
-          if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
-          let nc = xCol(anchor._x) + Math.max(-7, Math.min(7, dC));  // clamp to exactly the C3 limit
-          let nr = (anchor.row || 0) + Math.max(-5, Math.min(5, dR)); // → minimal displacement
-          nc = h === 0 ? Math.max(7, Math.min(14, nc)) : Math.max(0, Math.min(7, nc)); // keep hand zone
-          loose._x = COL_X[nc];
-          loose.row = Math.max(0, Math.min(10, nr));
-          _dswClamped++;
-        }
-      }
+      const _dswClamped = smoothPatternBoundaries(orbs);
       if (_dswClamped) console.log(`[DenseSweep] Boundary-clamped ${_dswClamped} loose neighbour(s) at region edges`);
     }
+  }
+
+  // ── [SparseSweep] choreograph loose runs (0.5-1.5-beat spacing) — see applySparseSweep ──
+  const _sswOpts = {
+    rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), sectionAt,
+    pickMove: (sec, reg) => {
+      const v = motifMemory.replay(sec, 'sparse') ?? (reg % DANCE_MOVES.length);
+      motifMemory.record(sec, 'sparse', v);
+      return v;
+    },
+  };
+  {
+    const _ssw = applySparseSweep(result, _sswOpts);
+    if (_ssw.runs) console.log(`[SparseSweep] Choreographed ${_ssw.runs} sparse run(s) (${_ssw.tagged} orbs), boundary-smoothed ${_ssw.smoothed}`);
+  }
+  // ── [PatternCoverage] keep choreographed coverage in 60-80% — see enforcePatternCoverage ──
+  {
+    const _pc = enforcePatternCoverage(result, {
+      promote: () => applySparseSweep(result, { ..._sswOpts, minRun: 3, minSpan: 3, maxGap: 2.0 }),
+    });
+    console.log(`[PatternCoverage] before=${(100 * _pc.before).toFixed(0)}% after=${(100 * _pc.after).toFixed(0)}% promoted=${_pc.promoted} demoted=${_pc.demoted}`);
   }
 
   // ── FINAL C1/C2 SWEEP — runs last, after every pass that could touch result ──
@@ -7395,7 +7804,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // later passes (rail dedup, snap re-runs, etc.) reintroduce them. This is the
   // final iron-clad cleanup before return — anything still wrong gets removed.
   {
-    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps });
+    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps, walls: autoWalls });
     if (_sw.grc > 0) console.log(`[GreenRail] Removed ${_sw.grc} green orb(s) overlapping an active rail`);
     const _railCount = result.filter(n => n.railEndBeat !== undefined && n.type <= 1).length;
     const _goldCount = result.filter(n => n.type === 3).length;
@@ -7428,7 +7837,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (const hand of [0, 1]) {
       const opp = 1 - hand;
       const seq = result
-        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail)
+        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail && !n._sparseSweep)
         .sort((a, b) => a.beat - b.beat);
       _xDiag[hand].pool = seq.length;
       let lastCrossBeat = -99;
@@ -7535,6 +7944,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     }
     console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (was sitting too low in VR; clamped at row ${diffRowMin})`);
   }
+  { const _ms = motifMemory.stats(); if (_ms.roots) console.log(`[MotifMemory] roots=${_ms.roots} recorded=${_ms.recorded} replayed=${_ms.replayed}`); }
 
   // ── [Phase2Probe] skeleton diff — what the spatial zone did to the population ─────────
   // Compares the note population at FINAL against the skeleton locked at phase-boundary.
@@ -8805,8 +9215,24 @@ function toast(msg, type) {
 
 
 
+// Sentinel returned by getApiKey() when the field is empty but server.py holds a key
+// (env ANTHROPIC_API_KEY or .anthropic_key). callAnthropic then posts to the local /anthropic
+// proxy, which adds the key server-side — the key itself never enters the page.
+const SERVER_KEY = '__server_key__';
+let _serverKeyAvailable = false;
+async function probeServerKey() {
+  if (!/^https?:/.test(location.protocol)) return;
+  try {
+    const r = await fetch('/api_key_status');
+    _serverKeyAvailable = r.ok && !!(await r.json()).server_key;
+  } catch { _serverKeyAvailable = false; }
+  const el = document.getElementById('apiKey');
+  if (_serverKeyAvailable && el && !el.value) el.placeholder = 'Using key from server (leave blank)';
+}
+
 function getApiKey() {
   const key = document.getElementById('apiKey').value.trim();
+  if (!key && _serverKeyAvailable) return SERVER_KEY;
   if (!key) throw new Error('Enter your Anthropic API key in the AI First Pass section first.');
   if (!key.startsWith('sk-')) throw new Error('API key should start with "sk-" — check console.anthropic.com.');
   return key;
@@ -8831,16 +9257,22 @@ async function callAnthropic(apiKey, body) {
   // on this specific error — keeps `temperature: 0`'s determinism where supported (Haiku).
   let _tempStripped = false;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const res  = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify(body),
-    });
+    const res  = apiKey === SERVER_KEY
+      ? await fetch('/anthropic', {                      // server adds the key (local-only)
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+          body: JSON.stringify(body),
+        })
+      : await fetch('https://api.anthropic.com/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            'anthropic-dangerous-direct-browser-access': 'true',
+          },
+          body: JSON.stringify(body),
+        });
     const data = await res.json();
     const _errType = data.error?.type;
     if (!_tempStripped && 'temperature' in body &&
@@ -8965,6 +9397,128 @@ const COL_X = [
    0.0,
    0.1365,  0.2730,  0.4095,  0.5460,  0.6825,  0.8190,  0.9555,
 ];
+
+// ── Obstacle volumes — SINGLE SOURCE OF TRUTH ────────────────────────────────
+// Every obstacle's real extent, in the world units the 3D preview renders with.
+// Generation, rail clamping, free-orb occlusion AND the renderer all read these —
+// never re-derive an obstacle's reach as a hardcoded column number. That is exactly
+// what produced notes sitting INSIDE lean/slide walls: a single flat column band
+// cannot describe a triangular prism, and the flat bands in use were measurably
+// wrong (col 10 is inside a lean at rows 0-2; cols 9-10 are inside a slide at every row).
+//   world x = COL_X[col] * P3D.x  → col 0 = +3.344, col 14 = -3.344 (NEGATIVE x = HIGH col)
+//   world y = ROW_Y[row] * P3D.y  → row 0 = +1.7745, row 10 = -1.7745 (POSITIVE y = LOW row)
+const OBS_BOX = {
+  lean:   { w: 2.8, h: 4.0, x: 1.9, y: 0.3 },  // right-triangular prism — see the taper below
+  slide:  { w: 2.8, h: 4.0, x: 1.9, y: 0.3 },  // plain box — no taper, blocks every row equally
+  center: { w: 7.4, h: 4.0, x: 0.0, y: 0.3 },  // full-width low barrier (slideType 3)
+  crouch: { w: 7.4, h: 0.9, x: 0.0, y: 2.5 },  // full-width overhead bar
+};
+// Half-orb clearance, world units. An orb is 2 columns wide (see the COL_X note above),
+// so its CENTRE has to sit clear of the wall face for the orb body to miss it. Half a
+// column step (0.478/2) keeps only the orb's outer rim anywhere near the wall without
+// collapsing the playable zone during a lean. Tuning knob if play-test disagrees.
+const OBS_CLEAR = 0.239;
+
+// Which side of the grid a wall occupies: +1 = HIGH columns (toward 14), -1 = LOW
+// columns (toward 0), 0 = neither (crouch/centre block rows, not columns).
+// Mapping matches applyObstacleOcclusion + the renderer — both calibrated by play-test.
+function obstacleSide(w) {
+  if (w.wallType === 'leanLeft')  return  1;   // player leans left → wall on the high-col side
+  if (w.wallType === 'leanRight') return -1;
+  if (w.wallType === 'slide') {
+    const t = w.slideType ?? 0;
+    if (t === 0) return  1;
+    if (t === 4) return -1;
+  }
+  return 0;
+}
+
+// The column limit a note at `row` must respect to stay clear of wall `w`.
+// Returns { maxCol } for a high-side wall, { minCol } for a low-side wall, or null when
+// the wall does not constrain columns at all.
+//
+// ROW-AWARE because LEAN walls are triangular prisms: full width at the TOP (low row
+// numbers) tapering to a point at the bottom-exterior corner. The safe band is therefore
+// TIGHTEST near the ceiling and widest near the floor. The flat band used previously was
+// simultaneously too loose near row 0 — which is the "notes in the top corner during a
+// lean" bug — and needlessly tight near row 8. Slides get frac=0, so they keep one
+// (correct, and much tighter than the old flat band) limit at every row.
+function obstacleColLimit(w, row) {
+  const side = obstacleSide(w);
+  if (!side) return null;
+  const isLean = w.wallType === 'leanLeft' || w.wallType === 'leanRight';
+  const box  = isLean ? OBS_BOX.lean : OBS_BOX.slide;
+  const hw   = box.w / 2;
+  const xC   = side > 0 ? -box.x : box.x;          // high-col side sits at negative world x
+  const xIn  = xC + (side > 0 ? hw : -hw);         // centre-facing face, at the wall's top
+  const xPt  = xC - (side > 0 ? hw : -hw);         // exterior corner the lean tapers down to
+  const yTop = box.y + box.h / 2, yBot = box.y - box.h / 2;
+  const y    = ROW_Y[Math.max(0, Math.min(10, Math.round(row)))] * P3D.y;
+  const frac = isLean ? Math.max(0, Math.min(1, (yTop - y) / (yTop - yBot))) : 0;
+  const xEdge = xIn + (xPt - xIn) * frac;
+  // World x decreases as the column index rises, so the safe set is a prefix on the high
+  // side and a suffix on the low side — scan the 15 real column centres, no inverse math.
+  if (side > 0) {
+    let maxCol = 0;
+    for (let c = 0; c < COL_X.length; c++) if (COL_X[c] * P3D.x > xEdge + OBS_CLEAR) maxCol = c;
+    return { maxCol };
+  }
+  let minCol = COL_X.length - 1;
+  for (let c = COL_X.length - 1; c >= 0; c--) if (COL_X[c] * P3D.x < xEdge - OBS_CLEAR) minCol = c;
+  return { minCol };
+}
+
+// Tightest column band a note at `row` must satisfy across EVERY wall overlapping
+// [beatStart, beatEnd]. Returns { minCol, maxCol } over the full grid when unobstructed.
+// `lead`/`buffer` mirror the occlusion window so approach and exit stay clear too.
+function obstacleBandAt(walls, beatStart, beatEnd, row, lead = 0, buffer = 0) {
+  let minCol = 0, maxCol = 14;
+  for (const w of walls || []) {
+    if (w.beat + w.duration + buffer <= beatStart || w.beat - lead > beatEnd) continue;
+    const lim = obstacleColLimit(w, row);
+    if (!lim) continue;
+    if (lim.maxCol !== undefined) maxCol = Math.min(maxCol, lim.maxCol);
+    if (lim.minCol !== undefined) minCol = Math.max(minCol, lim.minCol);
+  }
+  // Walls closing in from BOTH sides can invert the band (a lean overlapping an opposite
+  // slide). No column is truly safe then — collapse to the midpoint, the least-bad spot,
+  // rather than letting a caller clamp into whichever wall it happened to test last.
+  if (minCol > maxCol) { const mid = Math.round((minCol + maxCol) / 2); minCol = maxCol = mid; }
+  return { minCol, maxCol };
+}
+
+// Clamp every rail point (head, waypoints, end) out of any obstacle volume it sits inside.
+// Shared between the in-pipeline [RailObstacle] pass and runFinalSweep's obstacle stage so
+// the two cannot drift apart — divergent copies of one geometric rule is the exact failure
+// mode the C1/C2/C3 helpers exist to prevent (four divergent C3 checks, per the handoff).
+// Covers EVERY rail type: gold (3) and green (2) rails are skipped by applyObstacleOcclusion
+// (which skips all rails) and were skipped by the old per-hand rail clamp too, leaving them
+// with no obstacle handling anywhere in the pipeline.
+function clampRailsToObstacles(notes, walls) {
+  let clamped = 0;
+  if (!walls || !walls.length) return { clamped };
+  const _col = x => Math.max(0, Math.min(14, Math.round(((x ?? 0) + 0.9555) / 0.1365)));
+  const _pt = (x, row, beat) => {
+    const band = obstacleBandAt(walls, beat, beat, row, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+    const c  = _col(x);
+    const nc = Math.max(band.minCol, Math.min(band.maxCol, c));
+    return nc === c ? null : COL_X[nc];
+  };
+  for (const rail of notes) {
+    if (rail.railEndBeat === undefined) continue;
+    const h = _pt(rail._x, rail.row, rail.beat);
+    if (h !== null) { rail._x = h; clamped++; }
+    for (const seg of (rail.railSegments || [])) {
+      const s = _pt(seg._x, seg.row, seg.beat);
+      if (s !== null) { seg._x = s; clamped++; }
+    }
+    if (rail.railEnd_x !== undefined) {
+      const e = _pt(rail.railEnd_x, rail.railEndRow ?? rail.row, rail.railEndBeat);
+      if (e !== null) { rail.railEnd_x = e; clamped++; }
+    }
+  }
+  return { clamped };
+}
 
 // Compute note X by snapping to the 15-column grid.
 // Right hand (0): cols 7–14 (centre → far right, boundary at col 7 = 0.0)
@@ -9331,7 +9885,7 @@ function expandSections(sections, totalBeats, diff, hints = {}, bpm) {
   // final iron-clad cleanup before return — anything still wrong gets removed.
   {
     // expandSections fallback path — same shared fixers as the main pipeline.
-    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps: bpm ? bpm / 60 : undefined });
+    const _sw = runFinalSweep(result, { beatOccupied, clampFn: r => clampRow(Math.round(r)), bps: bpm ? bpm / 60 : undefined, walls: autoWalls });
     console.log(`[FinalSweep] C1: re-snapped ${_sw.c1.snapped}, removed ${_sw.c1.removed}. C2 gold: ${_sw.gold}, green: ${_sw.green}.`);
   }
 
@@ -9625,8 +10179,19 @@ function clampC3Jumps(notes, bps) {
   // iteration. A solo, untagged gold/green orb isn't part of any shape worth protecting,
   // unlike a GoldSweep run or a rail's curve — safe to reposition as a deliberate last resort.
   const _movableLastResort = (n, h) => (n.type === 2 || n.type === 3) && n.railEndBeat == null &&
-    !n._comp && !n._denseSweep && !n._goldSweep &&
+    !n._comp && !isPattern(n) && !n._goldSweep &&
     !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat);
+  // Final fallback: the FIRST or LAST orb of a GoldSweep run. Nudging a run's edge (minimal
+  // move, to exactly the C3 limit) leaves its interior shape intact, unlike moving a middle
+  // orb. Confirmed case (2026-11-21, Another Life, Master): a 6-orb GoldSweep run ended at
+  // row 7 and a right-hand rail started 0.49s later at row 1 — gold run (protected) vs rail
+  // head (locked), identical CRITICAL C3 on every critique iteration. An edge is a gold orb
+  // with no other GoldSweep gold within the run gap (1.5 beats) on one side.
+  const _GSW_GAP = 1.5;
+  const _gswEdge = (n, h) => n.type === 3 && n._goldSweep && n.railEndBeat == null &&
+    !_railsByHand[h].some(r => n.beat >= r.beat && n.beat <= r.railEndBeat) &&
+    (!notes.some(m => m !== n && m._goldSweep && m.type === 3 && m.beat < n.beat && n.beat - m.beat <= _GSW_GAP) ||
+     !notes.some(m => m !== n && m._goldSweep && m.type === 3 && m.beat > n.beat && m.beat - n.beat <= _GSW_GAP));
   let clamped = 0, stuck = 0;
   for (let pass = 0; pass < 2; pass++) {
     for (let h = 0; h <= 1; h++) {
@@ -9641,12 +10206,14 @@ function clampC3Jumps(notes, bps) {
         // pick the note to move: prefer loose (non-pattern) movable, then any movable,
         // then (last resort) an untagged solo gold/green orb
         let mv = null;
-        if      (!b._denseSweep && _movable(b, h)) mv = b;
-        else if (!a._denseSweep && _movable(a, h)) mv = a;
+        if      (!isPattern(b) && _movable(b, h)) mv = b;
+        else if (!isPattern(a) && _movable(a, h)) mv = a;
         else if (_movable(b, h))                   mv = b;
         else if (_movable(a, h))                   mv = a;
         else if (_movableLastResort(b, h))         mv = b;
         else if (_movableLastResort(a, h))         mv = a;
+        else if (_gswEdge(b, h))                   mv = b;
+        else if (_gswEdge(a, h))                   mv = a;
         // Count as "stuck" only when a red/blue endpoint existed but was rail-locked — a
         // gold→gold / gold→green pair (both anchors) is an intended shape, not a failure.
         if (!mv) { if (pass === 1 && (a.type === h || b.type === h)) stuck++; continue; }
@@ -9667,13 +10234,19 @@ function clampC3Jumps(notes, bps) {
   return { clamped, stuck };
 }
 
-function runFinalSweep(notes, { beatOccupied = null, clampFn, bps } = {}) {
+function runFinalSweep(notes, { beatOccupied = null, clampFn, bps, walls = null } = {}) {
+  // Obstacles FIRST when the caller knows the walls: moving a rail out of a wall shifts its
+  // path, and fixC1 below is what re-snaps companions onto the corrected path. This mirrors
+  // the in-pipeline order ([RailObstacle] runs before the FinalSweep) and closes the gap where
+  // the section-splice / mutateMap paths finish through here and so had NO obstacle stage at
+  // all — rails regenerated during the critique loop were never checked against a wall.
+  const obs   = clampRailsToObstacles(notes, walls);
   const grc   = clearGreenRailConflicts(notes, beatOccupied);
   const c1    = fixC1(notes, { beatOccupied, clampFn });
   const gold  = clearGoldC2(notes, beatOccupied);
   const green = clearGreenC2(notes, beatOccupied);
   const c3    = clampC3Jumps(notes, bps);   // last — C1/C2 deletions above can join distant neighbours
-  return { grc, c1, gold, green, c3 };
+  return { obs, grc, c1, gold, green, c3 };
 }
 
 async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
@@ -9870,7 +10443,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         : null,
       // pattern: which choreography pass placed this note ('dense'/'gold'), else omitted.
       // Lets the critic accept intended in-pattern movement while still judging loose sections.
-      ...(n._denseSweep ? { pattern: 'dense' } : n._goldSweep ? { pattern: 'gold' } : {}),
+      ...(n._denseSweep ? { pattern: 'dense' } : n._sparseSweep ? { pattern: 'sparse' } : n._goldSweep ? { pattern: 'gold' } : {}),
     }));
 
   // Row distribution across 11 layers (Ceiling … Floor)
@@ -10023,7 +10596,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
         if (a.type === 3 && b.type === 3 && h === 1) continue; // gold-gold pair is identical in both hands' walks — count once (h=0)
         if (sameRailWindow(a, b, _railsByHandNP, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
-        if ((a._denseSweep || a._goldSweep) && (b._denseSweep || b._goldSweep)) continue; // both in a pattern → intended
+        if ((isPattern(a) || a._goldSweep) && (isPattern(b) || b._goldSweep)) continue; // both in a pattern → intended
         const dCol = Math.abs(xToColF(b._x) - xToColF(a._x));
         const dRow = Math.abs((b.row || 0) - (a.row || 0));
         if (dCol > 7 || dRow > 5) {
@@ -10322,7 +10895,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const _c3Detail = [];
       // tag string for diagnosis: which pass owns each offending note
       const _tags = n => [n.railEndBeat != null && 'rail', n._comp && 'comp',
-        n._denseSweep && 'dsw', n._goldSweep && 'gsw', n._crossover && 'xover',
+        n._denseSweep && 'dsw', n._sparseSweep && 'ssw', n._goldSweep && 'gsw', n._crossover && 'xover',
         n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
       const _railsByHandFin = buildRailsByHand(currentNotes);
       for (let h = 0; h <= 1; h++) {
@@ -11512,11 +12085,17 @@ Rules:
             n.beat < sqEnd && n.railEndBeat > sqStart
           );
           const sqHand    = rightBusy ? 1 : 0;
-          const xStartCol = sqHand === 0 ? 14 : 0;
-          const xStartVal = COL_X[xStartCol];
           const rowSq    = 4 + Math.floor(Math.random() * 3);
           const rowSqEnd = Math.max(0, Math.min(10, rowSq + (Math.random() < 0.5 ? -2 : 2)));
-          const _sqArc2 = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSz, xStartVal, sqHand, true, 1.0, bpm);
+          // Head starts at the zone extreme, which is precisely where an obstacle sits — and
+          // this is the one rail path that never reaches [RailObstacle] (that pass lives in
+          // onsetsToNotes; the splice route finishes through runFinalSweep instead). Clamp the
+          // head against the real walls here, and shape the arc around them too.
+          const _sqBand   = obstacleBandAt(resultWalls, sqStart, sqEnd, rowSq,
+                                           OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+          const xStartCol = Math.max(_sqBand.minCol, Math.min(_sqBand.maxCol, sqHand === 0 ? 14 : 0));
+          const xStartVal = COL_X[xStartCol];
+          const _sqArc2 = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSz, xStartVal, sqHand, true, 1.0, bpm, null, resultWalls);
           result.push({
             beat:        sqStart,
             row:         rowSq,
@@ -11561,7 +12140,7 @@ Rules:
       // same C1/C2 logic as onsetsToNotes' FinalSweep to catch any new ones.
       {
         // Shared fixers (Finding-1). No beatOccupied set in mutateMap scope.
-        const _sw = runFinalSweep(result, { bps: beatsPerSec });
+        const _sw = runFinalSweep(result, { bps: beatsPerSec, walls: resultWalls });
         console.log(`[Mutate-FinalSweep] C1: re-snapped ${_sw.c1.snapped}, removed ${_sw.c1.removed}. C2 gold: ${_sw.gold}, green: ${_sw.green}, greenRail: ${_sw.grc}.`);
       }
 
@@ -11914,7 +12493,7 @@ Rules:
               // The splice combines two independently-validated halves; boundary
               // companions and preserved gold can create new C1/C2 violations.
               {
-                const _sw = runFinalSweep(iterNotes, { bps: bpm / 60 });
+                const _sw = runFinalSweep(iterNotes, { bps: bpm / 60, walls: iterWalls });
                 if (_sw.c1.snapped || _sw.c1.removed) console.log(`[SpliceC1] reSnapped=${_sw.c1.snapped} removed=${_sw.c1.removed}`);
                 if (_sw.gold > 0 || _sw.green > 0 || _sw.grc > 0) console.log(`[SpliceC2] Cleared gold:${_sw.gold} green:${_sw.green} greenRail:${_sw.grc} after splice`);
               }
@@ -13278,14 +13857,16 @@ function refresh3DView() {
                  : isCtr  ? 0xb71c1c   // Center block — dark red
                  :          0x00838f;  // other slide subtypes
 
-    const boxW = isCr ? 7.4 : isCtr ? 7.4 : 2.8;
-    const boxH = isCr ? 0.9 : 4.0;
-    const boxX = isLL   ? -1.9
-               : isLR   ?  1.9
-               : isSldL ?  1.9   // Slide Left:  obstacle on right side
-               : isSldR ? -1.9   // Slide Right: obstacle on left side
-               : 0;              // center blocker, unknown subtypes
-    const boxY = isCr ?  2.5 : 0.3;
+    // Geometry comes from the shared OBS_BOX table — the same source obstacleColLimit()
+    // clamps notes against, so what is drawn here is exactly what notes are kept out of.
+    const _obs  = isCr ? OBS_BOX.crouch : isCtr ? OBS_BOX.center
+                : (isLL || isLR) ? OBS_BOX.lean : OBS_BOX.slide;
+    const boxW  = _obs.w;
+    const boxH  = _obs.h;
+    // +1 = wall on the HIGH-column side, which sits at NEGATIVE world x (P3D.x flips the axis).
+    const _side = isLL ? 1 : isLR ? -1 : isSldL ? -1 : isSldR ? 1 : 0;
+    const boxX  = _side === 0 ? 0 : (_side > 0 ? -_obs.x : _obs.x);
+    const boxY  = _obs.y;
     const boxZ = Math.max(0.15, dur);
 
     // Lean obstacles use a right-triangular prism: wide at top, tapers to bottom corner.
@@ -13421,6 +14002,11 @@ async function checkLibSuggestByHash(hash) {
   // If fields are already filled with the SAME song, this is a re-upload — still show banner.
   // If fields are filled with a DIFFERENT song, stay silent (don't clobber user's work).
   if (fieldsPopulated && _libKey(titleEl.value, artistEl.value) !== entry.key) return;
+  if (_autoApplyLib) {                       // ?song= dev autoload: apply without the banner
+    _autoApplyLib = false;
+    console.log(`[DevSong] Library match "${entry.title}" applied`);
+    return loadLibraryEntry(entry);
+  }
   _libSuggestEntry = entry;
   const isReupload = !!fieldsPopulated;
   document.getElementById('libSuggestLabel').textContent = isReupload
@@ -13695,7 +14281,31 @@ function renderLibraryGrid(filter) {
 }
 
 // Close on overlay background click — deferred because libOverlay is rendered after this script block
+// Dev autoload: `?song=<filename substring>` pulls the file from server.py's /dev_song
+// (the ../MP3 folder) and feeds it through the normal upload handler, so a generation can
+// be driven end-to-end without the native file picker. A library hash match is applied
+// automatically (title/artist/BPM) instead of waiting on the banner click.
+let _autoApplyLib = false;
+async function devAutoloadSong() {
+  const q = new URLSearchParams(location.search).get('song');
+  if (!q || !/^https?:/.test(location.protocol)) return;
+  try {
+    const r = await fetch('/dev_song?q=' + encodeURIComponent(q));
+    if (!r.ok) { console.warn('[DevSong]', (await r.json()).error); return; }
+    const name = decodeURIComponent(r.headers.get('X-Song-Name') || (q + '.ogg'));
+    const file = new File([await r.blob()], name);
+    const dt = new DataTransfer(); dt.items.add(file);
+    const inp = document.getElementById('audioFile');
+    inp.files = dt.files;
+    _autoApplyLib = true;
+    inp.dispatchEvent(new Event('change'));
+    console.log(`[DevSong] Loaded "${name}" via server`);
+  } catch (e) { console.warn('[DevSong] autoload failed:', e.message); }
+}
+
 window.addEventListener('DOMContentLoaded', () => {
+  probeServerKey();
+  devAutoloadSong();
   document.getElementById('libOverlay')?.addEventListener('click', e => {
     if (e.target === document.getElementById('libOverlay')) closeLibraryModal();
   });

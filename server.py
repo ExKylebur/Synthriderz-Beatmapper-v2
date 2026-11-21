@@ -54,7 +54,45 @@ if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 PORT = 8090  # v2 sandbox — distinct from the stable build's 8080 so both can run at once (A/B)
+# `--port N` overrides, so a second instance (e.g. an agent-driven test server) can run
+# alongside one already holding 8090.
+if '--port' in sys.argv:
+    PORT = int(sys.argv[sys.argv.index('--port') + 1])
 SCRIPT_DIR = Path(__file__).parent  # serve from the folder server.py lives in
+
+# ── Server-held Anthropic key + local dev helpers ─────────────────────────────
+# Lets a generation run with NO key pasted into the page: the browser posts to
+# /anthropic and the server adds the key before forwarding to api.anthropic.com, so the
+# key never reaches the page. Source, first match wins:
+#   1. env var ANTHROPIC_API_KEY
+#   2. file <script_dir>/.anthropic_key (one line; gitignored)
+# A key typed into the page still goes direct to Anthropic exactly as before.
+#
+# SECURITY: this server sends `Access-Control-Allow-Origin: *` and binds every interface,
+# so a key-adding proxy would otherwise let any website the user visits — or any device
+# on the LAN — spend the key. /anthropic and /dev_song therefore require a loopback
+# client AND (when the browser sends one) an Origin of this server itself.
+ANTHROPIC_KEY_FILE = SCRIPT_DIR / '.anthropic_key'
+SONG_DIR = SCRIPT_DIR.parent / 'MP3'   # where the user's source audio lives
+SONG_EXTS = ('.ogg', '.mp3', '.wav', '.flac', '.m4a', '.aac')
+
+
+def server_anthropic_key() -> str:
+    key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+    if not key and ANTHROPIC_KEY_FILE.exists():
+        key = ANTHROPIC_KEY_FILE.read_text(encoding='utf-8').strip()
+    return key
+
+
+def find_song(query: str):
+    """Case-insensitive substring match on filenames in SONG_DIR (no path parts allowed).
+    Returns the single best Path (shortest name among matches) or None."""
+    q = (query or '').strip().lower()
+    if not q or '/' in q or '\\' in q or '..' in q or not SONG_DIR.is_dir():
+        return None
+    hits = [p for p in SONG_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in SONG_EXTS and q in p.name.lower()]
+    return min(hits, key=lambda p: len(p.name)) if hits else None
 
 # ── Song metadata library ─────────────────────────────────────────────────────
 # Persistent JSON cache so repeated songs don't need API lookups.
@@ -1104,8 +1142,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_cors()
         self.end_headers()
 
+    def _is_local_request(self) -> bool:
+        """Loopback client, and if the browser sent an Origin, it is this server's own page."""
+        if self.client_address[0] not in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
+            return False
+        origin = self.headers.get('Origin')
+        if origin is None:
+            return True
+        return origin in (f'http://localhost:{PORT}', f'http://127.0.0.1:{PORT}')
+
+    def _send_json(self, code, obj):
+        payload = json.dumps(obj).encode('utf-8')
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(payload))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _handle_anthropic_proxy(self):
+        import urllib.request, urllib.error
+        if not self._is_local_request():
+            self._send_json(403, {'error': {'type': 'forbidden', 'message': 'proxy is local-only'}})
+            return
+        key = server_anthropic_key()
+        if not key:
+            self._send_json(400, {'error': {'type': 'no_server_key',
+                'message': 'No server key: set ANTHROPIC_API_KEY or create .anthropic_key next to server.py'}})
+            return
+        body = self.rfile.read(int(self.headers.get('Content-Length', 0) or 0))
+        req = urllib.request.Request('https://api.anthropic.com/v1/messages', data=body, method='POST',
+            headers={'Content-Type': 'application/json', 'x-api-key': key,
+                     'anthropic-version': self.headers.get('anthropic-version', '2023-06-01')})
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+            code, hdrs, data = resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            code, hdrs, data = e.code, e.headers, e.read()
+        except Exception as e:
+            self._send_json(502, {'error': {'type': 'proxy_error', 'message': str(e)}})
+            return
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(data))
+        # Pass rate-limit headers through — callAnthropic logs them on a 429.
+        for h, v in hdrs.items():
+            if h.lower().startswith('anthropic-ratelimit-') or h.lower() == 'retry-after':
+                self.send_header(h, v)
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         path = self.path.split("?")[0]
+
+        # ── /api_key_status — does the server hold a key? (never returns the key) ──
+        if path == "/api_key_status":
+            self._send_json(200, {'server_key': bool(server_anthropic_key()) and self._is_local_request()})
+            return
+
+        # ── /dev_song?q=<substring> — stream a song from ../MP3 (local-only) ──
+        if path == "/dev_song":
+            if not self._is_local_request():
+                self._send_json(403, {'error': 'local-only'})
+                return
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get('q', [''])[0]
+            song = find_song(q)
+            if not song:
+                self._send_json(404, {'error': f'no song matching {q!r} in {SONG_DIR}'})
+                return
+            data = song.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", len(data))
+            self.send_header("X-Song-Name", urllib.parse.quote(song.name))
+            self.end_headers()
+            self.wfile.write(data)
+            return
 
         # ── /favicon.ico — silence browser auto-requests ─────────────────
         if path == "/favicon.ico":
@@ -1186,6 +1297,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split('?')[0].rstrip('/')
         if path == "/export":
             self._handle_export()
+            return
+        if path == "/anthropic":
+            self._handle_anthropic_proxy()
             return
         if path == "/meta_library":
             self._handle_meta_library()
@@ -2114,7 +2228,7 @@ def main():
     def _open_browser():
         time.sleep(1.2)  # wait for server to be ready
         webbrowser.open(f"http://localhost:{PORT}")
-    if platform.system() in ("Windows", "Darwin"):
+    if platform.system() in ("Windows", "Darwin") and '--no-browser' not in sys.argv:
         threading.Thread(target=_open_browser, daemon=True).start()
 
     socketserver.TCPServer.allow_reuse_address = True
