@@ -576,7 +576,8 @@ def classify_drum_hit(signal, sr: int, time_sec: float,
         return 'hat'
 
 
-def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) -> dict:
+def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
+                  pad_secs: float = 0.0) -> dict:
     """Run per-stem onset detection and return structured analysis JSON.
 
     stems:         { 'drums': path, 'bass': path, 'vocals': path, 'other': path }
@@ -584,6 +585,9 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
     enabled_stems: { 'drums': bool, 'bass': bool, 'vocals': bool, 'other': bool }
                    When a stem is False its onset/region detection is skipped
                    (Demucs always produces all 4 stems; this just avoids processing).
+    pad_secs:      beat-1 pad (the app's audioPadSecs): this much silence is prepended to every
+                   stem signal, so onsets, regions, duration and the per-beat energy/panning
+                   curves all come back on the map clock (the same silence /export adds).
 
     Returns the Phase 2 JSON structure consumed by extractNoteEvents in Phase 4.
     """
@@ -596,11 +600,20 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
     HOP_SEC  = 0.01    # 10ms frames
     HOP      = int(SR * HOP_SEC)
     beat_sec = 60.0 / bpm
+    pad_n    = max(0, int(round(float(pad_secs or 0.0) * SR)))
+
+    def _lead(sig):
+        """Prepend the beat-1 pad (zeros) to a signal."""
+        return np.concatenate([np.zeros(pad_n, dtype=sig.dtype), sig]) if pad_n else sig
+
+    if pad_n:
+        print(f'  Beat-1 pad: {pad_n / SR:.3f}s of silence before every stem')
 
     result_stems = {}
 
     # ── Drums ────────────────────────────────────────────────────────────────
     drums_sig, _ = load_wav_mono(stems['drums'], SR)
+    drums_sig = _lead(drums_sig)
     if enabled_stems.get('drums', True):
         print('  Analysing drums stem…')
         drums_env    = rms_envelope(drums_sig, HOP)
@@ -616,6 +629,7 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
 
     # ── Bass ─────────────────────────────────────────────────────────────────
     bass_sig, _ = load_wav_mono(stems['bass'], SR)
+    bass_sig = _lead(bass_sig)
     if enabled_stems.get('bass', True):
         print('  Analysing bass stem…')
         bass_env     = rms_envelope(bass_sig, HOP)
@@ -633,6 +647,7 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
     # [SUGGESTION-H] Combine RMS-based onsets with HFC-weighted spectral flux to
     # catch consonants and subtle vocal attacks that don't show in RMS envelope.
     vox_sig, _ = load_wav_mono(stems['vocals'], SR)
+    vox_sig = _lead(vox_sig)
     if enabled_stems.get('vocals', True):
         print('  Analysing vocals stem (RMS + spectral flux)…')
         vox_env         = rms_envelope(vox_sig, HOP)
@@ -653,6 +668,7 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
     # [SUGGESTION-H] Combine RMS + spectral flux for guitars / synths — catches
     # pinch harmonics and string attacks the RMS envelope misses.
     other_sig, _ = load_wav_mono(stems['other'], SR)
+    other_sig = _lead(other_sig)
     if enabled_stems.get('other', True):
         print('  Analysing other stem (RMS + spectral flux)…')
         other_env         = rms_envelope(other_sig, HOP)
@@ -728,12 +744,13 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
                _pad(vox_sig,  max_len) + _pad(other_sig, max_len)) * 0.25
     duration = max_len / SR
 
-    beat_frames  = int(beat_sec * SR)
     num_beats    = int(np.ceil(duration / beat_sec))
     energy_curve = []
     for b in range(num_beats):
-        s = b * beat_frames
-        e = min(s + beat_frames, len(mix))
+        # Beat b spans [b, b+1)*beat_sec, rounded per beat. The old fixed int(beat_sec*SR) step
+        # lost up to a sample a beat, so late beats' windows slid early.
+        s = int(round(b * beat_sec * SR))
+        e = min(int(round((b + 1) * beat_sec * SR)), len(mix))
         rms = float(np.sqrt((mix[s:e] ** 2).mean())) if e > s else 0.0
         energy_curve.append(round(rms, 5))
     # Normalise to [0, 1]
@@ -749,10 +766,10 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None) ->
     panning_by_beat = []
     try:
         L, R, _ = load_wav_stereo(stems['other'], SR)
-        beat_frames_pan = int(beat_sec * SR)
+        L, R = _lead(L), _lead(R)
         for b in range(num_beats):
-            s = b * beat_frames_pan
-            e = min(s + beat_frames_pan, min(len(L), len(R)))
+            s = int(round(b * beat_sec * SR))
+            e = min(int(round((b + 1) * beat_sec * SR)), min(len(L), len(R)))
             if e <= s:
                 panning_by_beat.append(0.0)
                 continue
@@ -945,12 +962,16 @@ def convert_to_ogg(input_bytes: bytes, input_ext: str, silence_secs: float = 0.0
             # Prepend silence using concat with anullsrc.
             # NOTE: adelay does NOT extend output duration — it shifts samples within the
             # existing time window, truncating the tail. concat is the correct approach.
+            pad_samples = int(round(silence_secs * 44100))
             cmd = [
                 ffmpeg_cmd, "-y",
-                "-f", "lavfi", "-t", str(round(silence_secs, 3)),
-                "-i", "anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 *seek_args, "-i", in_path,
-                "-filter_complex", "[0:a][1:a]concat=n=2:v=0:a=1[out]",
+                # exact pad length in samples; music resampled to the silence's format first
+                "-filter_complex",
+                f"[0:a]atrim=end_sample={pad_samples},aformat=sample_fmts=fltp:channel_layouts=stereo[pad];"
+                "[1:a]aresample=44100,aformat=sample_fmts=fltp:channel_layouts=stereo[mus];"
+                "[pad][mus]concat=n=2:v=0:a=1[out]",
                 "-map", "[out]",
                 "-c:a", "libvorbis",
                 "-q:a", "4",
@@ -1100,29 +1121,155 @@ def download_youtube_audio(url: str):
         return ogg_bytes, title, artist, str(saved)
 
 
+# ── Tempo refinement (epoch folding) ──────────────────────────────────────────
+# librosa's beat_track tempo is a LAG BIN, 60·sr/(hop·lag): near 100-120 BPM neighbouring
+# bins are 4-5% apart, so a 120-BPM song reads 117.45 and the snap grid slides ~9 beats over
+# the song. A line fit through the tracked beats (tried 2026-11-21) is still pulled toward
+# the tracker's starting bin: Nobody Speak fitted 161.56 where the music is 160.01.
+# Epoch folding is what works. Fold the onset envelope modulo each candidate period and keep
+# the period whose folded profile has the tallest peak. That uses every frame of the song,
+# so the period is good to ~0.01 BPM on a studio track. Each quarter of the song, folded on
+# its own, then lands on the same phase to within ±0.04 beat (it drifts a full beat at the
+# old values).
+TEMPO_HOP = 128                 # onset-envelope hop at 22050 Hz → 5.8 ms frames
+TEMPO_FOLD_BINS = 48            # phase bins per period for the period search
+TEMPO_PHASE_BINS = 96           # finer bins for the final phase / per-quarter drift
+# Folded onset_strength(center=True, hop 128) peaks ~14 ms AFTER a click onset (synthetic
+# click tracks at 89-172 BPM, 2026-11-21: 14.2 ± 0.3 ms; tests/tempo.test.mjs guards it).
+# Subtracted so `phase` is the beat onset itself.
+ONSET_ENV_LATENCY = 0.014
+
+
+def _fold_profile(env, t, period: float, nbins: int = TEMPO_FOLD_BINS):
+    """Mean onset strength per phase bin when `env` (sampled at times `t`) is folded
+    modulo `period`."""
+    import numpy as np
+    b = np.floor((t % period) * (nbins / period)).astype(np.int64) % nbins
+    s = np.bincount(b, weights=env, minlength=nbins)
+    c = np.bincount(b, minlength=nbins)
+    return s / np.maximum(c, 1)
+
+
+def _profile_peak_phase(prof, period: float) -> float:
+    """Phase (s, in [0, period)) of the folded profile's peak, with parabolic sub-bin
+    interpolation (circular neighbours)."""
+    import numpy as np
+    n = len(prof)
+    j = int(np.argmax(prof))
+    y0, y1, y2 = prof[(j - 1) % n], prof[j], prof[(j + 1) % n]
+    den = y0 - 2 * y1 + y2
+    d = 0.5 * (y0 - y2) / den if den < 0 else 0.0
+    return float(((j + 0.5 + d) / n * period) % period)
+
+
+def _smooth_env(env):
+    """~9 ms Gaussian smoothing so a folded onset peak is not split across bins."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+    return gaussian_filter1d(np.asarray(env, dtype=float), 1.5)
+
+
+def _lattice_fit(env_s, t, period: float) -> dict:
+    """Phase (latency-corrected), per-quarter drift and confidence of a FIXED beat period."""
+    import numpy as np
+    prof = _fold_profile(env_s, t, period, TEMPO_PHASE_BINS)
+    phase = _profile_peak_phase(prof, period)
+    drift = []
+    for idx in np.array_split(np.arange(len(env_s)), 4):
+        if len(idx) < 8:
+            continue
+        q = _profile_peak_phase(_fold_profile(env_s[idx], t[idx], period, TEMPO_PHASE_BINS), period)
+        drift.append(round(float(((q - phase) / period + 0.5) % 1.0 - 0.5), 3))
+    mean = float(env_s.mean()) or 1.0
+    return {'phase': (phase - ONSET_ENV_LATENCY) % period, 'drift': drift,
+            'confidence': float(prof.max()) / mean}
+
+
+def lattice_phase(env, dt: float, bpm: float) -> dict:
+    """Where the music's beats sit on a GIVEN tempo's lattice (no tempo search).
+
+    Returns {phase, drift, confidence} as fold_tempo does, for `bpm` as given. Used by
+    validate.py --timing to measure an exported map's grid against its own audio: phase ≈ 0
+    means the map's integer beats are the music's beats, and a drift trend means its BPM is off.
+    """
+    import numpy as np
+    env_s = _smooth_env(env)
+    return _lattice_fit(env_s, np.arange(len(env_s)) * dt, 60.0 / bpm)
+
+
+def fold_tempo(env, dt: float, bpm_guess: float, span: float = 0.05) -> dict:
+    """Refine a tempo estimate by epoch-folding an onset envelope.
+
+    env:       onset-strength envelope (any positive onset function), one value per frame
+    dt:        frame period (s)
+    bpm_guess: the octave to search (e.g. librosa's lag-bin tempo); the search covers
+               ±span (default ±5% = more than half a lag bin up to ~200 BPM)
+
+    Returns {bpm, phase, confidence, drift}:
+      bpm        refined tempo (BPM)
+      phase      time (s) of the first beat-lattice point, in [0, 60/bpm): beats sit at
+                 phase + k·60/bpm. Latency-corrected (ONSET_ENV_LATENCY).
+      confidence folded-profile peak / mean onset strength. A steady studio beat scores
+                 ~2.5-3; ~1.0-1.1 means no lattice fits (a wrong period scores that too).
+      drift      each quarter of the song folded on its own: its phase minus the global
+                 phase, in beats, in [-0.5, 0.5). Flat ≈ steady tempo; a trend = the song
+                 speeds up or slows down (live recordings); a lone ±0.5 = that quarter's
+                 accents sit on the off-beats (Painkiller's drum intro).
+    """
+    import numpy as np
+    env = _smooth_env(env)
+    t = np.arange(len(env)) * dt
+    dur = max(len(env) * dt, 1.0)
+    mean = float(env.mean()) or 1.0
+
+    def score(bpm):
+        return float(_fold_profile(env, t, 60.0 / bpm).max()) / mean
+
+    # The comb peak's half-width is ~0.1 beat of total drift: Δbpm ≈ 6/dur. Step at half of it.
+    step = 3.0 / max(dur, 30.0)
+    grid = np.arange(bpm_guess * (1 - span), bpm_guess * (1 + span), step)
+    coarse = np.array([score(b) for b in grid])
+    b0 = float(grid[int(np.argmax(coarse))])
+    fine = np.arange(b0 - 2 * step, b0 + 2 * step, step / 10)
+    fscore = np.array([score(b) for b in fine])
+    bpm = float(fine[int(np.argmax(fscore))])
+    fit = _lattice_fit(env, t, 60.0 / bpm)
+    return {'bpm': bpm, 'phase': fit['phase'], 'confidence': float(fscore.max()),
+            'drift': fit['drift']}
+
+
 def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict:
-    """Robust tempo estimate for one audio file via librosa's beat tracker (MIR standard).
+    """Tempo, beat phase and octave candidates for one audio file.
 
-    Runs on the FULL clip (vs the browser's first-20s autocorrelation) and returns the raw
-    estimate plus an OCTAVE-CANDIDATE FAMILY — the multiples of the raw tempo that fall in a
-    musical range. Octave error (x2 / x0.5) is the known failure mode of every tempo tracker,
-    so we don't try to pick the "true" octave from audio alone: we hand the family back and let
-    the browser reconcile it against the online lookup (authoritative human value). With no
-    lookup the browser picks the in-band candidate nearest 120. Lazy imports so the server
-    still starts if librosa is absent (the endpoint returns 503 and the browser falls back).
+    1. librosa's beat tracker on the FULL clip picks the octave (`raw_bpm`, a lag bin).
+    2. fold_tempo refines it at that octave to a precise `bpm` plus the beat `phase`.
+    3. `candidates` is the octave family of the refined bpm (x0.25..x4 inside a musical
+       range). Octave error (x2 / x0.5) is every tracker's failure mode, so the browser
+       still lets the online lookup / library choose the octave. The refined value then
+       wins over a lookup that agrees within ~2% (pickBpmCandidate / reconcileBpm).
 
-    Returns {duration, raw_bpm, candidates:[...]} — all floats rounded to 2 dp.
+    Lazy imports so the server still starts if librosa is absent (the endpoint returns 503
+    and the browser falls back to its JS detector).
+
+    Returns {duration, raw_bpm, bpm, phase, confidence, drift, candidates}. Candidates
+    and raw_bpm are 2 dp; bpm 3 dp; phase 4 dp (seconds).
     """
     import numpy as np
     import librosa
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
     duration = float(len(y) / sr) if sr else 0.0
     raw = float(np.atleast_1d(librosa.beat.beat_track(y=y, sr=sr)[0])[0])
-    cands = sorted({round(raw * m, 2) for m in (0.25, 0.5, 1, 2, 4)
-                    if lo * 0.95 <= raw * m <= hi * 1.05})
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=TEMPO_HOP)
+    fit = fold_tempo(env, TEMPO_HOP / sr, raw)
+    bpm = fit['bpm']
+    cands = sorted({round(bpm * m, 2) for m in (0.25, 0.5, 1, 2, 4)
+                    if lo * 0.95 <= bpm * m <= hi * 1.05})
     if not cands:
-        cands = [round(raw, 2)]
-    return {'duration': round(duration, 3), 'raw_bpm': round(raw, 2), 'candidates': cands}
+        cands = [round(bpm, 2)]
+    return {'duration': round(duration, 3), 'raw_bpm': round(raw, 2),
+            'bpm': round(bpm, 3), 'phase': round(fit['phase'], 4),
+            'confidence': round(fit['confidence'], 3), 'drift': fit['drift'],
+            'candidates': cands}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1343,6 +1490,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             parts = body.split(b'--' + boundary)
             filename = "audio.mp3"
             file_bytes = None
+            silence = 0.0   # optional 'silence_secs' field: prepend a beat-1 pad
 
             for part in parts[1:]:
                 if part.strip() in (b'', b'--', b'--\r\n'):
@@ -1356,10 +1504,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     continue
 
                 headers = header_block.decode('utf-8', errors='replace')
+                part_body = re.sub(rb'\r?\n$', b'', part_body)
+                field = re.search(r'name=["\']([^"\']+)["\']', headers)
+                if field and field.group(1) == 'silence_secs':
+                    try:
+                        silence = min(max(float(part_body.decode('utf-8', 'replace').strip()), 0.0), 2.0)
+                    except ValueError:
+                        pass
+                    continue
                 fn_match = re.search(r'filename=["\']?([^"\';\r\n]+)', headers)
                 if fn_match:
                     filename = fn_match.group(1).strip()
-                part_body = re.sub(rb'\r?\n$', b'', part_body)
                 if part_body:
                     file_bytes = part_body
 
@@ -1368,11 +1523,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             ext = os.path.splitext(filename)[1].lower() or ".mp3"
 
-            if ext == ".ogg":
+            if ext == ".ogg" and silence <= 0:
                 ogg_bytes = file_bytes
             else:
-                print(f"  Converting {filename} ({len(file_bytes)//1024} KB) → OGG…")
-                ogg_bytes = convert_to_ogg(file_bytes, ext, silence_secs=0.0)
+                pad_desc = f" with a {silence:.3f}s beat-1 pad" if silence > 0 else ""
+                print(f"  Converting {filename} ({len(file_bytes)//1024} KB) → OGG{pad_desc}…")
+                ogg_bytes = convert_to_ogg(file_bytes, ext, silence_secs=silence)
                 print(f"  Done — {len(ogg_bytes)//1024} KB OGG")
 
             self.send_response(200)
@@ -1608,6 +1764,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             audio_bytes   = None
             audio_ext     = '.mp3'
             bpm           = 120.0
+            pad_secs      = 0.0   # beat-1 pad from the app (audioPadSecs)
             enabled_stems = None  # None → all enabled (default)
 
             for part in parts[1:]:
@@ -1633,6 +1790,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         bpm = float(part_body.decode('utf-8', errors='replace').strip())
                     except ValueError:
                         pass
+                elif field_name == 'pad' and part_body:
+                    try:
+                        pad_secs = min(max(float(part_body.decode('utf-8', errors='replace').strip()), 0.0), 2.0)
+                    except ValueError:
+                        pass
                 elif field_name == 'enabled_stems' and part_body:
                     try:
                         parsed = json.loads(part_body.decode('utf-8', errors='replace').strip())
@@ -1646,14 +1808,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             disabled = [] if enabled_stems is None else [k for k, v in enabled_stems.items() if not v]
             print(f'  /analyse_stems — {len(audio_bytes)//1024} KB {audio_ext}'
-                  f' bpm={bpm} device={device}'
+                  f' bpm={bpm} pad={pad_secs:.3f}s device={device}'
                   + (f' disabled={disabled}' if disabled else ''))
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 print('  Running Demucs separation…')
                 stems = separate_stems(audio_bytes, audio_ext, tmpdir)
                 print('  Running per-stem analysis…')
-                analysis = analyse_stems(stems, bpm, enabled_stems)
+                analysis = analyse_stems(stems, bpm, enabled_stems, pad_secs)
 
             payload = json.dumps(analysis, cls=_NumpyEncoder, separators=(',', ':')).encode('utf-8')
             print(f'  /analyse_stems — done, {len(payload)//1024} KB')
@@ -1732,7 +1894,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     f.write(audio_bytes)
                 bpm_info = detect_bpm_librosa(tmp)
             print(f"  /detect_bpm — {len(audio_bytes)//1024} KB {audio_ext} → "
-                  f"raw={bpm_info['raw_bpm']} cands={bpm_info['candidates']}")
+                  f"raw={bpm_info['raw_bpm']} refined={bpm_info['bpm']} "
+                  f"phase={bpm_info['phase']}s conf={bpm_info['confidence']} "
+                  f"drift={bpm_info['drift']} cands={bpm_info['candidates']}")
 
             payload = json.dumps(bpm_info, separators=(',', ':')).encode('utf-8')
             self.send_response(200)
@@ -1857,6 +2021,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             offset     = float(track_obj.get('Offset', 0))
             clip_start = float(track_obj.get('clipStart', 0))
             clip_end   = float(track_obj.get('clipEnd',   0))
+            # Beat-1 pad the map was generated with (app audioPadSecs): prepended as silence so
+            # the audio matches the map clock. Clamped: a pad is under one beat period.
+            audio_pad  = min(max(float(track_obj.get('AudioPad', 0) or 0), 0.0), 2.0)
             notes      = track_obj.get('notes', [])
 
             # Deterministic UUID v5 from title+artist — game uses this as the map's unique key
@@ -2001,9 +2168,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if audio_bytes:
                 audio_ext = os.path.splitext(audio_filename)[1].lower() if audio_filename else '.ogg'
                 clip_desc = f", clip {clip_start:.1f}s–{clip_end:.1f}s" if (clip_start or clip_end) else ""
-                print(f"  Re-encoding audio ({audio_ext}) → OGG Vorbis{clip_desc}…")
+                pad_desc  = f", beat-1 pad {audio_pad:.3f}s" if audio_pad > 0 else ""
+                print(f"  Re-encoding audio ({audio_ext}) → OGG Vorbis{clip_desc}{pad_desc}…")
                 audio_bytes = convert_to_ogg(audio_bytes, audio_ext,
-                                             silence_secs=0.0,
+                                             silence_secs=audio_pad,
                                              clip_start=clip_start, clip_end=clip_end)
                 print(f"  Done — {len(audio_bytes)//1024} KB")
 

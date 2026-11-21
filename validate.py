@@ -11,8 +11,11 @@ generator change, or across the whole synthfiles/ corpus, to catch breakage mech
 USAGE:
     py -3.12 validate.py <file.synth | folder> [more ...]
     py -3.12 validate.py            # defaults to ../synthfiles + this folder's debug export
+    py -3.12 validate.py --timing debug_last_export.synth   # + beat grid vs the map's own audio
 
 Exit code = number of files with HARD violations (0 = all clean). Stats never fail.
+--timing (needs librosa) refits the beat on the exported OGG: map BPM error, how far the map's
+integer beats sit from the music's beats, and per-quarter drift (see timing_check).
 
 COORDINATE NOTES (from server.py /export):
     Position = [x, y, z];  x = _x + 0.002,  y = ROW_Y8[row] + 0.0012,  z = (beat/bps)*20
@@ -284,7 +287,63 @@ def validate_diff(meta, diff, walls=None, song_dur=None):
     return hard, soft, stats
 
 
-def validate_file(path):
+def timing_check(path, meta):
+    """--timing: refit the beat on the exported OGG and compare it with the map's own grid.
+
+    The map clock is z = (beat/bps)*20, so map beat k is at k*60/BPM s from the start of the
+    exported audio. Reports, from the onset envelope of that audio:
+      - audio tempo (fold_tempo near the map BPM), the map BPM error, and how many beats the
+        map grid slides against the music over the whole song;
+      - phase of the music's beats on the MAP lattice (0 = integer map beats are music beats),
+        overall and per quarter of the song (a trend = BPM off; a lone ±0.5 = off-beat accents);
+      - a cross-check from librosa's beat tracker (an independent estimator): the circular mean
+        of its beat times on the map lattice, per quarter.
+    Returns (lines, soft_warnings). Needs librosa (lazy import), hence opt-in.
+    """
+    import tempfile
+    import numpy as np
+    import librosa
+    from server import TEMPO_HOP, ONSET_ENV_LATENCY, fold_tempo, lattice_phase
+    z = zipfile.ZipFile(path)
+    oggs = [n for n in z.namelist() if n.lower().endswith('.ogg')]
+    if not oggs:
+        return [], ['timing: no OGG inside the .synth']
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, 'audio.ogg')
+        with open(p, 'wb') as f:
+            f.write(z.read(oggs[0]))
+        y, sr = librosa.load(p, sr=22050, mono=True)
+    bpm = float(meta.get('BPM', 120))
+    P, dur, dt = 60.0 / bpm, len(y) / sr, TEMPO_HOP / sr
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=TEMPO_HOP)
+    fit = fold_tempo(env, dt, bpm)
+    grid = lattice_phase(env, dt, bpm)
+    wrap = lambda v: float((v + 0.5) % 1.0 - 0.5)
+    ph = wrap(grid['phase'] / P)                          # beats; music beat minus map beat
+    quarters = [round(wrap(ph + q), 3) for q in grid['drift']]
+    err_pct = (bpm - fit['bpm']) / fit['bpm'] * 100
+    slide = (bpm - fit['bpm']) / 60.0 * dur               # map beats gained on the music
+    _, bt = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=TEMPO_HOP,
+                                    start_bpm=bpm, units='time')
+    bt = np.asarray(bt) - ONSET_ENV_LATENCY
+    circ = lambda ts: round(float(np.angle(np.exp(2j * np.pi * ts / P).mean()) / (2 * np.pi)), 3)
+    trk = [circ(bt[i]) for i in np.array_split(np.arange(len(bt)), 4) if len(i)] if len(bt) > 8 else []
+    lines = [f"timing  map BPM {bpm:g} vs audio {fit['bpm']:.3f} ({err_pct:+.2f}%, grid slides "
+             f"{slide:+.2f} beat over {dur:.0f}s) · beat conf {fit['confidence']:.2f} "
+             f"(on the map grid {grid['confidence']:.2f})",
+             f"timing  music beat vs map beat: {ph:+.3f} beat ({ph * P * 1000:+.0f} ms) · "
+             f"quarters {quarters} · beat-tracker quarters {trk}"]
+    soft = []
+    if fit['confidence'] < 1.3:   # the audio's own best lattice: no steady beat to measure
+        soft.append(f"timing: weak beat (conf {fit['confidence']:.2f}) — phase/drift unreliable")
+    if abs(slide) > 0.25:
+        soft.append(f"timing: map BPM off by {err_pct:+.2f}% — grid slides {slide:+.2f} beat over the song")
+    if abs(ph) > 0.08:
+        soft.append(f"timing: map beats sit {ph:+.2f} beat off the music's beats ({ph * P * 1000:+.0f} ms)")
+    return lines, soft
+
+
+def validate_file(path, timing=False):
     name = os.path.basename(path)
     try:
         meta = _load_meta(path)
@@ -306,11 +365,19 @@ def validate_file(path):
         for h in hard: print(f"    HARD  {h}")
         for s in soft: print(f"    soft  {s}")
         if hard: file_bad = 1
+    if timing:
+        try:
+            lines, soft = timing_check(path, meta)
+        except Exception as e:  # timing is a stat: never fail the file over it
+            lines, soft = [], [f"timing: check failed — {e}"]
+        for ln in lines: print(f"    {ln}")
+        for s in soft: print(f"    soft  {s}")
     return file_bad
 
 
 def main(argv):
-    targets = argv[1:]
+    timing = '--timing' in argv
+    targets = [a for a in argv[1:] if a != '--timing']
     if not targets:
         here = os.path.dirname(os.path.abspath(__file__))
         targets = [os.path.join(here, '..', 'synthfiles'),
@@ -327,7 +394,7 @@ def main(argv):
         print("No .synth files to validate."); return 0
     bad = 0
     for f in files:
-        bad += validate_file(f)
+        bad += validate_file(f, timing)
     print(f"\n{'='*60}\n{len(files)} file(s) checked — {bad} with HARD violation(s).")
     return bad
 

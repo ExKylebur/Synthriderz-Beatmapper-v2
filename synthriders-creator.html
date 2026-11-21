@@ -1741,6 +1741,14 @@ let audioFileData = null;
 let audioRawFile  = null;  // original File object for direct FormData use
 let audioOggData = null;
 let audioHasSilence = false; // kept for backward-compat; always false — silence feature removed
+// Beat-1 pad (2026-11-21). The map grid is anchored at t=0 (snapBeat, every `% 4` pass), but a
+// song's first beat sits anywhere in its first beat period (measured 20-560 ms). So at Generate
+// the app prepends `audioPadSecs` of silence (beatPadSecs) to everything time-based: the analysed
+// stems (server pad field), in-app playback (audioBuffer = padded copy of audioBufferRaw), lyric
+// cue times and the exported OGG (AudioPad → convert_to_ogg silence_secs). Integer map beats then
+// ARE the music's beats, and every beat-space pass stays correct unchanged.
+let audioBufferRaw = null;  // the decoded upload, never padded
+let audioPadSecs   = 0;     // pad currently applied to audioBuffer (and so to the current map)
 let _audioHash     = null;  // SHA-256[:16] of the loaded audio bytes; used for library lookup
 let _bpmProtected  = false; // true when loadLibraryEntry set BPM; prevents detectBPM overwrite
 let coverFileData  = null;
@@ -2348,8 +2356,10 @@ function newSong(skipConfirm = false) {
   // Reset audio
   if (isPlaying) togglePlay();
   audioBuffer = null; audioFileData = null; audioOggData = null; audioRawFile = null; audioHasSilence = false;
+  audioBufferRaw = null; audioPadSecs = 0;
   _audioHash = null;
   _bpmProtected = false;
+  window._bpmSrv = null; window._bpmCandidates = null;   // the old song's tempo measurement
   audioFileName = 'song.ogg';
   if (audioCtx) { audioCtx.close(); audioCtx = null; }
   // Clear the file input values so re-selecting the same file fires the change event
@@ -4095,6 +4105,9 @@ async function analyseAudioServer(bpm, statusEl, enabledStems) {
     throw new Error('No audio file loaded');
   }
   form.append('bpm', String(bpm));
+  // Beat-1 pad: the server prepends it to every stem, so onsets and per-beat curves come back
+  // on the map clock (same silence the export adds).
+  form.append('pad', String(audioPadSecs || 0));
   // Send enabled_stems so server skips onset/region detection for disabled stems
   const _stemFlags = enabledStems || { drums: true, bass: true, vocals: true, other: true };
   form.append('enabled_stems', JSON.stringify(_stemFlags));
@@ -8030,12 +8043,99 @@ async function detectBPMServer(bytes, filename) {
 // snap to the nearest candidate — librosa fixes the tempo grid, the reference fixes the octave.
 // WITHOUT one, prefer the in-band candidate nearest the felt 120 (same bias the JS detector had;
 // the online-lookup step then reconciles when title/artist are known).
+// With a reference, prefer reconcileBpm (it knows whether the candidates are measured or bins).
 function pickBpmCandidate(cands, ref) {
   if (!cands || !cands.length) return null;
   if (ref) return +cands.reduce((a, b) => Math.abs(b - ref) < Math.abs(a - ref) ? b : a).toFixed(2);
   const inBand = cands.filter(c => c >= 60 && c <= 200);
   const pool = inBand.length ? inBand : cands;
   return +pool.reduce((a, b) => Math.abs(b - 120) < Math.abs(a - 120) ? b : a).toFixed(2);
+}
+
+// Reconcile the server's tempo with a REFERENCE BPM (online lookup, library, batch catalogue).
+// Since 2026-11-21 /detect_bpm returns a MEASURED tempo (`bpm`, epoch-folded over the whole
+// song, ~0.01 BPM on a studio track) plus its octave family. A reference is a human number:
+// often rounded (Electric Love is listed at 120 but the file runs 119.88, and 120 drifts 0.3
+// beat over the song), and 45 library entries are old lag bins. So the reference only picks
+// the octave; the measurement at that octave wins when the two agree within BPM_REF_AGREE.
+// An old-format response (no `bpm`; candidates are 4-5%-spaced lag bins) is the reverse: the
+// reference wins within BPM_BIN_AGREE of the nearest bin, since a bin is only good to ±half a bin.
+// A reference that is ITSELF a lag bin (a stored library value from before the fix) carries the
+// bin's ±half-bin error, so it agrees with a measurement over BPM_BIN_AGREE: Electric Love's
+// stored 117.45 sits 2.07% from the measured 119.88.
+// Returns null without candidates or a reference, else { bpm, source, agree, rel }:
+//   agree=true  → use `bpm` (source 'measured' or 'reference');
+//   agree=false → a genuine (non-octave) conflict; `bpm` is the nearest measured/bin octave.
+const BPM_REF_AGREE = 0.02;
+const BPM_BIN_AGREE = 0.05;
+function isLagBinBpm(bpm) {   // 60·22050/(512·lag) at some octave, as stored (2 dp)
+  for (const m of [0.25, 0.5, 1, 2, 4]) {
+    const lag = Math.round(60 * 22050 / (512 * bpm / m));
+    if (lag > 0 && Math.abs(60 * 22050 / (512 * lag) * m - bpm) <= 0.006) return true;
+  }
+  return false;
+}
+function reconcileBpm(srv, ref) {
+  const cands = (srv && Array.isArray(srv.candidates)) ? srv.candidates : [];
+  if (!cands.length || !(ref > 0)) return null;
+  const measured = typeof srv.bpm === 'number' && srv.bpm > 0;
+  // Measured: each candidate's octave of the unrounded value (keeps the server's range filter).
+  const family = measured ? cands.map(c => srv.bpm * 2 ** Math.round(Math.log2(c / srv.bpm))) : cands;
+  const near = family.reduce((a, b) => Math.abs(b - ref) < Math.abs(a - ref) ? b : a);
+  const rel = Math.abs(near - ref) / ref;
+  const tol = isLagBinBpm(ref) ? BPM_BIN_AGREE : BPM_REF_AGREE;
+  if (measured) return { bpm: +near.toFixed(2), source: 'measured', agree: rel <= tol, rel };
+  return rel <= BPM_BIN_AGREE
+    ? { bpm: +(+ref).toFixed(2), source: 'reference', agree: true, rel }
+    : { bpm: +near.toFixed(2), source: 'bin', agree: false, rel };
+}
+
+// ── Beat-1 pad (see audioPadSecs) ────────────────────────────────────────────
+// Seconds of silence to prepend so the map lattice k·60/bpm (anchored at t=0) lands on the
+// music's beats. srv = /detect_bpm result {bpm, phase, duration}: beats at phase + k·60/srv.bpm.
+// Returns 0 without a measurement, or when `bpm` is not an octave of the measured tempo within
+// BEAT_PAD_OCTAVE_TOL (a hand-typed or conflicting BPM: the phase would mean nothing). The
+// measured beat nearest mid-song is the anchor, so a period that differs slightly (the 2-dp BPM
+// field) splits its residual across the song instead of growing from t=0. Half-time picks
+// either of the two beat phases — both are musical beats.
+const BEAT_PAD_OCTAVE_TOL = 0.005;
+function beatPadSecs(bpm, srv) {
+  if (!(bpm > 0) || !srv || !(srv.bpm > 0) || typeof srv.phase !== 'number') return 0;
+  const oct = 2 ** Math.round(Math.log2(bpm / srv.bpm));
+  if (Math.abs(bpm / (srv.bpm * oct) - 1) > BEAT_PAD_OCTAVE_TOL) return 0;
+  const Pm = 60 / srv.bpm, P = 60 / bpm;
+  const mid = (srv.duration || 0) / 2;
+  const anchor = srv.phase + Math.max(0, Math.round((mid - srv.phase) / Pm)) * Pm;
+  const pad = (P - (((anchor % P) + P) % P)) % P;
+  return (pad < 0.001 || pad > P - 0.001) ? 0 : +pad.toFixed(4);
+}
+
+// Copy of an AudioBuffer with `secs` of silence in front (every channel).
+function padAudioBuffer(ctx, buf, secs) {
+  const n = Math.round(secs * buf.sampleRate);
+  if (!(n > 0)) return buf;
+  const out = ctx.createBuffer(buf.numberOfChannels, buf.length + n, buf.sampleRate);
+  for (let c = 0; c < buf.numberOfChannels; c++) out.getChannelData(c).set(buf.getChannelData(c), n);
+  return out;
+}
+
+// Make audioBuffer the raw upload padded for `bpm`; returns the pad (s). Called at Generate,
+// before anything reads audioBuffer.duration, so the analysis, totalBeats and playback agree.
+function applyBeatPad(bpm) {
+  if (!audioBufferRaw) return audioPadSecs;
+  const pad = beatPadSecs(bpm, window._bpmSrv);
+  if (Math.abs(pad - audioPadSecs) > 1e-4 || !audioBuffer) {
+    if (isPlaying) togglePlay();
+    audioBuffer  = pad > 0 ? padAudioBuffer(audioCtx, audioBufferRaw, pad) : audioBufferRaw;
+    audioPadSecs = pad;
+  }
+  const srv = window._bpmSrv;
+  console.log(srv && srv.bpm
+    ? `[BeatPad] ${pad.toFixed(3)}s of silence before beat 1 (map ${bpm} BPM, measured ${srv.bpm}, phase ${srv.phase}s)` +
+      (pad === 0 && !(Math.abs(bpm / (srv.bpm * 2 ** Math.round(Math.log2(bpm / srv.bpm))) - 1) <= BEAT_PAD_OCTAVE_TOL)
+        ? ' — BPM is not an octave of the measurement, so no pad' : '')
+    : '[BeatPad] no tempo measurement — grid stays anchored at t=0');
+  return pad;
 }
 
 // ── Demucs availability flag ──────────────────────────────────────────────
@@ -8239,6 +8339,7 @@ document.getElementById('audioFile').addEventListener('change', async e => {
     statusEl.textContent = 'Decoding audio…';
     if (!audioCtx) audioCtx = new AudioContext();
     audioBuffer = await audioCtx.decodeAudioData(bytes.slice(0));
+    audioBufferRaw = audioBuffer; audioPadSecs = 0;   // the pad is applied at Generate (applyBeatPad)
     document.getElementById('playBtn').disabled = false;
     const dur = audioBuffer.duration;
     const musicDur = dur;
@@ -8254,11 +8355,23 @@ document.getElementById('audioFile').addEventListener('change', async e => {
     statusEl.textContent = 'Detecting BPM…';
     let detectedBpm;
     window._bpmCandidates = null;
+    window._bpmSrv = null;        // full /detect_bpm result: measured bpm + phase (see reconcileBpm)
     const _srvBpm = await detectBPMServer(bytes, filename);
     if (_srvBpm) {
       window._bpmCandidates = _srvBpm.candidates;
+      window._bpmSrv = _srvBpm;
       detectedBpm = pickBpmCandidate(_srvBpm.candidates, null);
-      console.log(`[BPM] librosa raw=${_srvBpm.raw_bpm} cands=[${_srvBpm.candidates}] → ${detectedBpm} (octave reconciled vs lookup if title/artist known)`);
+      console.log(`[BPM] librosa raw=${_srvBpm.raw_bpm} measured=${_srvBpm.bpm ?? 'n/a'} phase=${_srvBpm.phase ?? 'n/a'}s conf=${_srvBpm.confidence ?? 'n/a'} drift=[${_srvBpm.drift ?? ''}] cands=[${_srvBpm.candidates}] → ${detectedBpm} (octave reconciled vs lookup if title/artist known)`);
+      // A library entry loaded while detection ran (_bpmProtected) set its stored BPM. Stored
+      // values can be old lag bins: let the measurement win when it agrees on the octave.
+      if (_bpmProtected) {
+        const _cur = parseFloat(document.getElementById('bpm').value);
+        const _r = reconcileBpm(_srvBpm, _cur);
+        if (_r && _r.agree && Math.abs(_r.bpm - _cur) > 0.01) {
+          console.log(`[BPM] library value ${_cur} → measured ${_r.bpm} (same octave, ${(_r.rel * 100).toFixed(1)}% apart)`);
+          applyBPM(_r.bpm);
+        }
+      }
     } else {
       detectedBpm = await detectBPM(audioBuffer);
       console.log(`[BPM] JS autocorrelation → ${detectedBpm}${SERVER_MODE ? ' (librosa unavailable — fell back)' : ''}`);
@@ -8310,21 +8423,16 @@ document.getElementById('audioFile').addEventListener('change', async e => {
         const looked = await lookupBPMProgrammatic(_t, _a);
         if (!looked || _bpmProtected) return;
         const cur = parseFloat(document.getElementById('bpm').value) || detectedBpm;
-        // Octave reconciliation: when we have librosa's candidate family, trust its tempo grid
-        // and let the lookup choose the octave — snap to the candidate nearest the looked-up
-        // value. This auto-fixes the half/double errors (e.g. 72↔144) without bothering the
-        // user. Only fall through to the manual Use/Keep banner if even the best candidate
-        // still disagrees with the lookup (genuine conflict, not just an octave).
-        const cands = window._bpmCandidates;
-        if (cands && cands.length) {
-          const snapped = cands.reduce((a, b) => Math.abs(b - looked) < Math.abs(a - looked) ? b : a);
-          if (Math.abs(snapped - looked) / looked <= 0.05) {
-            if (Math.abs(snapped - cur) > 0.01) {
-              applyBPM(+snapped.toFixed(2));
-              console.log(`[BPM] reconciled librosa↔lookup → ${snapped} (lookup said ${looked}, was ${cur})`);
-            }
-            return;
-          }
+        // Octave reconciliation (reconcileBpm): the lookup chooses the octave. A measured tempo
+        // at that octave wins when the lookup agrees within 2% (lookups are rounded: "120" for a
+        // file that runs 119.88). Against an old bin-only response the lookup wins within 5%.
+        // This auto-fixes the half/double errors (e.g. 72↔144) without bothering the user. Only
+        // a genuine (non-octave) conflict falls through to the manual Use/Keep banner.
+        const r = reconcileBpm(window._bpmSrv || { candidates: window._bpmCandidates }, looked);
+        if (r && r.agree) {
+          if (Math.abs(r.bpm - cur) > 0.01) applyBPM(r.bpm);
+          console.log(`[BPM] reconciled librosa↔lookup → ${r.bpm} (${r.source}; lookup said ${looked}, was ${cur})`);
+          return;
         }
         if (cur > 0 && Math.abs(looked - cur) / cur > 0.03) showBpmLookupBanner(+cur.toFixed(2), looked);
       })().catch(() => {});
@@ -8858,11 +8966,25 @@ document.getElementById('exportJsonBtn').addEventListener('click', () => {
 });
 
 // ── Export Audio as OGG ──────────────────────────────────────
-document.getElementById('exportOggBtn').addEventListener('click', () => {
+document.getElementById('exportOggBtn').addEventListener('click', async () => {
   if (!audioOggData) { toast('Load an audio file first', 'error'); return; }
   const safe = (document.getElementById('title').value.trim() || 'song')
     .replace(/[^a-z0-9]+/gi, '-').toLowerCase().replace(/^-+|-+$/g, '') || 'song';
-  const blob = new Blob([audioOggData], { type: 'audio/ogg' });
+  // The clipboard notes are on the map clock, which starts audioPadSecs before the song: the
+  // editor needs the same padded audio (server re-encode with silence_secs).
+  let bytes = audioOggData;
+  if (audioPadSecs > 0) {
+    if (!SERVER_MODE) { toast('This map has a beat-1 pad; padding the OGG needs the local server', 'error'); return; }
+    try {
+      const fd = new FormData();
+      fd.append('file', new Blob([audioOggData], { type: 'audio/ogg' }), safe + '.ogg');
+      fd.append('silence_secs', String(audioPadSecs));
+      const r = await fetch('/convert', { method: 'POST', body: fd });
+      if (!r.ok) throw new Error(await r.text());
+      bytes = await r.arrayBuffer();
+    } catch (e) { toast('Padding the OGG failed: ' + (e.message || e), 'error'); return; }
+  }
+  const blob = new Blob([bytes], { type: 'audio/ogg' });
   const url  = URL.createObjectURL(blob);
   const a    = document.createElement('a');
   a.href = url; a.download = safe + '.ogg'; a.click();
@@ -8888,7 +9010,7 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
 
   // Clamp clipEnd to actual music duration.
   // clipEnd is always expressed in original-music time (seconds from music start, not
-  const _musicDur = audioBuffer ? audioBuffer.duration : 0;
+  const _musicDur = (audioBufferRaw || audioBuffer) ? (audioBufferRaw || audioBuffer).duration : 0;  // unpadded
   let effectiveClipEnd = clipEnd;
   if (audioBuffer && effectiveClipEnd > 0 && effectiveClipEnd > _musicDur + 0.5) {
     const actual = secsToMmss(_musicDur);
@@ -8918,6 +9040,9 @@ document.getElementById('exportBtn').addEventListener('click', async () => {
     Offset:     parseFloat(offset),
     clipStart,
     clipEnd: effectiveClipEnd,
+    // Beat-1 pad this map was generated with: the server prepends it to the OGG (silence_secs),
+    // so the audio matches the map clock. Offset stays 0 (what the game does with it is unknown).
+    AudioPad:   audioPadSecs || 0,
     DifficultyName: diffName,
     notes: trackNotes,
     crouchs: walls.filter(w => w.wallType === 'crouch').map(w => ({ beat: w.beat, duration: w.duration })),
@@ -11500,6 +11625,10 @@ document.getElementById('generateBtn').addEventListener('click', async () => {
   const artist   = document.getElementById('artist').value.trim();
   const bpm      = parseFloat(document.getElementById('bpm').value) || 120;
 
+  // Beat-1 pad FIRST: it changes audioBuffer.duration, which totalBeats, the analysis and the
+  // critic all read below. A changed pad or BPM means a fresh analysis (cache is per click).
+  applyBeatPad(bpm);
+
   // Always recompute totalBeats from the actual audio buffer at the current BPM before
   // generating. The UI value may be stale if the BPM was auto-detected incorrectly and
   // then corrected manually, or if a library entry set BPM without triggering the input
@@ -12233,9 +12362,10 @@ Rules:
         // missing the song's later half). Cues without `t` (LLM-guessed) pass through as-is.
         lyricCues: (() => {
           if (!lastLyricCues || !lastLyricCues.length) return lastLyricCues || null;
+          // `t` is in the song's own time; the map clock starts audioPadSecs earlier.
           const _bps = (parseFloat(document.getElementById('bpm')?.value) || 120) / 60;
           return lastLyricCues.map(c => (typeof c.t === 'number')
-            ? { ...c, beat: Math.max(0, Math.round(c.t * _bps)) }
+            ? { ...c, beat: Math.max(0, Math.round((c.t + audioPadSecs) * _bps)) }
             : c);
         })(),
         // Stem enable flags — null means all enabled (default, no hint overhead)
@@ -14101,7 +14231,16 @@ async function loadLibraryEntry(entry) {
   // Protect against the detectBPM race: if this runs before BPM detection finishes,
   // the flag prevents the detected value from overwriting what the library set.
   _bpmProtected = true;
-  applyBPM(entry.bpm || 120);
+  // Stored BPMs can be old lag bins (45 of 82 were, 2026-11-21). If this audio was already
+  // measured, the measurement wins at the stored octave (reconcileBpm); if detection is still
+  // running, the upload handler applies the same rule when it finishes.
+  {
+    const _stored = entry.bpm || 120;
+    const _r = reconcileBpm(window._bpmSrv, _stored);
+    if (_r && _r.agree && Math.abs(_r.bpm - _stored) > 0.01)
+      console.log(`[BPM] library value ${_stored} → measured ${_r.bpm} (same octave, ${(_r.rel * 100).toFixed(1)}% apart)`);
+    applyBPM(_r && _r.agree ? _r.bpm : _stored);
+  }
   const genreEl = document.getElementById('genre');
   if (genreEl && entry.genre) {
     genreEl.value = entry.genre;
@@ -14422,7 +14561,7 @@ async function batchExportToPath(outputPath) {
   const trackData = {
     Title: title, Artist: artist, Mapper: mapper,
     BPM: parseFloat(bpm), Offset: parseFloat(offset),
-    clipStart, clipEnd, DifficultyName: diffName,
+    clipStart, clipEnd, AudioPad: audioPadSecs || 0, DifficultyName: diffName,   // AudioPad: see exportBtn
     notes: trackNotes,
     crouchs: walls.filter(w => w.wallType === 'crouch')
              .map(w => ({ beat: w.beat, duration: w.duration })),
@@ -14492,6 +14631,7 @@ async function _processBatchItem(file, i) {
   audioOggData  = bytes.slice(0);
   if (!audioCtx) audioCtx = new AudioContext();
   audioBuffer = await audioCtx.decodeAudioData(bytes.slice(0));
+  audioBufferRaw = audioBuffer; audioPadSecs = 0;     // the pad is applied at Generate (applyBeatPad)
   document.getElementById('playBtn').disabled = false;
   const dur = audioBuffer.duration;
   document.getElementById('clipStart').value = '0:00';
@@ -14522,10 +14662,14 @@ async function _processBatchItem(file, i) {
       const _cat = entry.bpm || 120;
       updateBatchItem(i, { status: 'Reconciling BPM…' });
       const _srvCat = await detectBPMServer(bytes, filename);
+      window._bpmSrv = _srvCat;
       if (_srvCat && Array.isArray(_srvCat.candidates) && _srvCat.candidates.length) {
-        const _snap = pickBpmCandidate(_srvCat.candidates, _cat);
-        if (Math.abs(_snap - _cat) / _cat <= 0.05) {
-          applyBPM(_cat);                                  // librosa confirms catalogued octave → keep verified value
+        // Agreeing octave → measured value (or the catalogued one vs a bin-only response).
+        const _r = reconcileBpm(_srvCat, _cat);
+        if (_r && _r.agree) {
+          if (Math.abs(_r.bpm - _cat) > 0.01)
+            console.log(`[Batch] "${entry.title || filename}" catalogued BPM ${_cat} → ${_r.source} ${_r.bpm}`);
+          applyBPM(_r.bpm);                                // librosa confirms catalogued octave
         } else {
           const _libPick = pickBpmCandidate(_srvCat.candidates, null);
           console.warn(`[Batch] "${entry.title || filename}" catalogued BPM ${_cat} disagrees with librosa (raw ${_srvCat.raw_bpm}, cands [${_srvCat.candidates}]) → using librosa ${_libPick}`);
@@ -14566,6 +14710,7 @@ async function _processBatchItem(file, i) {
     updateBatchItem(i, { status: 'Detecting BPM…' });
     // Server-side librosa first (full-clip), JS autocorrelation as fallback — same as upload.
     const _srvBpm = await detectBPMServer(bytes, filename);
+    window._bpmSrv = _srvBpm;
     let _cands = null;
     if (_srvBpm) {
       _cands = _srvBpm.candidates;
@@ -14580,11 +14725,11 @@ async function _processBatchItem(file, i) {
       updateBatchItem(i, { status: 'Looking up BPM…' });
       const onlineBpm = await lookupBPMProgrammatic(title, artist);
       if (onlineBpm) {
-        // Octave reconciliation: snap librosa's tempo grid to the looked-up octave when close;
-        // otherwise defer to the lookup value (its own authority) as before.
+        // Octave reconciliation (reconcileBpm): the lookup picks the octave and the measured
+        // value wins when they agree; a genuine conflict defers to the lookup as before.
         if (_cands && _cands.length) {
-          const snapped = _cands.reduce((a, b) => Math.abs(b - onlineBpm) < Math.abs(a - onlineBpm) ? b : a);
-          applyBPM(Math.abs(snapped - onlineBpm) / onlineBpm <= 0.05 ? +snapped.toFixed(2) : onlineBpm);
+          const _r = reconcileBpm(_srvBpm, onlineBpm);
+          applyBPM(_r && _r.agree ? _r.bpm : onlineBpm);
         } else {
           applyBPM(onlineBpm);
         }
