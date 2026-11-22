@@ -44,20 +44,22 @@ The generator reshapes some sections into deliberate choreography. Sampled notes
 
 **Hard limits:** `issues` ≤6 entries (CRITICAL first, then highest point cost; consolidate related ones). `suggestions` ≤5. Each string ≤200 chars, no newlines. `metrics`: only the fields below.
 
-```json
+Schema: replace every `<…>` placeholder with a real value; the output must be valid JSON. Sub-scores are your own judgement of THIS map (integers 0–100, see SCORING); every other metric is echoed from the `map` input.
+
+```
 {
-  "score": 82,
-  "pass": true,
+  "score": <0-100>,
+  "pass": <true|false>,
   "issues": ["Right hand 71% — target 45-55%, chorus drives skew.", "Rail% 4% vs 5-20% — verses need rails."],
   "suggestions": ["hand_balance: reduce right-hand from 71% to 50% in region 48.0s-80.0s", "rail_pct: increase from 4% to 15% — add rails to verse1 (10s-31s)"],
   "metrics": {
-    "flow_score": 88, "energy_sync_score": 74, "difficulty_adherence_score": 79, "instrument_stem_adherence_score": 65,
-    "hand_balance_pct": { "left": 29, "right": 71 },
-    "layer_distribution_pct": { "ceiling": 1, "high_plus": 3, "high": 8, "high_minus": 14, "mid_plus": 21, "mid": 22, "mid_minus": 16, "low_plus": 13, "low": 2, "low_minus": 1, "floor": 1 },
-    "rail_pct_of_notes": 24, "rail_3d_curve_pct": 62, "obstacle_count": 8, "alternating_bursts_per_min": 3.5,
-    "single_arm_section_pct": 31, "single_arm_right_pct": 52, "single_arm_left_pct": 48,
-    "squats_with_underrail_pct": 100, "floating_notes_during_rail": 2,
-    "lyric_cues_total": 8, "lyric_cues_honored": 6, "lyric_cues_missed": []
+    "flow_score": <0-100>, "energy_sync_score": <0-100>, "difficulty_adherence_score": <0-100>, "instrument_stem_adherence_score": <0-100>,
+    "hand_balance_pct": { "left": <map.hand_balance_pct.left>, "right": <map.hand_balance_pct.right> },
+    "layer_distribution_pct": <map.layer_distribution_pct, all 11 keys>,
+    "rail_pct_of_notes": <map>, "rail_3d_curve_pct": <map>, "obstacle_count": <map>, "alternating_bursts_per_min": <map>,
+    "single_arm_section_pct": <map>, "single_arm_right_pct": <0-100>, "single_arm_left_pct": <0-100>,
+    "squats_with_underrail_pct": <map>, "floating_notes_during_rail": <map>,
+    "lyric_cues_total": <int>, "lyric_cues_honored": <int>, "lyric_cues_missed": [<seconds>]
   }
 }
 ```
@@ -77,15 +79,16 @@ Actionable parameters: `density`, `hand_balance`, `rail_pct`, `row_range`, `obst
 
 ## SCORING
 
-Total = weighted average of five sub-scores:
+The overall score is computed in code: measured beat timing, flow, playability and structure, plus your four sub-scores. Your `score` field is informational only. Judge each sub-score on its own and use the full 0–100 range: **50 = a typical generated map for this tier**, 80+ only when that dimension is clearly strong with no real gaps, 30 or below when it is clearly broken. Don't default to familiar numbers or reuse one value across dimensions.
 
-| Category | Weight | Evaluate |
-|---|---|---|
-| Flow | 35% | Smooth arc-coherent movement. **Anchor on `map.flow_metrics`.** |
-| Energy sync | 26% | Dense/sparse follows musical phrasing & melodic contour, not raw loudness |
-| Difficulty adherence | 17% | Reach/jump/pattern complexity matches tier (NOT notes/sec — density is correct by construction) |
-| Genre fit | 17% | Pattern style matches genre (incl. stem adherence) |
-| Hand balance | 4% | Only flag if right/(left+right) outside 35–65% |
+| Sub-score | Evaluate |
+|---|---|
+| Flow (`flow_score`) | Smooth arc-coherent movement. **Anchor on `map.flow_metrics`.** |
+| Energy sync (`energy_sync_score`) | Dense/sparse follows musical phrasing & melodic contour, not raw loudness |
+| Difficulty adherence (`difficulty_adherence_score`) | Reach/jump/pattern complexity matches tier (NOT notes/sec — density is correct by construction) |
+| Genre fit (`instrument_stem_adherence_score`) | Pattern style matches genre (incl. stem adherence) |
+
+Hand balance: only flag if right/(left+right) is outside 35–65%.
 
 **Flow — anchor on `map.flow_metrics` (deterministic, all single-hand notes):**
 - `arc_coherence_pct {right,left,overall}` — share of triples NOT reversing across a distant jump. **≥88% good, 80–88% some jitter, <80% jittery** (→ low flow_score). One hand far below the other = call out that hand.
@@ -95,13 +98,6 @@ Total = weighted average of five sub-scores:
 - `nonpattern_big_jumps {count,max,worst[]}` — jumps over C3 limits in LOOSE sections. count>0 → flag the listed beats; these are real reachability problems the mean hides.
 
 Trust these over the sparse `note_sample`. Reward recognizable arcs/diagonal sweeps/U-turns; penalize random zigzag between distant positions (the primary flow failure).
-
-**Score bands:**
-- **90–100:** no CRITICAL; all five sub-scores ≥80; rail%, layers, hand balance, obstacle density, single-arm% all in target; intent aligns everywhere.
-- **75–89:** no CRITICAL; minor deviation in 1–2 dimensions; musically responsive, mechanically clean.
-- **68–74:** no CRITICAL; rail% ≥ synthesis floor (4–8% dense genres); hand balance within 20/80; arcs coherent. Playable despite minor gaps.
-- **60–67:** ≥1 CRITICAL, OR 3+ sub-scores <60.
-- **<60:** multiple CRITICALs or systemic failures.
 
 Score against concrete rules only — no "human vs generated" discount.
 
@@ -214,6 +210,6 @@ You receive `audio_metadata` (song, bpm, duration, genre, difficulty, energy_cur
 - rowContour (avg row first-third vs last-third): `rising` → first>last; `falling` → first<last; `arch` → middle lowest; `valley` → middle highest; `plateau` → constant ±1.
 - Misalignment → suggestion, e.g. `section_intent: chorus1 (48s-80s) intended rail-dominant but 8% rails — rail_pct: increase from 8% to 35% in region 48s-80s`.
 
-**Pass threshold:** score ≥68 AND no CRITICAL.
+**Pass/fail** is decided in code: no CRITICAL and a computed-score threshold.
 
 Analyze thoroughly against metadata and section intent. Be specific — include timestamps and values.

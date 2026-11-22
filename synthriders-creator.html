@@ -10380,6 +10380,206 @@ function runFinalSweep(notes, { beatOccupied = null, clampFn, bps, walls = null 
   return { obs, grc, c1, gold, green, c3 };
 }
 
+// ── Map score v2: measured first (2026-11-21 scoring review) ─────────────────────────
+// v1 was a weighted average of the four LLM sub-scores. On 43 clean runs it sat at 75 ± 2.8
+// (68–79): the critic picks from a small palette (flow = 88 in 56/120 calls, the prompt
+// example's value), it is sent no timing at all, and the regenerate-below-pass loop cuts off
+// the floor. v2 scores what can be measured and keeps the LLM as one rescaled input:
+//   score = 100 · Σ w·c over the components that could be measured (weights renormalised),
+// where each c ∈ [0,1] is a ramp between a "bad" and a "good" anchor. A CRITICAL caps the score
+// at SCORE_CRIT_CAP (below PASS_SCORE); ranking by fewest criticals first is unchanged.
+// Offline on 21 runs paired with their exports: 51 ± 10.6, and both known improvements (beat-1
+// pad, C3 fix) score higher. v1 scored the pad fix 79 → 74. The anchors were set from exported
+// maps. Re-fit them, and LLM_SCORE_HISTORY, from generation_diagnostics.json, which logs
+// scoreInputs + components for every iteration.
+const SCORE_VERSION = 2;
+const SCORE_WEIGHTS = { timing: 0.20, flow: 0.25, play: 0.15, struct: 0.15, sync: 0.10, llm: 0.15 };
+const SCORE_CRIT_CAP = 59;
+// [mean, sd] of each LLM sub-score over 120 critic calls (diagnostics up to 2026-11-21).
+const LLM_SCORE_HISTORY = { flow: [85.2, 5.8], energy: [72.9, 4.5], diff: [72.4, 6.1], stem: [55.8, 7.9] };
+// Mix inside the llm component: energy sync and genre fit need judgement; flow and difficulty
+// are mostly measured by the other components.
+const LLM_SCORE_MIX = { energy: 0.4, stem: 0.3, diff: 0.2, flow: 0.1 };
+// Max notes in any 1 s window above which a tier reads as too dense (validate.py NPS_SOFT).
+const SCORE_NPS_SOFT = { Easy: 4, Normal: 5, Hard: 6, Expert: 8, Master: 10 };
+// Obstacle events per minute [lo_bad, lo_good, hi_good, hi_bad]: the prompt's tier targets, widened.
+const SCORE_OBSTACLE_BAND = { Easy: [0, 2, 4, 8], Normal: [1, 3, 5, 10], Hard: [1, 4, 6, 12], Expert: [2, 5, 8, 14], Master: [2, 6, 10, 16] };
+
+// 0 at `bad`, 1 at `good`, linear between, clamped; works in either direction. null if x isn't a number.
+function scoreRamp(x, bad, good) {
+  if (!Number.isFinite(x)) return null;
+  if (bad === good) return x === good ? 1 : 0;
+  return Math.max(0, Math.min(1, (x - bad) / (good - bad)));
+}
+
+// 1 inside [loGood, hiGood], ramping to 0 at loBad / hiBad.
+function scoreBand(x, loBad, loGood, hiGood, hiBad) {
+  if (!Number.isFinite(x)) return null;
+  if (x < loGood) return scoreRamp(x, loBad, loGood);
+  if (x > hiGood) return scoreRamp(x, hiBad, hiGood);
+  return 1;
+}
+
+// Weighted mean of [value, weight] pairs. A null value drops out and its weight is shared by
+// the rest, so an unmeasured input neither helps nor hurts. null when nothing was measured.
+function scoreMix(pairs) {
+  let s = 0, w = 0;
+  for (const [v, wt] of pairs) if (v != null && Number.isFinite(v)) { s += v * wt; w += wt; }
+  return w > 0 ? s / w : null;
+}
+
+// Where the map's beat grid sits on the music, from the server's tempo measurement
+// (window._bpmSrv = /detect_bpm: bpm, phase [s], drift [measured beats per quarter], confidence,
+// duration) and the beat-1 pad applied to the audio. All results are in MAP beats:
+//   phase        music beat minus map beat at mid-song (0 = on the grid, wrapped to ±0.5);
+//   slide        how far the grid drifts from the music over the song (BPM error);
+//   worstQuarter largest |phase| in any quarter of the song (tempo drift, live playing).
+// null when there is no measurement (no librosa): the timing component then drops out.
+function timingInputs(bpm, srv, padSecs = 0) {
+  if (!(bpm > 0) || !srv || !(srv.bpm > 0) || typeof srv.phase !== 'number') return null;
+  const oct = 2 ** Math.round(Math.log2(bpm / srv.bpm));
+  const Pm = 60 / srv.bpm, P = 60 / bpm;
+  const dur = srv.duration || 0;
+  // same mid-song anchor beat as beatPadSecs, so a correctly applied pad reads phase 0
+  const anchor = srv.phase + Math.max(0, Math.round((dur / 2 - srv.phase) / Pm)) * Pm;
+  const wrap = v => ((v + 0.5) % 1 + 1) % 1 - 0.5;
+  const phase = wrap((anchor + (padSecs || 0)) / P);
+  const slide = (bpm - srv.bpm * oct) / 60 * dur;
+  const drift = Array.isArray(srv.drift) ? srv.drift.filter(Number.isFinite) : [];
+  const worstQuarter = drift.length
+    ? Math.max(...drift.map(d => Math.abs(wrap(phase + d * Pm / P))))
+    : Math.abs(phase);
+  return { phase: +phase.toFixed(3), slide: +slide.toFixed(2), worstQuarter: +worstQuarter.toFixed(3),
+           confidence: typeof srv.confidence === 'number' ? +srv.confidence.toFixed(2) : null };
+}
+
+// 0..1 timing quality from timingInputs (or validate.py --timing numbers). The slide is a hard
+// limit, not a share: a grid that drifts a beat over the song sweeps through every phase, so a
+// good mid-song phase means nothing (a 117.45 library BPM vs a measured 119.878 lines up at
+// mid-song but drifts ±4.5 beats at the ends). A weak beat (confidence < 1.3: live recording,
+// rubato) can't be measured reliably, so it shrinks toward 0.6.
+function timingScore(t) {
+  if (!t) return null;
+  const grid = scoreMix([[scoreRamp(Math.abs(t.phase), 0.25, 0.03), 0.5],
+                         [scoreRamp(t.worstQuarter, 0.35, 0.08), 0.5]]);
+  const slide = scoreRamp(Math.abs(t.slide), 1.0, 0.1);
+  let c = grid == null ? slide : slide == null ? grid : Math.min(grid, slide);
+  if (c != null && t.confidence != null && t.confidence < 1.3) c = 0.5 * c + 0.3;
+  return c;
+}
+
+// Does note density follow loudness? Pearson r between notes per ~4 s window and that window's
+// mean energy (energyCurve = per-beat RMS, 0..1). Near-silent windows are skipped. The prompt
+// says not to mirror raw energy exactly, hence only a 10% weight. null when too short to say.
+function densityEnergyR(noteBeats, energyCurve, bps, winSec = 4) {
+  if (!Array.isArray(energyCurve) || !energyCurve.length || !(bps > 0)) return null;
+  const wb = Math.max(1, Math.round(winSec * bps));
+  const nw = Math.floor(energyCurve.length / wb);
+  if (nw < 4) return null;
+  const cnt = new Array(nw).fill(0), en = new Array(nw).fill(0);
+  for (const b of noteBeats) { const k = Math.floor(b / wb); if (k >= 0 && k < nw) cnt[k]++; }
+  for (let k = 0; k < nw; k++) {
+    let s = 0;
+    for (let i = k * wb; i < (k + 1) * wb; i++) s += energyCurve[i] || 0;
+    en[k] = s / wb;
+  }
+  const emax = Math.max(...en);
+  const idx = en.map((e, k) => k).filter(k => en[k] > emax * 0.02);
+  if (idx.length < 4) return null;
+  const xs = idx.map(k => cnt[k]), ys = idx.map(k => en[k]);
+  const mx = xs.reduce((a, b) => a + b, 0) / xs.length, my = ys.reduce((a, b) => a + b, 0) / ys.length;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < xs.length; i++) {
+    const dx = xs[i] - mx, dy = ys[i] - my;
+    sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+  }
+  return sxx > 0 && syy > 0 ? +(sxy / Math.sqrt(sxx * syy)).toFixed(3) : null;
+}
+
+// Measured components, each 0..1 or null (not measured). `si` = scoreInputs from critiqueMap
+// (+ densityEnergyR), `timing` = timingInputs(...).
+function scoreComponents(si, timing) {
+  si = si || {};
+  const tier = Object.prototype.hasOwnProperty.call(SCORE_NPS_SOFT, si.difficulty) ? si.difficulty : 'Master';
+  const nps = SCORE_NPS_SOFT[tier];
+  return {
+    timing: timingScore(timing),
+    // arc coherence (rubric: ≥88 good, <80 jittery) and the longest flat line. The rubric flags
+    // 6+, but live in-app runs read 10–12 (Electric Love 2026-11-22), so 20 → 6 keeps the term
+    // graded instead of always 0. Re-fit both from logged scoreInputs.
+    flow:   scoreMix([[scoreRamp(si.arc, 80, 96), 0.7], [scoreRamp(si.flatMax, 20, 6), 0.3]]),
+    // density spikes past the tier's comfort cap, and dead air
+    play:   scoreMix([[scoreRamp(si.maxNps, nps * 1.8, nps), 0.6], [scoreRamp(si.maxGapSec, 8, 4), 0.4]]),
+    // prompt targets: rails 5–20%, gold+green 6–15% (9–11% gold plays well), single-hand
+    // balance, obstacle rate for the tier
+    struct: scoreMix([[scoreBand(si.railPct, 1, 5, 20, 30), 0.35],
+                      [scoreBand(si.specialPct, 2, 6, 15, 22), 0.25],
+                      [scoreRamp(si.balancePct, 35, 46), 0.2],
+                      [scoreBand(si.obstaclesPerMin, ...SCORE_OBSTACLE_BAND[tier]), 0.2]]),
+    sync:   scoreRamp(si.densityEnergyR, 0, 0.6),
+  };
+}
+
+// The critic's sub-scores {flow, energy, diff, stem}, each z-scored against its own history so
+// the palette's habits (flow 88, stem 48) read as "typical", then mixed. 0.5 = a typical map.
+function llmComponent(sub) {
+  if (!sub) return null;
+  const z = scoreMix(Object.entries(LLM_SCORE_MIX).map(([k, w]) => {
+    const v = sub[k], h = LLM_SCORE_HISTORY[k];
+    return [Number.isFinite(v) ? (v - h[0]) / h[1] : null, w];
+  }));
+  return z == null ? null : Math.max(0, Math.min(1, 0.5 + z / 4));
+}
+
+// → { score (0–100, or null if nothing was measured), passScore, components (0–100 ints,
+// null = not measured), version }. hasCritical caps both scores at SCORE_CRIT_CAP.
+// passScore is what the critique loop's pass gate uses: timing is fixed per song (BPM + beat
+// pad), so regenerating can't change it, and it must not make a song with an unmeasurable beat
+// burn every iteration. passScore = max(score, the score without timing): timing can lift a
+// map over the pass mark but never hold it under.
+function computeMapScore({ inputs = null, timing = null, sub = null, hasCritical = false } = {}) {
+  const c = { ...scoreComponents(inputs, timing), llm: llmComponent(sub) };
+  const mix = keys => scoreMix(keys.map(k => [c[k], SCORE_WEIGHTS[k]]));
+  const keys = Object.keys(SCORE_WEIGHTS);
+  const raw = mix(keys), rawNoTiming = mix(keys.filter(k => k !== 'timing'));
+  const cap = v => (v != null && hasCritical ? Math.min(v, SCORE_CRIT_CAP) : v);
+  const score = cap(raw == null ? null : Math.round(100 * raw));
+  const passScore = cap(raw == null ? null : Math.round(100 * Math.max(raw, rawNoTiming ?? raw)));
+  const components = {};
+  for (const k of keys) components[k] = c[k] == null ? null : Math.round(100 * c[k]);
+  return { score, passScore, components, version: SCORE_VERSION };
+}
+
+// Drop critic lines that break the prompt's DO-NOT-FLAG list. On 2026-11-21 the critic
+// flagged squat underrails in 24/24 calls (the prompt says NEVER), and in 17/24 it called
+// 8–9% gold "over target", although 9–11% gold plays well (the user's favourite maps). The
+// prompt wording alone hasn't held, so this is enforced in code. CRITICAL lines are never
+// touched. A gold-% line is dropped only while the map's gold sits in [DNF_GOLD_MIN_PCT,
+// DNF_GOLD_OK_PCT] (only "too high" past ~12%) AND the line says gold is too high. Lines that
+// say something is too low (green, the gold+green total) or are about hand balance are kept.
+const DNF_GOLD_MIN_PCT = 5;
+const DNF_GOLD_OK_PCT = 12;
+function stripDoNotFlag(lines, goldPct) {
+  const kept = [], dropped = [];
+  const goldOk = goldPct >= DNF_GOLD_MIN_PCT && goldPct <= DNF_GOLD_OK_PCT;
+  for (const s of (Array.isArray(lines) ? lines : [])) {
+    const t = String(s);
+    const squat = /squat|\bunder-?rails?\b/i.test(t);   // not "under-railed" (a rail-% complaint)
+    const goldHigh = goldOk
+      && /gold[^.;]{0,24}?\d+(\.\d+)?\s*%|\d+(\.\d+)?\s*%\s*gold|gold_pct|gold (rate|density|share|ratio|count)/i.test(t)
+      && /\bover\b|over-|overweight|excess|exceed|above|reduce|trim|remove|too (high|many|much)|elevated|gold-heavy|concentrat/i.test(t)
+      && !/increase|add more|too few|\blow\b|lower end|underused|underutili[sz]|insufficient|missing|below|hand.balance/i.test(t);
+    if (!/^CRITICAL:/i.test(t) && (squat || goldHigh)) dropped.push(t); else kept.push(t);
+  }
+  return { kept, dropped };
+}
+
+// Iteration whose map was committed: the LAST one marked isBest (each new best is marked).
+function bestIterOf(log) {
+  for (let i = (log || []).length - 1; i >= 0; i--) if (log[i]?.isBest) return log[i].iter;
+  return null;
+}
+
 async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
                            singleArmSections = [], mapSections = [], criticalOnly = false) {
 
@@ -10852,6 +11052,25 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
     })(),
   };
 
+  // ── Deterministic score inputs (score v2, see computeMapScore) ───────────────────
+  // Attached to the critique in _finalize. The loop adds densityEnergyR (it needs the full
+  // per-beat energy curve), and computeMapScore gets the timing measurement separately.
+  let maxGapSec = 0;
+  for (let i = 1; i < times.length; i++) maxGapSec = Math.max(maxGapSec, times[i] - times[i - 1]);
+  const scoreInputs = {
+    difficulty:      audioMeta.difficulty,
+    arc:             flowMetrics.arc_coherence_pct.overall,
+    flatMax:         Math.max(flowMetrics.flat_run_max.right, flowMetrics.flat_run_max.left),
+    maxNps:          maxBurst,
+    maxGapSec:       +maxGapSec.toFixed(2),
+    railPct:         +(railCount / (total || 1) * 100).toFixed(1),
+    specialPct:      +((greenCount + goldCount) / (total || 1) * 100).toFixed(1),
+    // single-hand notes only (hand_balance_pct divides by ALL notes, so 50/50 reads ~45%)
+    balancePct:      rightCount + leftCount > 0
+      ? Math.round(Math.min(rightCount, leftCount) / (rightCount + leftCount) * 100) : null,
+    obstaclesPerMin: +(mapSummary.obstacle_count / Math.max(durMin, 0.01)).toFixed(2),
+  };
+
   // Log the key stats being sent so scores can be diagnosed
   console.log('[Critic] Sending map summary:', {
     notes: mapSummary.note_count,
@@ -10967,6 +11186,18 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       result.issues = result.issues.filter(i => !_mechCrit(i));
       console.log(`[Critic] Stripped ${_llmMechCount} LLM-authored mechanical CRITICAL(s) — C1/C2/C3 are JS-verified below`);
     }
+
+    // ── DO-NOT-FLAG enforcement: squat underrails, gold % (see stripDoNotFlag) ──
+    {
+      const _goldPct = goldCount / total * 100;
+      const _iss = stripDoNotFlag(result.issues, _goldPct);
+      const _sug = stripDoNotFlag(result.suggestions, _goldPct);
+      result.issues = _iss.kept;
+      if (Array.isArray(result.suggestions)) result.suggestions = _sug.kept;
+      const _n = _iss.dropped.length + _sug.dropped.length;
+      if (_n) console.log(`[Critic] Dropped ${_n} DO-NOT-FLAG line(s) (squat underrails / gold ${_goldPct.toFixed(1)}% within ${DNF_GOLD_MIN_PCT}–${DNF_GOLD_OK_PCT}%):`, [..._iss.dropped, ..._sug.dropped]);
+    }
+    result.scoreInputs = scoreInputs;
 
     // ── C1: same-hand note off active rail path ──────────────────────────
     const c1 = _detectC1Count(currentNotes);
@@ -12294,16 +12525,17 @@ Rules:
     // iter 5: mutation only — C1–C5 structural fixes on the best result so far.
     //         Skipped entirely if the best map already has no CRITICAL violations.
     const MAX_ITER    = 5;
-    const PASS_SCORE  = 68;  // score at which the map is considered passing
-    // Lowered from 75: stem adherence is structurally capped at 55-65 in dense-genre
-    // songs due to Demucs detection limits. Maps with no CRITICALs and clean flow/energy
-    // realistically score 68-74. 75 was effectively unreachable (2/216 iterations).
-    // Canonical scoring weights — SINGLE source for the score recompute, the regression
-    // gate, and the weakest-dimension picker (previously three drifting copies that
-    // disagreed: energy .26 vs .27, hand .04 vs .05). flow/energy/diff/stem are the LLM
-    // sub-score dimensions; hand-balance is derived (not an LLM dim) so it lives separate.
+    const PASS_SCORE  = 62;  // v2 score (computeMapScore) at which the map is considered passing
+    // v2 (2026-11-21): was 68 on the v1 LLM-average scale. On a post-timing-fix what-if of 21
+    // real runs, v2 spreads 58–81; 62 passes ~80% of them on iteration 1 (v1: ~60%). A
+    // CRITICAL caps v2 at SCORE_CRIT_CAP = 59, so a map with a CRITICAL can never pass.
+    // Recalibrate from generation_diagnostics.json once ~20 v2 runs are logged.
+    // LLM sub-score weights. They now drive only the v1 score (logged next to v2 for
+    // comparison) and the weakest-dimension picker that steers the regen hints. The v2 score
+    // and the regression gate use SCORE_WEIGHTS. flow/energy/diff/stem are the LLM dims;
+    // hand balance is derived, not an LLM dim, so it lives separate.
     const DIM_WEIGHTS = { flow: 0.35, energy: 0.27, diff: 0.17, stem: 0.17 };
-    const HAND_WEIGHT = 0.04; // hand-balance contribution to the overall score
+    const HAND_WEIGHT = 0.04; // hand-balance contribution to the v1 score
     const mutationLog = [];  // per-iteration stats for the debug panel
     let critique     = null;
     let critiqueMsg  = null;
@@ -12506,12 +12738,14 @@ Rules:
       // criticalOnly mode: never full-regen after iter 1 — C1-C5 are fixed
       //   locally by mutateMap, so regenerating sections serves no purpose and
       //   causes the model to respond conversationally instead of returning JSON.
+      // The pass gate reads passScore (computeMapScore: timing can't hold a map under it).
+      const bestPassScore = bestCritique?.passScore ?? bestScore;
       const shouldFullRegen  = iter === 1 || bestNotes === null ||
-        (iter < MAX_ITER && !criticalOnly && (bestHasCriticalEarly || bestScore < PASS_SCORE));
+        (iter < MAX_ITER && !criticalOnly && (bestHasCriticalEarly || bestPassScore < PASS_SCORE));
       // At iter MAX_ITER we always run mutation if CRITICALs persist OR score is below
       // PASS_SCORE — this gives one final structural cleanup chance. Only skip when
       // the best map is already clean AND passing.
-      if (!shouldFullRegen && !bestHasCriticalEarly && bestScore >= PASS_SCORE) {
+      if (!shouldFullRegen && !bestHasCriticalEarly && bestPassScore >= PASS_SCORE) {
         console.log(`[Critic] iter ${iter} mutation skipped — best map clean & passing (score=${bestScore}). Accepting best result.`);
         break;
       }
@@ -12739,35 +12973,50 @@ Rules:
           if (_stripped.length) console.warn('[Critic] Downgraded false CRITICALs to style issues:', _stripped);
         }
 
-        // ── Recompute overall score from sub-scores ───────────────────────
-        // The LLM anchors its `score` field on familiar round numbers (62, 68…)
-        // rather than computing the weighted average from its own sub-scores.
-        // Recomputing deterministically from the sub-scores eliminates anchoring
-        // and makes iteration comparisons meaningful.
-        //
-        // Weights: see DIM_WEIGHTS (Flow 35%, Energy 27%, Difficulty 17%, Genre/Stem 17%)
-        // + HAND_WEIGHT 4% (hand balance derived from hand_balance_pct.right — 50/50=100, 70/30=20)
-        // CRITICAL penalty: ×0.85 to clearly separate critical from clean maps.
-        if (critique?.metrics && !criticalOnly) {
-          const _sm      = critique.metrics;
-          const _rPct    = _sm.hand_balance_pct?.right ?? 50;
-          const _handSc  = Math.max(0, 100 - Math.abs(_rPct - 50) * 4);
-          const _base    = Math.round(
-            (_sm.flow_score                      ?? 60) * DIM_WEIGHTS.flow   +
-            (_sm.energy_sync_score               ?? 60) * DIM_WEIGHTS.energy +
-            (_sm.difficulty_adherence_score      ?? 60) * DIM_WEIGHTS.diff   +
-            (_sm.instrument_stem_adherence_score ?? 60) * DIM_WEIGHTS.stem   +
-            _handSc * HAND_WEIGHT
-          );
+        // ── Score v2: measured first (computeMapScore, SCORE_WEIGHTS) ─────
+        // The LLM's own `score` field is discarded. v2 = timing 20% + flow 25% +
+        // playability 15% + structure 15% + density/energy sync 10% + the LLM's
+        // sub-scores rescaled against their history 15%. A CRITICAL caps it at
+        // SCORE_CRIT_CAP. v1 (the old weighted average of the LLM sub-scores, ×0.85 on a
+        // CRITICAL) is still computed and logged next to it for comparison.
+        if (critique && !criticalOnly) {
+          const _sm      = critique.metrics || {};
           const _hasCrit = critique.issues?.some(i => i.startsWith('CRITICAL:')) ?? false;
-          const _recomputed = _hasCrit ? Math.max(20, Math.round(_base * 0.85)) : _base;
-          if (_recomputed !== critique.score || _hasCrit) {
-            const _critList = _hasCrit
-              ? ' | CRITICALS: ' + (critique.issues?.filter(i => i.startsWith('CRITICAL:')).join('; ') || '(none?)')
-              : '';
-            console.log(`[Critic] Score recomputed: LLM said ${critique.score} → weighted avg ${_base}${_hasCrit ? ` × 0.85 = ${_recomputed}` : ''} (flow=${_sm.flow_score} energy=${_sm.energy_sync_score} diff=${_sm.difficulty_adherence_score} stem=${_sm.instrument_stem_adherence_score} hand=${Math.round(_handSc)})${_critList}`);
+          let _v1 = null;
+          if (critique.metrics) {
+            const _rPct   = _sm.hand_balance_pct?.right ?? 50;
+            const _handSc = Math.max(0, 100 - Math.abs(_rPct - 50) * 4);
+            const _base   = Math.round(
+              (_sm.flow_score                      ?? 60) * DIM_WEIGHTS.flow   +
+              (_sm.energy_sync_score               ?? 60) * DIM_WEIGHTS.energy +
+              (_sm.difficulty_adherence_score      ?? 60) * DIM_WEIGHTS.diff   +
+              (_sm.instrument_stem_adherence_score ?? 60) * DIM_WEIGHTS.stem   +
+              _handSc * HAND_WEIGHT
+            );
+            _v1 = _hasCrit ? Math.max(20, Math.round(_base * 0.85)) : _base;
           }
-          critique.score = _recomputed;
+          const _sub = critique.metrics ? {
+            flow: _sm.flow_score, energy: _sm.energy_sync_score,
+            diff: _sm.difficulty_adherence_score, stem: _sm.instrument_stem_adherence_score,
+          } : null;
+          const _inputs = { ...(critique.scoreInputs || {}),
+                            densityEnergyR: densityEnergyR(iterNotes.map(n => n.beat), energyCurve, bps) };
+          const _timing = timingInputs(bpm, window._bpmSrv, audioPadSecs);
+          const _v2 = computeMapScore({ inputs: _inputs, timing: _timing, sub: _sub, hasCritical: _hasCrit });
+          critique.scoreInputs     = _inputs;
+          critique.scoreTiming     = _timing;
+          critique.scoreComponents = _v2.components;
+          critique.scoreV1         = _v1;
+          critique.passScore       = _v2.passScore;   // pass gate: timing can't hold a map under
+          const _critList = _hasCrit
+            ? ' | CRITICALS: ' + (critique.issues?.filter(i => i.startsWith('CRITICAL:')).join('; ') || '(none?)')
+            : '';
+          console.log(`[Score] v2=${_v2.score}${_hasCrit ? ` (capped at ${SCORE_CRIT_CAP})` : ''} pass-gate=${_v2.passScore} v1=${_v1} LLM-said=${critique.score} | ` +
+            Object.entries(_v2.components).map(([k, v]) => `${k}=${v ?? '–'}`).join(' ') +
+            ` | timing ${_timing ? `phase=${_timing.phase} slide=${_timing.slide} worstQ=${_timing.worstQuarter} conf=${_timing.confidence}` : 'not measured'}` +
+            ` | sub flow=${_sm.flow_score} energy=${_sm.energy_sync_score} diff=${_sm.difficulty_adherence_score} stem=${_sm.instrument_stem_adherence_score}${_critList}`);
+          if (_v2.score != null) critique.score = _v2.score;
+          else if (_v1 != null) critique.score = _v1;
         }
       } catch (criticErr) {
         // Critic parse/network error — keep the current map but don't break early.
@@ -12791,7 +13040,7 @@ Rules:
       const hasCritical = critique.issues?.some(i => i.startsWith('CRITICAL:'));
       // criticalOnly: map "passes" the moment there are no CRITICAL violations,
       // regardless of numeric score — stops iterations chasing style improvements.
-      const passed = criticalOnly ? !hasCritical : (critique.score >= PASS_SCORE && !hasCritical);
+      const passed = criticalOnly ? !hasCritical : ((critique.passScore ?? critique.score) >= PASS_SCORE && !hasCritical);
 
       // Print to console
       console.log(`[Critic] Iteration ${iter}/${MAX_ITER} — score=${critique.score} pass=${passed} hasCritical=${hasCritical} mode=${shouldFullRegen ? 'full-regen' : 'mutation'}`);
@@ -12803,9 +13052,9 @@ Rules:
       {
         const sc = critique.score;
         const badge = document.getElementById('scoreBadge');
-        const [bg, border, fg] =
-          sc < 55 ? ['rgba(214,60,60,0.08)',  'rgba(214,60,60,0.35)',  'var(--red)']   :
-          sc < 75 ? ['rgba(240,160,52,0.08)', 'rgba(240,160,52,0.35)', 'var(--amber)'] :
+        const [bg, border, fg] =   // v2 scale (computeMapScore)
+          sc < 50 ? ['rgba(214,60,60,0.08)',  'rgba(214,60,60,0.35)',  'var(--red)']   :
+          sc < 70 ? ['rgba(240,160,52,0.08)', 'rgba(240,160,52,0.35)', 'var(--amber)'] :
                     ['rgba(78,203,141,0.08)', 'rgba(78,203,141,0.35)', 'var(--green)'];
         badge.style.cssText = `display:block;margin-top:6px;padding:6px 12px;border-radius:6px;text-align:center;font-family:'Space Mono',monospace;font-size:12px;font-weight:700;background:${bg};border:1px solid ${border};color:${fg};`;
         badge.textContent = `Pass ${iter}/${MAX_ITER}: ${sc}/100${passed ? ' ✓' : hasCritical ? ' ⚠ critical' : ' — refining…'}`;
@@ -12832,31 +13081,34 @@ Rules:
       const currentCritCount = critique.issues?.filter(i => i.startsWith('CRITICAL:')).length ?? 0;
       const bestHasCritical  = bestCritCount > 0;
 
-      // ── Update per-dimension peak scores ─────────────────────────────────
-      for (const [key, val] of Object.entries(scoreBreakdown)) {
-        if (val !== null) bestDimScores[key] = Math.max(bestDimScores[key] ?? 0, val);
+      // v2 components (0–100 each, null = not measured), from computeMapScore above
+      const componentScores = critique.scoreComponents ?? {};
+
+      // ── Update per-component peak scores ─────────────────────────────────
+      for (const [key, val] of Object.entries(componentScores)) {
+        if (val != null) bestDimScores[key] = Math.max(bestDimScores[key] ?? 0, val);
       }
 
       // ── Regression gate: weighted regression check ───────────────────────
-      // Each dimension's score drop is multiplied by its scoring weight before
-      // being summed. This prevents low-weight dimensions (stem 17%, diff 17%)
-      // from blocking a genuinely better map just because they regressed slightly.
+      // Each v2 component's drop from its best-so-far is multiplied by its weight
+      // (SCORE_WEIGHTS) before being summed, so a small loss in a low-weight
+      // component can't block a genuinely better map.
       //
-      // Threshold = 4.0 weighted points. Examples:
-      //   Flow (35%) drops 12 pts → 4.2 → BLOCKED  (large Flow loss is real)
-      //   Stem (17%) drops 10 pts → 1.7 → passes  (small weight, OK trade-off)
-      //   Flow drops 7 + Stem drops 10 → 2.45+1.70=4.15 → passes  (iter 2 case)
+      // Threshold = 5.0 weighted points. Examples:
+      //   Flow (25%) drops 24 pts → 6.0 → BLOCKED  (large flow loss is real)
+      //   LLM (15%) drops 30 pts → 4.5 → passes   (noisy judgement, OK trade-off)
+      //   Flow drops 12 + structure (15%) drops 14 → 3.0+2.1=5.1 → BLOCKED
       //
       // Gate is bypassed when: new map fixes a CRITICAL, or best is still null.
       const REGRESSION_LIMIT_WEIGHTED = 5.0;
       let regressionBlocked = false;
       if (bestNotes !== null && !hasCritical && !bestHasCritical) {
         let weightedReg = 0;
-        for (const [key, val] of Object.entries(scoreBreakdown)) {
-          if (val === null) continue;
+        for (const [key, val] of Object.entries(componentScores)) {
+          if (val == null) continue;
           const peak = bestDimScores[key] ?? 0;
           const drop = Math.max(0, peak - val);
-          weightedReg += drop * (DIM_WEIGHTS[key] ?? 0.1);
+          weightedReg += drop * (SCORE_WEIGHTS[key] ?? 0);
         }
         if (weightedReg > REGRESSION_LIMIT_WEIGHTED) {
           regressionBlocked = true;
@@ -12907,6 +13159,10 @@ Rules:
         iter,
         mode: shouldFullRegen ? (iter === 1 ? 'full-regen' : 'regen-with-hints') : 'mutation-only',
         score: critique.score,
+        scoreV1:     critique.scoreV1 ?? null,
+        passScore:   critique.passScore ?? null,
+        components:  critique.scoreComponents ?? null,
+        scoreInputs: critique.scoreInputs ?? null,
         scoreBreakdown,
         weakestDim,
         hasCritical,
@@ -13198,14 +13454,24 @@ Rules:
                            bpm,
                            duration:  audioBuffer ? parseFloat(audioBuffer.duration.toFixed(1)) : null },
         difficulty:      _diffName,
+        // v2 = computeMapScore (measured first); scores logged before 2026-11-21 have no
+        // scoreVersion and are v1 (the LLM sub-score average). scoreV1 keeps v1 for comparison.
+        scoreVersion:    SCORE_VERSION,
+        model:           getGeneratorModel(),   // the critic runs on the generator model
+        passScore:       PASS_SCORE,
+        timing:          timingInputs(bpm, window._bpmSrv, audioPadSecs),
         finalScore:      bestScore > -Infinity ? bestScore : null,
         finalHasCritical: committedHasCritical,
-        bestIter:        mutationLog.find(e => e.isBest)?.iter ?? null,
+        bestIter:        bestIterOf(mutationLog),   // the LAST isBest (find() always said 1)
         totalIters:      mutationLog.length,
         iterations:      mutationLog.map(e => ({
           iter:          e.iter,
           mode:          e.mode,
           score:         e.score,
+          scoreV1:       e.scoreV1,
+          passScore:     e.passScore,
+          components:    e.components,
+          scoreInputs:   e.scoreInputs,
           isBest:        e.isBest,
           passed:        e.passed,
           hasCritical:   e.hasCritical,
@@ -13241,21 +13507,24 @@ Rules:
       const sc = bestScore;
       const finalPassed = criticalOnly
         ? !committedHasCritical
-        : (sc >= PASS_SCORE && !committedHasCritical);
+        : ((bestCritique.passScore ?? sc) >= PASS_SCORE && !committedHasCritical);
+      // A low timing component is the song's BPM/beat measurement, not the map: say so.
+      const _tc = bestCritique.scoreComponents?.timing;
+      const _timingNote = !criticalOnly && _tc != null && _tc < 60 ? ` · timing ${_tc} (BPM/beat grid, not the map)` : '';
       const badge = document.getElementById('scoreBadge');
       // In criticalOnly mode colour by critical status, not score
       const [bg, border, fg] = criticalOnly
         ? (committedHasCritical
             ? ['rgba(214,60,60,0.08)',  'rgba(214,60,60,0.35)',  'var(--red)']
             : ['rgba(78,203,141,0.08)', 'rgba(78,203,141,0.35)', 'var(--green)'])
-        : (sc < 55 ? ['rgba(214,60,60,0.08)',  'rgba(214,60,60,0.35)',  'var(--red)']   :
-           sc < 75 ? ['rgba(240,160,52,0.08)', 'rgba(240,160,52,0.35)', 'var(--amber)'] :
+        : (sc < 50 ? ['rgba(214,60,60,0.08)',  'rgba(214,60,60,0.35)',  'var(--red)']   :   // v2 scale
+           sc < 70 ? ['rgba(240,160,52,0.08)', 'rgba(240,160,52,0.35)', 'var(--amber)'] :
                      ['rgba(78,203,141,0.08)', 'rgba(78,203,141,0.35)', 'var(--green)']);
       badge.style.cssText = `display:block;margin-top:6px;padding:6px 12px;border-radius:6px;text-align:center;font-family:'Space Mono',monospace;font-size:12px;font-weight:700;background:${bg};border:1px solid ${border};color:${fg};`;
       const finalCritCount = bestCritique?.issues?.filter(i => i.startsWith('CRITICAL:')).length ?? 0;
       badge.textContent = criticalOnly
         ? `Critical-only mode: ${finalCritCount === 0 ? '0 critical errors ✓' : `${finalCritCount} unresolved critical${finalCritCount > 1 ? 's' : ''} ⚠`}`
-        : `Best of ${MAX_ITER} passes: ${sc}/100${finalPassed ? ' ✓' : committedHasCritical ? ' ⚠ unresolved critical' : ''}`;
+        : `Best of ${MAX_ITER} passes: ${sc}/100${finalPassed ? ' ✓' : committedHasCritical ? ' ⚠ unresolved critical' : ''}${_timingNote}`;
     }
 
     // ── Render mutation log panel ─────────────────────────────────────────
@@ -13271,19 +13540,25 @@ Rules:
         // Weakest scoring dimension
         if (entry.weakestDim) {
           const wd = entry.weakestDim;
-          const gap = wd.score !== null ? ` (${wd.score}/100, pulling total down by ~${Math.round((100 - wd.score) * wd.weight)} pts)` : '';
-          lines.push(`   Weakest dim: ${wd.label}${gap}`);
+          const gap = wd.score !== null ? ` (${wd.score}/100)` : '';
+          lines.push(`   Weakest LLM dim: ${wd.label}${gap}`);
+        }
+        // v2 score components (computeMapScore) — what the score is actually made of
+        if (entry.components) {
+          const fmt = v => v != null ? String(v).padStart(3) : '  —';
+          const c = entry.components;
+          lines.push(`   Score v2: timing=${fmt(c.timing)} flow=${fmt(c.flow)} play=${fmt(c.play)} struct=${fmt(c.struct)} sync=${fmt(c.sync)} llm=${fmt(c.llm)}  (v1 would be ${entry.scoreV1 ?? '—'})`);
         }
         // Focus section — which section the next regen will target
         if (entry.focusSection) {
           const fs = entry.focusSection;
           lines.push(`   Focus → "${fs.name}" (${fs.startSec.toFixed(0)}s–${fs.endSec.toFixed(0)}s) · ${fs.hitCount} issue ref(s) · all other sections locked`);
         }
-        // Sub-score breakdown (flow 35%, energy 26%, diff 17%, stem→genre 17%)
+        // LLM sub-scores (inputs to the v2 llm component; the v1 weights are shown)
         if (entry.scoreBreakdown) {
           const b = entry.scoreBreakdown;
           const fmt = v => v !== null ? String(v).padStart(3) : ' —';
-          lines.push(`   Sub-scores: flow=${fmt(b.flow)} (35%)  energy=${fmt(b.energy)} (26%)  diff=${fmt(b.diff)} (17%)  stem=${fmt(b.stem)} (17%)`);
+          lines.push(`   LLM sub-scores: flow=${fmt(b.flow)} (35%)  energy=${fmt(b.energy)} (27%)  diff=${fmt(b.diff)} (17%)  stem=${fmt(b.stem)} (17%)`);
         }
         for (const c of entry.criticals)   lines.push(`   ⚠ ${c}`);
         for (const o of entry.otherIssues) lines.push(`   ${o}`);
@@ -13410,10 +13685,11 @@ Rules:
       badge.textContent = 'Critic skipped — map accepted';
     }
 
+    const _toastPass = (bestCritique?.passScore ?? bestScore) >= PASS_SCORE;
     const passMsg = bestCritique?.score != null
-      ? `Best score: ${bestScore}/100${bestScore >= PASS_SCORE ? ' ✓' : ''}`
+      ? `Best score: ${bestScore}/100${_toastPass ? ' ✓' : ''}`
       : 'Map generated';
-    toast(`${passMsg} — ${notes.length} notes`, bestScore >= PASS_SCORE ? 'success' : 'info');
+    toast(`${passMsg} — ${notes.length} notes`, _toastPass ? 'success' : 'info');
 
   } catch (err) {
     status.style.color = 'var(--red)';
