@@ -27,6 +27,27 @@
       "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8096", "--no-browser"],
       "port": 8096,
       "autoPort": false
+    },
+    {
+      "name": "synthmapper-v2-agent-score",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8098", "--no-browser"],
+      "port": 8098,
+      "autoPort": false
+    },
+    {
+      "name": "synthmapper-v2-agent-triplet",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8100", "--no-browser"],
+      "port": 8100,
+      "autoPort": false
+    },
+    {
+      "name": "synthmapper-v2-agent-drums",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["C:\\Users\\kgrot\\OneDrive\\Documents\\Synthriderz mapper\\Synthmapper v2\\server.py", "--port", "8102", "--no-browser"],
+      "port": 8102,
+      "autoPort": false
     }
   ]
 }
