@@ -3960,6 +3960,10 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   // Rails >= 6 beats chain 2-3 of these shapes (planRailSegments); see the multi-segment block below.
   const rng = Math.random();
   const _shapeRoll = Math.random();
+  // Waypoints round to the caller's grid as round(b·d)/d: bit-identical to round(b/s)·s for the
+  // straight 1, 1/2, 1/4 grids, and exact for thirds/sixths (s = 1/3 would land 2 ulp off the
+  // snapped head, i.e. a waypoint just BEFORE its own rail head).
+  const _wpD = Math.round(1 / snapSz);
   // Multi-segment plan for rails >= 6 beats (or a replayed chorus motif). Below 6 beats with
   // no motif this is null and the legacy single-shape path runs with an identical RNG
   // sequence (golden test vs acd1853).
@@ -3973,7 +3977,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
     for (let i = 1; i <= numWP; i++) {
       const t    = i / (numWP + 1);
       const p    = posAt(t);
-      const beat = Math.round((startBeat + len * t) / snapSz) * snapSz;
+      const beat = Math.round((startBeat + len * t) * _wpD) / _wpD;
       const wp   = clampPt(p.col, p.row, beat);
       waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
     }
@@ -4009,7 +4013,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
       const t    = i / counts[k];
       const p    = posAt(t);
       const beat = k === nSeg - 1 && i === counts[k] ? endBeat
-                 : Math.round((segStart + segLen * t) / snapSz) * snapSz;
+                 : Math.round((segStart + segLen * t) * _wpD) / _wpD;
       last = clampPt(p.col, p.row, beat);
       waypoints.push({ beat, row: last.row, _x: COL_X[last.col] });
     }
@@ -4228,6 +4232,116 @@ function weightedRow(bandBias = 0) {
   return Math.max(0, Math.min(10, 10 + Math.round(bandBias)));
 }
 
+// ── Swing → triplet snap lattice (2026-11-21) ────────────────────────────────────────────
+// A straight 1/16 snap moves swung hits (0, 1/3, 2/3 of a beat) to 0, 1/4, 3/4: 1/12 beat off,
+// 42 ms at 120 BPM. On Electric Love that left 31% of notes within 30 ms of a hit; snapping its
+// swung notes to thirds gives 72%. detectSwing reads the stem onsets the server already returns
+// (map clock, beat-1 pad included) and decides per song, with a per-section override, whether
+// hits sit on thirds or quarters. makeSnapLattice turns that into the grid onsetsToNotes'
+// snapBeat / snapToGrid use, section by section.
+// Phase lock R_k = |mean e^(2πi·k·x)| over onset beat positions x (server.onset_phase_lock's
+// measure): k=3 locks to thirds, k=4 to quarters. On-beat-only hits lock at every k, so the
+// decision is R3 against R4, never either alone.
+const SWING_STEMS        = ['drums', 'bass', 'other'];  // vocals anticipate the beat and lock at noise level (R3 0.22 / R4 0.23 on Electric Love)
+const SWING_WINDOW_BEATS = 32;     // 8 bars of 4/4
+const SWING_MIN_ONSETS   = 24;     // a window / section needs this many onsets before it votes
+const SWING_MARGIN       = 0.10;   // R3 must beat R4 by this much (or R4 beat R3) to call it
+const SWING_MIN_LOCK     = 0.30;   // a section override also needs its winning R at least this high
+const SWING_SONG_SHARE   = 0.5;    // share of voting windows that must be swung to swing the song
+const SWING_SIXTH_SHARE  = 0.25;   // Master: onsets nearer an odd sixth than a third → 1/6 grid
+let SWING_SNAP_MODE = 'auto';      // 'auto' | 'off' | 'on' — dev A/B switch, set from the console
+function phaseLockR(beats, k) {
+  if (!beats.length) return 0;
+  let c = 0, s = 0;
+  for (const b of beats) { const a = 2 * Math.PI * k * b; c += Math.cos(a); s += Math.sin(a); }
+  return Math.hypot(c, s) / beats.length;
+}
+// Share of onsets more than 1/12 beat off the thirds lattice, i.e. nearer 1/6, 1/2 or 5/6.
+function offThirdsShare(beats) {
+  if (!beats.length) return 0;
+  let off = 0;
+  for (const b of beats) { const f = (b - Math.floor(b)) * 3; if (Math.abs(f - Math.round(f)) > 0.25) off++; }
+  return off / beats.length;
+}
+function swingStats(beats) {
+  return { n: beats.length, R3: phaseLockR(beats, 3), R4: phaseLockR(beats, 4), offThirds: offThirdsShare(beats) };
+}
+// Pooled rhythmic onsets in MAP beats. Stem onsets when the server analysed stems, else the
+// in-browser band onsets (seconds, same clock).
+function swingOnsetBeats(analysis, bps) {
+  const sd = analysis?.stemData;
+  const times = sd
+    ? SWING_STEMS.flatMap(k => (sd[k]?.onsets || []).map(o => o.time))
+    : [...(analysis?.bassOnsets || []), ...(analysis?.midOnsets || []), ...(analysis?.highOnsets || [])];
+  return times.map(t => t * bps).sort((a, b) => a - b);
+}
+// Song decision: swung when at least SWING_SONG_SHARE of the 8-bar windows with enough onsets
+// lock to thirds by SWING_MARGIN. Section override: a section with enough onsets flips to the
+// other grid only on clear evidence (margin AND its winning R >= SWING_MIN_LOCK).
+function detectSwing(onsetBeats, totalBeats, sections = []) {
+  const beats = onsetBeats.filter(b => b >= 0 && b < totalBeats);
+  const inRange = (a, e) => beats.filter(b => b >= a && b < e);
+  const voteOf = s => s.n < SWING_MIN_ONSETS ? 0
+    : s.R3 > s.R4 + SWING_MARGIN ? 1 : s.R4 > s.R3 + SWING_MARGIN ? -1 : 0;
+  const windows = [];
+  for (let w = 0; w < totalBeats; w += SWING_WINDOW_BEATS) {
+    const s = swingStats(inRange(w, w + SWING_WINDOW_BEATS));
+    windows.push({ startBeat: w, endBeat: Math.min(w + SWING_WINDOW_BEATS, totalBeats), ...s, vote: voteOf(s) });
+  }
+  const voting = windows.filter(w => w.n >= SWING_MIN_ONSETS);
+  const swungWindows = voting.filter(w => w.vote === 1).length;
+  const swung = voting.length > 0 && swungWindows >= SWING_SONG_SHARE * voting.length;
+  const secs = (sections || []).map(sec => {
+    const s = swingStats(inRange(sec.startBeat, sec.endBeat));
+    let sw = swung, override = false;
+    if (s.n >= SWING_MIN_ONSETS) {
+      if (!swung && s.R3 > s.R4 + SWING_MARGIN && s.R3 >= SWING_MIN_LOCK) { sw = true;  override = true; }
+      if ( swung && s.R4 > s.R3 + SWING_MARGIN && s.R4 >= SWING_MIN_LOCK) { sw = false; override = true; }
+    }
+    return { name: sec.name, startBeat: sec.startBeat, endBeat: sec.endBeat, ...s, swung: sw, override };
+  });
+  return { swung, ...swingStats(beats), windows, voting: voting.length, swungWindows, sections: secs };
+}
+// Divisions per beat for a section. Straight = 1/baseSnap (1, 2, 4). Swung = thirds wherever the
+// straight grid is sub-beat (Hard and up); sixths at Master (diff >= 9) when the section's onsets
+// sit off the thirds — judged only on as many onsets as a vote needs (a 6-beat outro with 5
+// onsets read 40% off-thirds); Easy/Normal (1-beat snap) stay on the beat either way.
+function snapDivsFor(baseSnap, diff, sec) {
+  const straight = Math.round(1 / baseSnap);
+  if (!sec?.swung || straight < 2) return straight;
+  return diff >= 9 && (sec.n ?? 0) >= SWING_MIN_ONSETS && sec.offThirds >= SWING_SIXTH_SHARE ? 6 : 3;
+}
+// The snap grid. spans = [{startBeat, endBeat, divs}]; beats outside every span use defDivs (the
+// straight grid unless the caller passes the song-level grid). Span edges are rounded to whole
+// beats, which sit on every lattice, so snap() stays idempotent across a straight/swung boundary.
+// Straight snapping is bit-identical to the old Math.round(b / snapSize) * snapSize (both are
+// exact for 1, 1/2, 1/4).
+function makeSnapLattice(baseSnap, spans = [], defDivs = Math.round(1 / baseSnap)) {
+  const sp = spans.map(s => ({ a: Math.round(s.startBeat), e: Math.round(s.endBeat), d: s.divs }))
+                  .filter(s => s.e > s.a && s.d !== defDivs);
+  const divsAt = b => { for (const s of sp) if (b >= s.a && b < s.e) return s.d; return defDivs; };
+  return {
+    spans: sp, defDivs,
+    divsAt,
+    sizeAt:  b => 1 / divsAt(b),
+    swungAt: b => divsAt(b) % 3 === 0,
+    snap:    b => { const d = divsAt(b); return Math.round(b * d) / d; },
+    // Smallest whole number of grid cells at b that is >= minBeats (a step that never re-snaps
+    // onto the same cell). Straight: max(snapSize, minBeats) for the 1/2^n grids used here.
+    stepAt:  (b, minBeats) => { const c = 1 / divsAt(b); return Math.ceil(minBeats / c - 1e-9) * c; },
+  };
+}
+// One call for onsetsToNotes: detection + lattice + a log line. mode 'off' = straight everywhere
+// (the pre-2026-11-21 grid), 'on' = every section swung.
+function planSnapLattice(analysis, bps, totalBeats, sections, diff, baseSnap, mode = 'auto') {
+  if (mode === 'off') return { lattice: makeSnapLattice(baseSnap), swing: null };
+  const swing = detectSwing(swingOnsetBeats(analysis, bps), totalBeats, sections);
+  if (mode === 'on') { swing.swung = true; for (const s of swing.sections) s.swung = true; }
+  const spans = swing.sections.map(s => ({ startBeat: s.startBeat, endBeat: s.endBeat, divs: snapDivsFor(baseSnap, diff, s) }));
+  // Beats no section covers follow the song-level decision.
+  return { lattice: makeSnapLattice(baseSnap, spans, snapDivsFor(baseSnap, diff, swing)), swing };
+}
+
 // Convert detected audio onsets into SynthRiders notes + auto-walls.
 // Uses extractNoteEvents() for typed, density-capped, hand-balanced events.
 // Returns { notes, walls } — both generated from the audio signal.
@@ -4281,8 +4395,24 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // the v2 baseline — gold accents/climax landed past the song end, the rail-synthesis fallback
   // broke out of its candidate loop immediately (so under-railed sections never got rails), and
   // solo-density fills / chorus-buildup golds missed their sections. Found 2026-11-21.
-  function snapBeat(t)    { return Math.round(t * bps / snapSize) * snapSize; }
-  function snapToGrid(b)  { return Math.round(b / snapSize) * snapSize; }
+  // Both are SECTION-AWARE (2026-11-21, triplet snap): swung sections snap to thirds (sixths at
+  // Master when warranted), straight ones to snapSize exactly as before. snapSize stays the
+  // difficulty's BASE resolution for step/window arithmetic; snapStepAt(b, min) gives a step that
+  // lands on the local grid, and swungAt(b) tells a pass which grid it is on.
+  const _snapPlan = planSnapLattice(analysis, bps, totalBeats, sections, diff, snapSize, hints.swingMode ?? SWING_SNAP_MODE);
+  const _lattice  = _snapPlan.lattice;
+  function snapBeat(t)    { return _lattice.snap(t * bps); }
+  function snapToGrid(b)  { return _lattice.snap(b); }
+  function swungAt(b)     { return _lattice.swungAt(b); }
+  function snapStepAt(b, minBeats) { return _lattice.stepAt(b, minBeats); }
+  if (_snapPlan.swing) {
+    const _sw = _snapPlan.swing, _f = x => x.toFixed(2);
+    const _ov = _sw.sections.filter(s => s.override).map(s => `${s.name || s.startBeat}→${s.swung ? 'thirds' : 'straight'}`);
+    console.log(`[Swing] song ${_sw.swung ? 'SWUNG' : 'straight'}: ${_sw.swungWindows}/${_sw.voting} 8-bar windows lock to thirds `
+      + `(pooled R3 ${_f(_sw.R3)} vs R4 ${_f(_sw.R4)}, off-thirds ${_f(_sw.offThirds)}, n=${_sw.n}); `
+      + `grid 1/${_lattice.defDivs}, exceptions ${JSON.stringify(_lattice.spans.map(s => [s.a, s.e, '1/' + s.d]))}`
+      + (_ov.length ? `; section overrides: ${_ov.join(', ')}` : ''));
+  }
   function energyAt(beat) {
     if (!energyCurve?.length) return 0.5;
     return energyCurve[Math.min(Math.floor(beat), energyCurve.length - 1)];
@@ -5005,7 +5135,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       }
 
       const _motifSec = sectionAt(beat);
-      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, snapSize, xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
+      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, _lattice.sizeAt(beat), xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
       motifMemory.record(_motifSec, 'rails', _arc.plan);
 
       // [FEAT-6] For elevate rails, blend the circular arc waypoints with a linear
@@ -6108,7 +6238,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const startCol = goLeft ? 3 : 11;
       const endCol   = goLeft ? 11 : 3;
       const colDir   = goLeft ? 1 : -1;
-      const stepSize = Math.max(snapSize, 0.25); // 1/16th note minimum step
+      // 1/16th note minimum step, in whole cells of the local grid: a 0.25 step re-snapped to
+      // thirds put two golds on one beat (0.5 and 0.75 both → 2/3). Straight: unchanged.
+      const stepSize = snapStepAt(startBeat, Math.max(snapSize, 0.25));
       const row      = Math.max(diffRowMin, Math.min(diffRowMax, 4 + Math.floor(Math.random() * 3)));
 
       // Build the sequence of (beat, col) pairs
@@ -6414,6 +6546,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const RC_MIN_DRUM_HITS = 3;
     const RC_GRID_TOL_FRAC = 0.2;
     const SUBDIVS = [1.0, 0.5, 0.25]; // allowed musical pulse periods (beats)
+    // Swung windows: drums run in thirds or alternate 2/3 + 1/3 (swung 8ths). Both put every
+    // hit on the thirds lattice, so a 2/3 median means a 1/3 pulse. With the straight list a
+    // 1/3 median read as a 0.25 pulse and culled every triplet-position orb near a drum.
+    const SUBDIVS_SWUNG = [1.0, 2 / 3, 1 / 3, 1 / 6];
 
     // Backbone = drum-sourced orbs (not rails). These define the cadence.
     const drumBeats = result
@@ -6434,15 +6570,18 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         for (let i = 1; i < winDrums.length; i++) diffs.push(winDrums[i] - winDrums[i - 1]);
         diffs.sort((a, b) => a - b);
         const medianDiff = diffs[Math.floor(diffs.length / 2)];
-        let pulse = SUBDIVS[0];
+        const _rcSwung = swungAt(w + RC_WINDOW_BEATS / 2);
+        const _subdivs = _rcSwung ? SUBDIVS_SWUNG : SUBDIVS;
+        let pulse = _subdivs[0];
         let bestErr = Infinity;
-        for (const s of SUBDIVS) {
+        for (const s of _subdivs) {
           const e = Math.abs(s - medianDiff);
           if (e < bestErr) { bestErr = e; pulse = s; }
         }
         // Require the chosen pulse to actually fit the drum spacing — if the median
         // interval is wildly off every subdivision, the pulse is ambiguous: skip.
         if (bestErr > pulse * 0.5) continue;
+        if (_rcSwung && pulse === 2 / 3) pulse = 1 / 3;   // swung 8ths → the thirds lattice
         const anchor = winDrums[0];
         const tol = pulse * RC_GRID_TOL_FRAC;
 
@@ -7039,7 +7178,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
 
         // autoWalls is fully built by this point, so this rail can be shaped around the real
         // obstacles instead of relying on the [RailObstacle] clamp to flatten it afterwards.
-        const _arc = generateRailArc(rb, rowS, endBeat, rowS, snapSize, xStart, hand, false, swayBoost, bpm, null, autoWalls);
+        const _arc = generateRailArc(rb, rowS, endBeat, rowS, _lattice.sizeAt(rb), xStart, hand, false, swayBoost, bpm, null, autoWalls);
         result.push({
           beat: rb, row: rowS, type: hand, _x: xStart,
           stemSource: '_synth',
@@ -7174,8 +7313,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     );
     let added = 0;
     for (const sq of longSquats) {
-      const sqStart = sq.beat + 0.5;
-      const sqEnd   = sq.beat + sq.duration - 0.5;
+      // Half a beat inside the crouch; on a swung grid that half-beat is off the lattice, so
+      // the head (a hit) and tail land on the nearest third instead. Straight: unchanged.
+      const sqStart = swungAt(sq.beat) ? snapToGrid(sq.beat + 0.5) : sq.beat + 0.5;
+      const sqEnd   = swungAt(sq.beat) ? snapToGrid(sq.beat + sq.duration - 0.5) : sq.beat + sq.duration - 0.5;
       if (sqEnd - sqStart < 1.5) continue;
       // Skip if a rail already covers most of this window
       const hasRail = result.some(n =>
@@ -7192,7 +7333,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const xStartCol = sqHand === 0 ? 10 : 4; // start in mid-zone, not extreme
       const xStartVal = COL_X[xStartCol];
       const rowSq    = 5 + Math.floor(Math.random() * 2); // rows 5-6 (under squat barrier)
-      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSize, xStartVal, sqHand, true, 1.0, bpm, null, autoWalls);
+      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, _lattice.sizeAt(sqStart), xStartVal, sqHand, true, 1.0, bpm, null, autoWalls);
       // Remove any same-hand orbs inside this window — they'd violate C1 once the rail exists
       for (let j = result.length - 1; j >= 0; j--) {
         const m = result[j];
@@ -7731,6 +7872,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // shapes are previewed in move_playbook.html.
   if (DENSE_SWEEP) {
     const DSW_MAXGAP = 0.5, DSW_MINRUN = 4, DSW_MAXSTEP = 3;
+    // A swung 8th run alternates 2/3 + 1/3 gaps, so its "8th-note density" ceiling is 2/3, not 0.5
+    // (with 0.5 every long half of the swing pair would split the run).
+    const DSW_MAXGAP_SWUNG = 2 / 3 + 1e-6;
+    const _dswGap = b => swungAt(b) ? DSW_MAXGAP_SWUNG : DSW_MAXGAP;
     const dRowLo = Math.max(diffRowMin, 2), dRowHi = Math.min(diffRowMax, 8);
     const clRow = r => Math.max(dRowLo, Math.min(dRowHi, Math.round(r)));
     const MOVES = DANCE_MOVES;                       // shared library (buildDanceMoves)
@@ -7742,7 +7887,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     let i = 0;
     while (i < orbs.length) {
       let j = i;
-      while (j + 1 < orbs.length && orbs[j + 1].beat - orbs[j].beat <= DSW_MAXGAP) j++;
+      while (j + 1 < orbs.length && orbs[j + 1].beat - orbs[j].beat <= _dswGap(orbs[j].beat)) j++;
       const region = orbs.slice(i, j + 1);
       const beatKeys = new Set(region.map(o => Math.round(o.beat * 64)));
       if (region.length >= DSW_MINRUN && beatKeys.size >= 3) {
@@ -10073,10 +10218,17 @@ function railPosAt(rail, beat) {
 // True if `note` is a C1 violation against `rail` — same-hand note inside the
 // rail's active window that sits more than one column / one row off the path.
 // Bounds use strict < / > so boundary-beat notes ARE checked (matches critic).
+// C1_EDGE_SLACK widens the window by validate.py's beat_eps. A rail capped at head + 2 s ends
+// off-grid (head + 3.996 beats at 119.88 BPM), so a same-hand note on the next grid slot sat
+// 0.004 beat "after" it: unplayably far from where the hand releases, flagged HARD C1 by
+// validate, but outside this window, so fixC1 never re-snapped it. Seen on the thirds grid
+// (Electric Love, 3 of 20 seeded runs, 0 of 20 straight) as _dbComp mirrors; grid notes sit
+// >= 1/6 beat apart, so the slack catches nothing else.
+const C1_EDGE_SLACK = 0.02;
 function isOffRail(note, rail) {
   if (note === rail) return false;
   if (note.type !== rail.type) return false;
-  if (note.beat < rail.beat || note.beat > rail.railEndBeat) return false;
+  if (note.beat < rail.beat - C1_EDGE_SLACK || note.beat > rail.railEndBeat + C1_EDGE_SLACK) return false;
   const pos = railPosAt(rail, note.beat);
   return Math.abs((note._x ?? 0) - pos._x) > RAIL_COL_STEP ||
          Math.abs((note.row ?? 5) - pos.row) > 1;
@@ -10131,6 +10283,11 @@ function fixC1(notes, { beatOccupied = null, clampFn = (r => Math.max(0, Math.mi
 //   (b) single-hand RAIL whose window contains a gold ORB → strip to plain orb
 //   (c) single-hand ORB within ±1 beat of a gold ORB → remove
 // Mutates `notes` in place. Returns count of changes.
+// Slack for the INCLUSIVE ±1-beat C2 windows. On a thirds grid beat differences are not exact
+// in binary: 50/3 − 47/3 = 1.0000000000000018, so a note exactly 1 beat after a gold slipped a
+// `<= 1.0` test, and the export's 6-dp times then read 0.999999999 in validate (HARD C2-GOLD,
+// Electric Love 2026-11-22). Quarter-grid differences are exact, so straight maps are unaffected.
+const C2_BEAT_EPS = 1e-6;
 function clearGoldC2(notes, beatOccupied = null) {
   let cleared = 0;
   const goldOrbs  = notes.filter(n => n.type === 3 && n.railEndBeat == null);
@@ -10141,7 +10298,7 @@ function clearGoldC2(notes, beatOccupied = null) {
     if (m.type !== 0 && m.type !== 1) continue;
     const insideGoldRail = goldRails.some(gr => {
       if (m === gr) return false;
-      const inWindow = m.beat >= gr.beat - 1.0 && m.beat <= gr.railEndBeat + 1.0;
+      const inWindow = m.beat >= gr.beat - 1.0 - C2_BEAT_EPS && m.beat <= gr.railEndBeat + 1.0 + C2_BEAT_EPS;
       const overlapsFromBefore = m.railEndBeat != null && m.beat < gr.beat && m.railEndBeat > gr.beat;
       return inWindow || overlapsFromBefore;
     });
@@ -10155,7 +10312,7 @@ function clearGoldC2(notes, beatOccupied = null) {
         cleared++;
       }
     } else {
-      if (goldOrbs.some(g => Math.abs(g.beat - m.beat) <= 1.0)) {
+      if (goldOrbs.some(g => Math.abs(g.beat - m.beat) <= 1.0 + C2_BEAT_EPS)) {
         if (beatOccupied) beatOccupied.delete(Math.round(m.beat * 100));
         notes.splice(i, 1); cleared++;
       }
@@ -10199,7 +10356,7 @@ function clearGreenRailConflicts(notes, beatOccupied = null) {
     const g = notes[i];
     if (g.type !== 2 || g.railEndBeat !== undefined) continue; // green orbs only
     const conflict = rails.some(r =>
-      g.beat >= r.beat - 1.0 && g.beat <= r.railEndBeat + 1.0
+      g.beat >= r.beat - 1.0 - C2_BEAT_EPS && g.beat <= r.railEndBeat + 1.0 + C2_BEAT_EPS
     );
     if (conflict) {
       if (beatOccupied) beatOccupied.delete(Math.round(g.beat * 100));
