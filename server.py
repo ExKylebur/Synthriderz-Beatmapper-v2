@@ -619,33 +619,263 @@ def estimate_pitch_row(signal, sr: int, time_sec: float,
     return max(0, min(7, row))
 
 
-def classify_drum_hit(signal, sr: int, time_sec: float,
-                      window_sec: float = 0.04) -> str:
-    """Classify a drum onset as 'kick', 'snare', or 'hat' using spectral centroid.
+# ── Drum hit classification: per-band attack levels + a per-song kick/snare split (2026-11-22) ──
+# The old classify_drum_hit labelled a hit by the spectral centroid of the 40 ms after it, with
+# kick < 200 Hz. On a Demucs drum stem the hats and the snare's ring lift every kick's centroid far
+# over 200 Hz, so it returned 0 kicks on Electric Love, Painkiller and Resist and Disorder, before
+# and after the SuperFlux onsets (Resist: 644 hats / 2 snares). The app maps kick → bassOnsets,
+# snare → midOnsets and hat → highOnsets, and drops hats below Expert, so Hard-and-below maps lost
+# nearly every drum orb.
+# What separates them on real stems (measured on those 3 songs, levels relative to each band's
+# loud hits): a kick is a RISE in the low band (< 150 Hz); a hit that also carries a snare has
+# 9-14 dB more 150 Hz-2 kHz energy relative to its low band than a plain kick does (Electric Love's
+# snares on 2 & 4, Painkiller's snare on every beat over 16th double bass). How much more depends
+# on the kit, so that threshold is found per song: a 2-cluster (Otsu) split of the mid-minus-low
+# tilt (measured from the local plain kick), used only when the tilt really is bimodal. Resist has a
+# kick on every beat with a clap layered on 2 & 4 whose PEAK spectrum matches the kick's (both beat
+# parities within ±3 dB across 150 Hz-10 kHz; tilt η 0.43): only its ring tells them apart, so when the
+# tilt split is not bimodal a decay fallback looks for a second drum that adds both 2-5 kHz crack and
+# a 1-5 kHz decay tail (DRUM_DECAY_*). A hit with no kick is a snare if its mid band rises to near its
+# loud level, else a hat. Result (kick / snare / hat; old: 0 kicks on all 9 songs measured):
+#   Electric Love 557 / 301 / 24: on-beat kicks 92% on beats 1 & 3, snares 92% on 2 & 4;
+#   Painkiller 576 / 645 / 46: a snare on every beat, double-bass kicks between;
+#   Resist 179 / 244 / 223 (decay fallback): 91% of snares on a beat, kick and snare one beat apart
+#   on the 2-beat cycle (0.97), hats 71% on the "&". Fly for Your Life, Bye Bye Bye and Nobody Speak
+#   are unsplit and the fallback stays off (r 0.13 / 0.15 / 0.06).
+# See handoff "2026-11-22 — drum classifier"; tests/drums.test.mjs gates it.
+DRUM_BANDS = (('low', 30.0, 150.0), ('mid', 150.0, 2000.0), ('high', 5000.0, None))
+DRUM_POST_FRAMES = (-1, 4)      # post level: max band energy over frames f-1..f+3 (−6..+17 ms)
+DRUM_PRE_FRAMES = (-9, -4)      # rise baseline: mean over frames f-9..f-5 (−52..−29 ms)
+DRUM_REF_WINDOW = 15.0          # band reference: 90th pct of the hits' post levels within ±15 s,
+DRUM_REF_Q = 90
+DRUM_REF_FLOOR_DB = 15.0        # but never more than 15 dB under the song-wide one (a hats-only
+                                # intro must not promote its low-band bleed to "loud")
+DRUM_KICK_LVL_DB = -12.0        # kick: low band within 12 dB of its loud hits,
+DRUM_KICK_RISE_DB = 6.0         # rising by ≥ 6 dB at the hit (not a ringing earlier kick),
+DRUM_KICK_OVER_HIGH_DB = -6.0   # and not buried under the high band (bleed under a hat: −11..−43)
+DRUM_SNARE_LVL_DB = -12.0       # no kick: snare if the mid band is within 12 dB of its loud hits,
+DRUM_SNARE_RISE_DB = 6.0        # rises by ≥ 6 dB,
+DRUM_SNARE_OVER_HIGH_DB = -10.0 # and is not buried under the high band (real snares ≥ −2 dB at p1,
+                                # real hats −26..−36); otherwise a hat
+# Kick/snare split on the kick-bearing hits' tilt (mid level − low level, dB), measured from the
+# LOCAL kick: minus the 20th percentile of the kick-bearing tilts within ±8 s. A section played on a
+# softer kick (Electric Love beats 112-143, 224-255, 304-399: 6-8 dB less 63-100 Hz, the same
+# 1-8 kHz) otherwise tilts up past a song-wide threshold and every kick reads as a snare (kick-beat
+# accuracy 0.76 → 0.96 with the local base; snare beats 1.00 → 0.91). Assumes ≥ 20% of the
+# kick-bearing hits in any ±8 s are plain kicks, true of every song measured.
+DRUM_TILT_BASE_WINDOW = 8.0
+DRUM_TILT_BASE_Q = 20
+# Otsu's η (between-class / total variance) is 2/π ≈ 0.64 for ANY unimodal normal sample and 0.75
+# for a uniform one, so η alone can't call a split; the gap in dB is what says "two drums". Measured
+# (η, gap): Painkiller 0.90 / 14.3 dB, Handshake with Hell 0.84 / 13.6, Electric Love 0.75 / 9.2;
+# Resist 0.43 / 1.5 and a synthetic four-on-the-floor kick with ±3 dB velocities 0.65-0.72 / 1.4-1.9.
+DRUM_SPLIT_ETA = 0.70
+DRUM_SPLIT_SEP_DB = 6.0
+DRUM_SPLIT_MIN_FRAC = 0.03      # each side of the split holds ≥ 3% of the kick-bearing hits
+# Decay fallback, only when the tilt split is NOT bimodal. A clap or snare layered on the kick can match
+# its peak spectrum (Resist: both beat parities within ±3 dB) but rings on: 1-5 kHz energy over
+# 40-70 ms after the peak frame / its −12..+17 ms peak is 0.01-0.03 on Resist's kick beats vs
+# 0.30-0.60 on its snare beats (found by a parallel session, 2026-11-22). Neither that tail nor the
+# 2-5 kHz crack tilt is cleanly bimodal on its own, and a tail split alone also fires on songs with no
+# second drum (Fly for Your Life η 0.77, Bye Bye Bye 0.72). What does separate them: a real second
+# drum adds BOTH crack and tail, so the two correlate across the kick-bearing hits (Spearman r:
+# Resist +0.37; Electric Love / Tycho / Handshake / Painkiller / Trivium +0.17..+0.40) while spread
+# in one alone does not (Fly +0.13, Bye Bye Bye +0.15, Nobody Speak +0.06, a synthetic four-on-the-
+# floor −0.38). Gate on r, then split z(crack tilt) + z(tail) at its Otsu threshold.
+DRUM_CRACK_BAND = (2000.0, 5000.0)
+DRUM_TAIL_BAND = (1000.0, 5000.0)
+DRUM_TAIL_PEAK_FRAMES = (-2, 4)  # tail reference: max over frames f-2..f+3
+DRUM_TAIL_FRAMES = (7, 13)       # tail: mean power over frames f+7..f+12 (+41..+70 ms)
+DRUM_TAIL_MIN_GAP = 0.085        # a hit followed by another within 85 ms has no clean tail: skipped
+DRUM_DECAY_MIN_R = 0.25
+DRUM_DECAY_MIN_N = 40
+DRUM_DECAY_MIN_FRAC = 0.20       # a layered backbeat covers a real share of the kick-bearing hits
 
-    Kick:  centroid < 200 Hz  (low thud)
-    Snare: centroid 200–2000 Hz (mid crack)
-    Hat:   centroid > 2000 Hz  (high sizzle)
+
+def _band_energy_db(signal, sr: int, bands=DRUM_BANDS):
+    """Per-frame band energies (dB) of a centred Hann STFT: ~46 ms window, ~5.8 ms hop at any sr
+    (n_fft 1024 / hop 128 at 22050 Hz, the stem_onsets framing). numpy only, chunked.
+
+    Returns ({band name: dB array}, frame period in s). Frame j is centred on j·dt.
     """
     import numpy as np
+    from numpy.lib.stride_tricks import sliding_window_view
+    n_fft = int(2 ** round(np.log2(sr * 0.0464)))
+    hop = n_fft // 8
+    x = np.pad(np.asarray(signal, dtype=np.float32), n_fft // 2)
+    if len(x) < n_fft:
+        x = np.pad(x, (0, n_fft - len(x)))
+    frames = sliding_window_view(x, n_fft)[::hop]
+    win = np.hanning(n_fft + 1)[:-1].astype(np.float32)          # periodic Hann
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    masks = [(freqs >= lo) & (freqs <= (hi if hi else sr)) for _, lo, hi in bands]
+    power = np.empty((len(bands), len(frames)))
+    for s in range(0, len(frames), 2048):
+        spec = np.abs(np.fft.rfft(frames[s:s + 2048] * win, axis=1)) ** 2
+        for k, m in enumerate(masks):
+            power[k, s:s + 2048] = spec[:, m].sum(axis=1)
+    db = 10.0 * np.log10(power + 1e-12)
+    return {name: db[k] for k, (name, _, _) in enumerate(bands)}, hop / sr
 
-    start = int(time_sec * sr)
-    end   = min(start + int(window_sec * sr), len(signal))
-    frame = signal[start:end]
-    if len(frame) < 16:
-        return 'snare'
 
-    spectrum = np.abs(np.fft.rfft(frame))
-    freqs    = np.fft.rfftfreq(len(frame), d=1.0 / sr)
-    denom    = spectrum.sum()
-    centroid = float((spectrum * freqs).sum() / denom) if denom > 0 else 500.0
+def _otsu_split(values):
+    """Best two-class split of 1-D values (Otsu). Returns {thr, eta, sep, frac_hi}, or None for
+    fewer than 4 values. eta = between-class / total variance (≈ 0.64 for a unimodal normal
+    sample, → 1 for two well-separated clusters); sep = upper-class mean − lower-class mean (the
+    same units as the values); frac_hi = the share above thr."""
+    import numpy as np
+    v = np.sort(np.asarray(values, dtype=float))
+    n = len(v)
+    if n < 4:
+        return None
+    c = np.cumsum(v)
+    k = np.arange(1, n)
+    m0 = c[:-1] / k
+    m1 = (c[-1] - c[:-1]) / (n - k)
+    w0 = k / n
+    sb = w0 * (1 - w0) * (m1 - m0) ** 2
+    j = int(np.argmax(sb))
+    var = float(v.var())
+    return {'thr': float((v[j] + v[j + 1]) / 2), 'eta': float(sb[j] / var) if var > 0 else 0.0,
+            'sep': float(m1[j] - m0[j]), 'frac_hi': float((n - k[j]) / n)}
 
-    if centroid < 200:
-        return 'kick'
-    elif centroid < 2000:
-        return 'snare'
-    else:
-        return 'hat'
+
+def _local_quantile(times, vals, at, win: float, q: float, min_n: int = 1):
+    """For each time in `at`: the q-th percentile of `vals` (sampled at `times`) over the samples
+    within ±win s; the song-wide q-th percentile where fewer than `min_n` samples are in range."""
+    import numpy as np
+    t = np.asarray(times, float)
+    order = np.argsort(t, kind='stable')
+    t, v = t[order], np.asarray(vals, float)[order]
+    at = np.asarray(at, float)
+    lo = np.searchsorted(t, at - win, side='left')
+    hi = np.searchsorted(t, at + win, side='right')
+    glob = float(np.percentile(v, q))
+    return np.array([np.percentile(v[a:b], q) if b - a >= min_n else glob for a, b in zip(lo, hi)])
+
+
+def _local_ref(times, vals, win: float, q: float, floor_db: float):
+    """Per hit: the q-th percentile of `vals` over the hits within ±win s, floored at the song-wide
+    q-th percentile − floor_db."""
+    import numpy as np
+    ref = _local_quantile(times, vals, times, win, q)
+    return np.maximum(ref, np.percentile(np.asarray(vals, float), q) - floor_db)
+
+
+def _rank_corr(a, b) -> float:
+    """Spearman rank correlation of two equal-length 1-D arrays (ties broken by order)."""
+    import numpy as np
+    ra = np.argsort(np.argsort(a, kind='stable'), kind='stable').astype(float)
+    rb = np.argsort(np.argsort(b, kind='stable'), kind='stable').astype(float)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    den = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    return float((ra * rb).sum() / den) if den > 0 else 0.0
+
+
+def classify_drum_hits(signal, sr: int, times, info: dict | None = None) -> list:
+    """Label each drum-stem onset 'kick', 'snare' or 'hat' (one label per onset).
+
+    signal: the drum stem (mono); times: onset times (s) on the same clock, as stem_onsets returns
+    them (latency-corrected, so the attack peak is at time + STEM_ONSET_LATENCY).
+
+    Per hit and band (low < 150 Hz, mid 150 Hz-2 kHz, high > 5 kHz):
+      post  = max band energy (dB) just after the hit (DRUM_POST_FRAMES);
+      rise  = post − the mean over ~30-50 ms before it (DRUM_PRE_FRAMES);
+      level = post − the band's local reference (the loud hits' level; _local_ref).
+    1. Kick-bearing: low level ≥ DRUM_KICK_LVL_DB, low rise ≥ DRUM_KICK_RISE_DB, and low post ≥
+       high post + DRUM_KICK_OVER_HIGH_DB.
+    2. Among those, tilt = mid level − low level, minus the local plain-kick tilt (the
+       DRUM_TILT_BASE_Q-th percentile of the kick-bearing tilts within ±DRUM_TILT_BASE_WINDOW s).
+       If its Otsu split is bimodal (η ≥ DRUM_SPLIT_ETA, gap ≥ DRUM_SPLIT_SEP_DB, each side ≥
+       DRUM_SPLIT_MIN_FRAC) the upper cluster is 'snare' (a snare, usually over a kick) and the
+       lower 'kick'; otherwise they are all 'kick', unless the decay fallback (_decay_split) finds a
+       layered ringing drum: crack tilt and decay tail rank-correlate (r ≥ DRUM_DECAY_MIN_R) across
+       the kick-bearing hits, which are then split on z(crack tilt) + z(tail) at its Otsu threshold.
+    3. Every other hit: 'snare' if mid level ≥ DRUM_SNARE_LVL_DB, mid rise ≥ DRUM_SNARE_RISE_DB and
+       mid post ≥ high post + DRUM_SNARE_OVER_HIGH_DB, else 'hat'.
+    So a hit carrying a kick and a hat is a kick, and one carrying a snare and a kick is a snare: the
+    label is the most salient drum (the backbeat over a kick, the kick over a hat).
+
+    `info` (optional dict) receives the counts and the split statistics for logging.
+    """
+    import numpy as np
+    t = np.asarray(times, dtype=float)
+    if len(t) == 0:
+        if info is not None:
+            info.update({'kick': 0, 'snare': 0, 'hat': 0, 'kick_bearing': 0, 'split': None,
+                         'split_used': False, 'decay': None, 'decay_used': False})
+        return []
+    E, dt = _band_energy_db(signal, sr, DRUM_BANDS + (('crack',) + DRUM_CRACK_BAND,
+                                                      ('tail',) + DRUM_TAIL_BAND))
+    nf = len(E['low'])
+    f = np.clip(np.round((t + STEM_ONSET_LATENCY) / dt).astype(np.int64), 0, nf - 1)
+    post_i = np.clip(f[:, None] + np.arange(*DRUM_POST_FRAMES), 0, nf - 1)
+    pre_i = np.clip(f[:, None] + np.arange(*DRUM_PRE_FRAMES), 0, nf - 1)
+    post, rise, lvl = {}, {}, {}
+    for name in ('low', 'mid', 'high', 'crack'):
+        post[name] = E[name][post_i].max(axis=1)
+        rise[name] = post[name] - E[name][pre_i].mean(axis=1)
+        lvl[name] = post[name] - _local_ref(t, post[name], DRUM_REF_WINDOW, DRUM_REF_Q,
+                                            DRUM_REF_FLOOR_DB)
+    kick_bearing = ((lvl['low'] >= DRUM_KICK_LVL_DB) & (rise['low'] >= DRUM_KICK_RISE_DB)
+                    & (post['low'] - post['high'] >= DRUM_KICK_OVER_HIGH_DB))
+    label = np.where((lvl['mid'] >= DRUM_SNARE_LVL_DB) & (rise['mid'] >= DRUM_SNARE_RISE_DB)
+                     & (post['mid'] - post['high'] >= DRUM_SNARE_OVER_HIGH_DB),
+                     'snare', 'hat').astype(object)
+    label[kick_bearing] = 'kick'
+    tilt = lvl['mid'] - lvl['low']
+    split = None
+    if kick_bearing.sum() >= 8:
+        tilt = tilt - _local_quantile(t[kick_bearing], tilt[kick_bearing], t,
+                                      DRUM_TILT_BASE_WINDOW, DRUM_TILT_BASE_Q, min_n=4)
+        split = _otsu_split(tilt[kick_bearing])
+    use = bool(split and split['eta'] >= DRUM_SPLIT_ETA and split['sep'] >= DRUM_SPLIT_SEP_DB
+               and DRUM_SPLIT_MIN_FRAC <= split['frac_hi'] <= 1 - DRUM_SPLIT_MIN_FRAC)
+    if use:
+        label[kick_bearing & (tilt > split['thr'])] = 'snare'
+    decay = None
+    if not use and kick_bearing.sum() >= DRUM_DECAY_MIN_N:
+        decay = _decay_split(E, f, t, lvl, kick_bearing, label)
+    out = [str(s) for s in label]
+    if info is not None:
+        info.update({k: out.count(k) for k in ('kick', 'snare', 'hat')})
+        info.update({'kick_bearing': int(kick_bearing.sum()), 'split': split, 'split_used': use,
+                     'decay': decay, 'decay_used': bool(decay and decay['used'])})
+    return out
+
+
+def _decay_split(E, f, t, lvl, kick_bearing, label) -> dict:
+    """The decay fallback (see DRUM_DECAY_*): relabel kick-bearing hits that carry a layered,
+    ringing second drum as 'snare', in place. Returns its statistics ({r, n, used, ...})."""
+    import numpy as np
+    nf = len(E['tail'])
+    pk = E['tail'][np.clip(f[:, None] + np.arange(*DRUM_TAIL_PEAK_FRAMES), 0, nf - 1)].max(axis=1)
+    ring = E['tail'][np.clip(f[:, None] + np.arange(*DRUM_TAIL_FRAMES), 0, nf - 1)]
+    tail = 10.0 * np.log10((10.0 ** (ring / 10.0)).mean(axis=1) + 1e-12) - pk
+    nxt = np.append(np.diff(t), np.inf)
+    m = kick_bearing & (nxt >= DRUM_TAIL_MIN_GAP) & (f + DRUM_TAIL_FRAMES[1] <= nf)
+    out = {'n': int(m.sum()), 'r': None, 'used': False}
+    if m.sum() < DRUM_DECAY_MIN_N:
+        return out
+    crack = lvl['crack'] - lvl['low']
+    crack = crack - _local_quantile(t[kick_bearing], crack[kick_bearing], t,
+                                    DRUM_TILT_BASE_WINDOW, DRUM_TILT_BASE_Q, min_n=4)
+    out['r'] = round(_rank_corr(crack[m], tail[m]), 3)
+    if out['r'] < DRUM_DECAY_MIN_R:
+        return out
+
+    def z(v):
+        q1, med, q3 = np.percentile(v[m], [25, 50, 75])
+        return (v - med) / ((q3 - q1) or 1.0)
+    score = z(crack) + z(tail)
+    sp = _otsu_split(score[m])
+    out.update({'thr': round(sp['thr'], 3), 'eta': round(sp['eta'], 3), 'frac_hi': round(sp['frac_hi'], 3)})
+    if not (DRUM_DECAY_MIN_FRAC <= sp['frac_hi'] <= 1 - DRUM_DECAY_MIN_FRAC):
+        return out
+    label[m & (score > sp['thr'])] = 'snare'
+    out['used'] = True
+    return out
 
 
 def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
@@ -709,10 +939,17 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     if enabled_stems.get('drums', True):
         print('  Analysing drums stem…')
         raw_onsets   = _onsets(drums_sig, 0.25)
-        drums_onsets = []
-        for o in raw_onsets:
-            subtype = classify_drum_hit(drums_sig, SR, o['time'])
-            drums_onsets.append({**o, 'subtype': subtype})
+        # One call over the whole stem: the kick/snare threshold is found per song.
+        cls = {}
+        subtypes = classify_drum_hits(drums_sig, SR, [o['time'] for o in raw_onsets], cls)
+        drums_onsets = [{**o, 'subtype': s} for o, s in zip(raw_onsets, subtypes)]
+        sp, dc = cls.get('split'), cls.get('decay')
+        print(f"    drum subtypes: kick {cls['kick']}, snare {cls['snare']}, hat {cls['hat']} "
+              f"(kick-bearing {cls['kick_bearing']}; kick/snare split "
+              + (f"η {sp['eta']:.2f}, gap {sp['sep']:.1f} dB, " if sp else '')
+              + ('used' if cls['split_used'] else 'not bimodal')
+              + (f"; decay fallback r {dc['r']}, {'used' if dc['used'] else 'not used'}"
+                 if dc and dc.get('r') is not None else '') + ')')
         result_stems['drums'] = {'onsets': drums_onsets}
     else:
         print('  Skipping drums stem (disabled).')
