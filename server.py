@@ -348,20 +348,55 @@ STEM_ONSET_LATENCY = 0.010
 STEM_ONSET_THRESH = 1.0         # a peak must clear local mean + 1.0σ of the onset function
 STEM_ONSET_WINDOW = 15.0        # ±15 s local statistics, so quiet sections still get onsets
 STEM_ONSET_PEAK_HALF = 0.05     # a peak is the max within ±50 ms (or ±min_gap/2 if smaller)
+# Drums keep their dense passages (2026-11-22). In a continuous 16th / double-kick passage the hits
+# themselves raise the ±15 s mean and σ, so evenly spaced weaker 16ths score z ≈ 0.3-1.3 and fell
+# under the 1.0σ gate. And a lockout of exactly one 16th suppressed real 16ths that land a few ms
+# early (0.24 beat after a stronger hit). Two drum-only changes:
+#  - the NMS gap is 0.8 x the ¼-beat lockout (hits that ring twice 0.11-0.14 beat apart still
+#    merge; they can't be snapped at Master anyway);
+#  - LOUDNESS-ADAPTIVE gate: z > 0.5 instead of 1.0 where the MIX is in its louder half (local
+#    RMS over ±8 lockout slots = ±2 beats ≥ the song's median), so the loud, busy passages keep
+#    their weaker real hits and quiet passages still need a clear one.
+# Master replay of today's onsetsToNotes (same sections, 20 seeds; ρ = density vs mix energy per
+# 16 beats, ±0.02 standard error): Painkiller 1549 → 1714 notes, ρ 0.29 → 0.36 (another 20 seeds:
+# 0.28 → 0.39; the random legacy detector: 2021, 0.35); Electric Love 971 → 971, 0.39 → 0.39; Resist
+# 791 → 839, −0.07 → 0.13; Nobody Speak 664 → 667, 0.42 → 0.44; Fly for Your Life 951 → 963,
+# 0.32 → 0.36. Drum lock holds (Painkiller 0.68 → 0.70; the others 0.94-0.99), and the added onsets
+# ≥ 0.25 beat from a kept hit lock at 0.99 / 0.99 / 0.93 on Electric Love / Resist / Fly, 0.35 on
+# Painkiller (noise 0.12). Live Painkiller Master: 1624 notes (HEAD runs 1,410-1,550), 0 HARD.
+# Tried and rejected (same replay):
+#  - a FLAT z > 0.5 (soft hits in quiet passages: Electric Love ρ 0.39 → 0.32);
+#  - "dense where the first pass already fills ≥ half the slots" (circular: σ inflation thins the
+#    first pass in exactly those passages; Painkiller ρ 0.29 → 0.21);
+#  - gating on the DRUM stem's own loudness (Resist's loud drums are not its loud mix: ρ −0.21);
+#  - a flat 0σ gate, or "relative to the local peaks" (Fly drums +486 at R 0.42 / +391 at 0.04).
+# For bass / vocals / other ANY lower gate added off-grid onsets on 3 of 5 songs (Painkiller bass
+# R 0.07, Fly 0.08, Resist 0.11), so they are unchanged.
+STEM_ONSET_DRUM_GAP_TOL = 0.8
+STEM_ONSET_DRUM_LOUD_THRESH = 0.5
+STEM_ONSET_LOUD_SLOTS = 8       # loudness window: ±8 lockout slots (±2 beats at the drum ¼-beat lockout)
+STEM_ONSET_LOUD_Q = 50          # "loud" = local mix RMS ≥ its song-wide median (silence excluded)
 
 
-def stem_onsets(signal, sr: int, min_gap_sec: float) -> list:
+def stem_onsets(signal, sr: int, min_gap_sec: float, thresh: float = STEM_ONSET_THRESH,
+                gap_tol: float = 1.0, loud_thresh: float | None = None, loud_ref=None) -> list:
     """Onset times of one stem: peak-picked SuperFlux, latency-corrected.
 
     1. librosa onset_strength (mel, n_fft 1024, hop 128, lag 2, max_size 3, center=True).
-    2. Candidates: local maxima (±STEM_ONSET_PEAK_HALF) above the local mean + STEM_ONSET_THRESH·σ
-       over ±STEM_ONSET_WINDOW s.
-    3. Non-maximum suppression at `min_gap_sec`, strongest first: the lockout keeps the
-       strongest hit in a burst, not the first frame that crossed a threshold.
+    2. Candidates: local maxima (±STEM_ONSET_PEAK_HALF) above the local mean + `thresh`·σ
+       (default STEM_ONSET_THRESH) over ±STEM_ONSET_WINDOW s.
+    3. Non-maximum suppression at `gap_tol`·`min_gap_sec`, strongest first: the lockout keeps
+       the strongest hit in a burst, not the first frame that crossed a threshold. gap_tol < 1
+       lets a real hit through that lands slightly early on the next subdivision.
+    2b. With `loud_thresh` and `loud_ref` (a signal on the same clock and sample rate, e.g. the
+       mix): where loud_ref's RMS over ±STEM_ONSET_LOUD_SLOTS lockouts is ≥ its
+       STEM_ONSET_LOUD_Q-th percentile (non-silent frames), the gate is mean + loud_thresh·σ.
     4. time = peak frame − STEM_ONSET_LATENCY; energy = peak value / the 99th percentile of the
        stem's peak values, clipped to 1. This puts the per-stem means at 0.19-0.54, close to the
        old detector's 0.17-0.49, which buildStemDominanceMap's weights were tuned on.
 
+    analyse_stems passes STEM_ONSET_DRUM_GAP_TOL / STEM_ONSET_DRUM_LOUD_THRESH and the mix for
+    the drum stem.
     Returns [{ 'time': float (s), 'energy': float (0-1) }] in time order — the same shape as
     detect_onsets_np.
     """
@@ -378,10 +413,14 @@ def stem_onsets(signal, sr: int, min_gap_sec: float) -> list:
     mean, std = _sliding_mean_std(env, max(1, int(STEM_ONSET_WINDOW / dt)))
     half = max(1, int(round(min(STEM_ONSET_PEAK_HALF, min_gap_sec / 2) / dt)))
     is_peak = env >= maximum_filter1d(env, size=2 * half + 1, mode='nearest')
-    cand = np.flatnonzero(is_peak & (env > mean + STEM_ONSET_THRESH * std) & (env > 0))
+    gate = np.full(len(env), float(thresh))
+    if loud_thresh is not None and loud_ref is not None:
+        gate[_loud_frames(loud_ref, len(env), STEM_ONSET_HOP,
+                          max(1, int(STEM_ONSET_LOUD_SLOTS * min_gap_sec / dt)))] = loud_thresh
+    cand = np.flatnonzero(is_peak & (env > mean + gate * std) & (env > 0))
     if len(cand) == 0:
         return []
-    gap = max(1, int(min_gap_sec / dt))
+    gap = max(1, int(gap_tol * min_gap_sec / dt))
     taken = np.zeros(len(env) + 2 * gap + 2, dtype=bool)   # taken[j + gap] ↔ frame j kept
     keep = []
     for i in cand[np.argsort(-env[cand], kind='stable')]:
@@ -394,6 +433,23 @@ def stem_onsets(signal, sr: int, min_gap_sec: float) -> list:
     times = np.maximum(keep * dt - STEM_ONSET_LATENCY, 0.0)
     return [{'time': round(float(t), 4), 'energy': round(float(min(1.0, v / ref)), 4)}
             for t, v in zip(times, vals)]
+
+
+def _loud_frames(ref, n: int, hop: int, half_win: int):
+    """Boolean mask over `n` onset frames (hop `hop` samples): RMS of `ref` within ±half_win
+    frames ≥ its STEM_ONSET_LOUD_Q-th percentile over the non-silent frames."""
+    import numpy as np
+    x = np.asarray(ref, dtype=np.float64)
+    x = np.pad(x, (0, max(0, n * hop - len(x))))[:n * hop]
+    p = (x.reshape(n, hop) ** 2).mean(axis=1)
+    cs = np.concatenate(([0.0], np.cumsum(p)))
+    i = np.arange(n)
+    lo, hi = np.maximum(0, i - half_win), np.minimum(n, i + half_win + 1)
+    rms = np.sqrt((cs[hi] - cs[lo]) / (hi - lo))
+    live = rms > 0
+    if not live.any():
+        return np.zeros(n, dtype=bool)
+    return rms >= np.percentile(rms[live], STEM_ONSET_LOUD_Q)
 
 
 def detect_onsets_np(env, hop_sec: float, min_gap_sec: float,
@@ -921,9 +977,9 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
         legacy = True
         print('  WARNING: librosa missing: legacy RMS onsets (not beat-locked). pip install librosa')
 
-    def _onsets(sig, gap_beats, hfc=False):
+    def _onsets(sig, gap_beats, hfc=False, **kw):
         if not legacy:
-            return stem_onsets(sig, SR, beat_sec * gap_beats)
+            return stem_onsets(sig, SR, beat_sec * gap_beats, **kw)
         env = rms_envelope(sig, HOP)
         rms = detect_onsets_np(env, HOP_SEC, beat_sec * gap_beats)
         if not hfc:
@@ -933,12 +989,31 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
 
     result_stems = {}
 
+    # All four stems up front: the drum gate needs the mix's loudness (stem_onsets loud_ref).
+    drums_sig = _lead(load_wav_mono(stems['drums'], SR)[0])
+    bass_sig  = _lead(load_wav_mono(stems['bass'], SR)[0])
+    vox_sig   = _lead(load_wav_mono(stems['vocals'], SR)[0])
+    other_sig = _lead(load_wav_mono(stems['other'], SR)[0])
+    # Equal-weight mix of all 4 stems (also the per-beat energy curve below). Demucs can output
+    # stems of slightly different lengths (rounding / conv padding); shorter stems are zero-padded
+    # so no audio window is silently dropped.
+    stem_lengths = [len(drums_sig), len(bass_sig), len(vox_sig), len(other_sig)]
+    max_len = max(stem_lengths)
+    min_len = min(stem_lengths)
+    if min_len < max_len:
+        ratio_pct = round(min_len / max_len * 100, 1)
+        print(f'  WARNING: stem length mismatch ({ratio_pct}%) — padding shorter stems to {max_len/SR:.1f}s')
+    def _pad(sig, length):
+        if len(sig) >= length: return sig[:length]
+        return np.pad(sig, (0, length - len(sig)))
+    mix     = (_pad(drums_sig, max_len) + _pad(bass_sig, max_len) +
+               _pad(vox_sig,  max_len) + _pad(other_sig, max_len)) * 0.25
+
     # ── Drums ────────────────────────────────────────────────────────────────
-    drums_sig, _ = load_wav_mono(stems['drums'], SR)
-    drums_sig = _lead(drums_sig)
     if enabled_stems.get('drums', True):
         print('  Analysing drums stem…')
-        raw_onsets   = _onsets(drums_sig, 0.25)
+        raw_onsets   = _onsets(drums_sig, 0.25, gap_tol=STEM_ONSET_DRUM_GAP_TOL,
+                               loud_thresh=STEM_ONSET_DRUM_LOUD_THRESH, loud_ref=mix)
         # One call over the whole stem: the kick/snare threshold is found per song.
         cls = {}
         subtypes = classify_drum_hits(drums_sig, SR, [o['time'] for o in raw_onsets], cls)
@@ -956,8 +1031,6 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
         result_stems['drums'] = {'onsets': []}
 
     # ── Bass ─────────────────────────────────────────────────────────────────
-    bass_sig, _ = load_wav_mono(stems['bass'], SR)
-    bass_sig = _lead(bass_sig)
     if enabled_stems.get('bass', True):
         print('  Analysing bass stem…')
         bass_env     = rms_envelope(bass_sig, HOP)
@@ -974,8 +1047,6 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     # ── Vocals ───────────────────────────────────────────────────────────────
     # SuperFlux (stem_onsets) catches consonants and soft vocal attacks; it replaced the old
     # RMS + HFC-flux merge ([SUGGESTION-H]), which was random against the beat.
-    vox_sig, _ = load_wav_mono(stems['vocals'], SR)
-    vox_sig = _lead(vox_sig)
     if enabled_stems.get('vocals', True):
         print('  Analysing vocals stem…')
         vox_onsets_raw  = _onsets(vox_sig, 0.5, hfc=True)
@@ -991,8 +1062,6 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     # ── Other / synth ────────────────────────────────────────────────────────
     # Guitars / synths: SuperFlux catches pinch harmonics and string attacks (it replaced the
     # old RMS + HFC-flux merge).
-    other_sig, _ = load_wav_mono(stems['other'], SR)
-    other_sig = _lead(other_sig)
     if enabled_stems.get('other', True):
         print('  Analysing other stem…')
         other_onsets      = _onsets(other_sig, 0.4, hfc=True)
@@ -1050,20 +1119,7 @@ def analyse_stems(stems: dict, bpm: float, enabled_stems: dict | None = None,
     # weighting would suppress that gate in melodic-only sections, preventing rails
     # from forming precisely where they are most needed.
     print('  Computing energy curve…')
-    # Use max_len so the energy curve and duration cover the full audio.
-    # Demucs can output stems of slightly different lengths (rounding / conv padding);
-    # shorter stems are zero-padded so no audio window is silently dropped.
-    stem_lengths = [len(drums_sig), len(bass_sig), len(vox_sig), len(other_sig)]
-    max_len = max(stem_lengths)
-    min_len = min(stem_lengths)
-    if min_len < max_len:
-        ratio_pct = round(min_len / max_len * 100, 1)
-        print(f'  WARNING: stem length mismatch ({ratio_pct}%) — padding shorter stems to {max_len/SR:.1f}s')
-    def _pad(sig, length):
-        if len(sig) >= length: return sig[:length]
-        return np.pad(sig, (0, length - len(sig)))
-    mix     = (_pad(drums_sig, max_len) + _pad(bass_sig, max_len) +
-               _pad(vox_sig,  max_len) + _pad(other_sig, max_len)) * 0.25
+    # `mix` (built at the top, max_len long) so the energy curve and duration cover the full audio.
     duration = max_len / SR
 
     num_beats    = int(np.ceil(duration / beat_sec))
@@ -1573,8 +1629,14 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
     Lazy imports so the server still starts if librosa is absent (the endpoint returns 503
     and the browser falls back to its JS detector).
 
-    Returns {duration, raw_bpm, bpm, phase, confidence, drift, candidates}. Candidates
-    and raw_bpm are 2 dp; bpm 3 dp; phase 4 dp (seconds).
+    4. `phases` maps each candidate (key = its 2-dp string) to the beat phase folded at THAT
+       candidate's own period. At a slower octave the measured lattice holds two (or four)
+       interleaved phases, and only the fold at the slower period knows which is the strong one.
+       Echolokators measures 152 and maps at 76: the app's mid-song anchor picked the weak half
+       and every map beat sat +0.5 beat off (2026-11-22). The app's beatPadSecs uses these.
+
+    Returns {duration, raw_bpm, bpm, phase, confidence, drift, candidates, phases}. Candidates
+    and raw_bpm are 2 dp; bpm 3 dp; phases 4 dp (seconds).
     """
     import numpy as np
     import librosa
@@ -1584,14 +1646,15 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
     env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=TEMPO_HOP)
     fit = fold_tempo(env, TEMPO_HOP / sr, raw)
     bpm = fit['bpm']
-    cands = sorted({round(bpm * m, 2) for m in (0.25, 0.5, 1, 2, 4)
-                    if lo * 0.95 <= bpm * m <= hi * 1.05})
-    if not cands:
-        cands = [round(bpm, 2)]
+    octs = [m for m in (0.25, 0.5, 1, 2, 4) if lo * 0.95 <= bpm * m <= hi * 1.05] or [1]
+    cands = sorted({round(bpm * m, 2) for m in octs})
+    phases = {f'{bpm * m:.2f}': round(fit['phase'] if m == 1 else
+                                      lattice_phase(env, TEMPO_HOP / sr, bpm * m)['phase'], 4)
+              for m in octs}
     return {'duration': round(duration, 3), 'raw_bpm': round(raw, 2),
             'bpm': round(bpm, 3), 'phase': round(fit['phase'], 4),
             'confidence': round(fit['confidence'], 3), 'drift': fit['drift'],
-            'candidates': cands}
+            'candidates': cands, 'phases': phases}
 
 
 def onset_phase_lock(times, bpm: float, phase: float = 0.0, bins: int = 16) -> dict:

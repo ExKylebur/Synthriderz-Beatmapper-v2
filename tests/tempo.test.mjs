@@ -115,4 +115,31 @@ test('detect_bpm_librosa returns the refined bpm, phase and its octave family', 
     assert.ok([0.25, 0.5, 1, 2, 4].some(k => Math.abs(m - k) < 1e-3), `${c} not an octave`);
   }
   assert.ok(Math.abs(det.duration - 90) < 0.05);
+  // one folded phase per candidate, keyed by its 2-dp string
+  assert.deepEqual(Object.keys(det.phases).sort(), det.candidates.map(c => c.toFixed(2)).sort());
+});
+
+// Half-time phase (2026-11-22, Echolokators: measured 152, mapped at 76, +0.5 beat off). A 150-BPM
+// click track whose even beats are loud and odd beats soft: at 75 BPM the strong beats (0.25 s +
+// k·0.8 s) must be beat 1, whichever octave the tracker measures.
+const halfTime = py(`
+import numpy as np, librosa, soundfile as sf, tempfile, os, server
+SR = 22050; dur = 60.0; P = 60 / 150
+beats = np.arange(0.25, dur - 0.2, P)
+strong, weak = beats[0::2], beats[1::2]
+y = librosa.clicks(times=strong, sr=SR, length=int(dur * SR), click_duration=0.03)
+y += 0.35 * librosa.clicks(times=weak, sr=SR, length=int(dur * SR), click_duration=0.03)
+y += np.random.default_rng(2).normal(0, 0.003, len(y))
+d = tempfile.mkdtemp(); p = os.path.join(d, 'half.wav'); sf.write(p, y, SR)
+det = server.detect_bpm_librosa(p)
+os.remove(p); os.rmdir(d)
+print(json.dumps(det))
+`);
+
+test('detect_bpm_librosa: the half-time candidate gets the STRONG beat phase', () => {
+  const key = Object.keys(halfTime.phases).find(k => Math.abs(+k - 75) < 0.1);
+  assert.ok(key, `no ~75 candidate in ${JSON.stringify(halfTime.phases)} (measured ${halfTime.bpm})`);
+  const P = 60 / +key, ph = halfTime.phases[key];
+  const d = Math.abs(((ph - 0.25) / P + 0.5) % 1 - 0.5) * P;        // seconds from the strong clicks
+  assert.ok(d < 0.006, `75-BPM phase ${ph}s is ${(d * 1000).toFixed(1)} ms from the strong beats`);
 });

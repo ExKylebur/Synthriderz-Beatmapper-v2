@@ -173,7 +173,7 @@ function closure(src, roots) {
 }
 // BASE = the last commit before the comfort-reach rule. Aerobic mode must reproduce it exactly.
 // If a later change MEANS to alter this song's output, re-pin BASE to that commit and say so.
-const BASE = '79cc1d9';
+const BASE = '99ee4f3';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);
