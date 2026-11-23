@@ -1629,8 +1629,14 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
     Lazy imports so the server still starts if librosa is absent (the endpoint returns 503
     and the browser falls back to its JS detector).
 
-    Returns {duration, raw_bpm, bpm, phase, confidence, drift, candidates}. Candidates
-    and raw_bpm are 2 dp; bpm 3 dp; phase 4 dp (seconds).
+    4. `phases` maps each candidate (key = its 2-dp string) to the beat phase folded at THAT
+       candidate's own period. At a slower octave the measured lattice holds two (or four)
+       interleaved phases, and only the fold at the slower period knows which is the strong one.
+       Echolokators measures 152 and maps at 76: the app's mid-song anchor picked the weak half
+       and every map beat sat +0.5 beat off (2026-11-22). The app's beatPadSecs uses these.
+
+    Returns {duration, raw_bpm, bpm, phase, confidence, drift, candidates, phases}. Candidates
+    and raw_bpm are 2 dp; bpm 3 dp; phases 4 dp (seconds).
     """
     import numpy as np
     import librosa
@@ -1640,14 +1646,15 @@ def detect_bpm_librosa(audio_path: str, lo: float = 60, hi: float = 200) -> dict
     env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=TEMPO_HOP)
     fit = fold_tempo(env, TEMPO_HOP / sr, raw)
     bpm = fit['bpm']
-    cands = sorted({round(bpm * m, 2) for m in (0.25, 0.5, 1, 2, 4)
-                    if lo * 0.95 <= bpm * m <= hi * 1.05})
-    if not cands:
-        cands = [round(bpm, 2)]
+    octs = [m for m in (0.25, 0.5, 1, 2, 4) if lo * 0.95 <= bpm * m <= hi * 1.05] or [1]
+    cands = sorted({round(bpm * m, 2) for m in octs})
+    phases = {f'{bpm * m:.2f}': round(fit['phase'] if m == 1 else
+                                      lattice_phase(env, TEMPO_HOP / sr, bpm * m)['phase'], 4)
+              for m in octs}
     return {'duration': round(duration, 3), 'raw_bpm': round(raw, 2),
             'bpm': round(bpm, 3), 'phase': round(fit['phase'], 4),
             'confidence': round(fit['confidence'], 3), 'drift': fit['drift'],
-            'candidates': cands}
+            'candidates': cands, 'phases': phases}
 
 
 def onset_phase_lock(times, bpm: float, phase: float = 0.0, bins: int = 16) -> dict:

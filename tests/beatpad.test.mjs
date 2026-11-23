@@ -56,6 +56,25 @@ test('the 2-dp BPM field: anchored mid-song, the residual stays tiny over the wh
   // anchoring at t=0 instead would double the end error; mid-song keeps it split
 });
 
+// Found live 2026-11-22: Echolokators measures 152 (phase 0.017 s) but maps at 76 (library/lookup).
+// The mid-song anchor's parity picked the WEAK of the two half-time phases, so every map beat sat
+// +0.5 beat off the music. The server now sends `phases` (each candidate folded at its own period;
+// these are the real values) and the pad uses the chosen octave's.
+test('half-time uses the strong phase folded at the slower period, not the anchor parity', () => {
+  const measured = { bpm: 151.998, phase: 0.017, duration: 300.499 };
+  const P76 = 60 / 76;
+  const off = pad => { const x = ((0.0127 + pad) / P76) % 1; return Math.min(x, 1 - x); }; // strong-phase distance, beats
+  // without phases (old server): the anchor lands on the weak half — the bug as shipped
+  assert.ok(off(beatPadSecs(76, measured)) > 0.45, 'old rule should reproduce the half-beat bug');
+  // with phases: the strong beat is beat 1. Residual ~0.0025 beat (2 ms): the 76.00 map vs the
+  // 75.999 octave lattice, split across the song by the mid-song anchor. The bug was 0.5.
+  const pad = beatPadSecs(76, { ...measured, phases: { '76.00': 0.0127, '152.00': 0.017 } });
+  assert.ok(off(pad) < 0.01, `pad ${pad} leaves ${off(pad)} beat`);
+  // the measured octave itself still comes out the same either way
+  assert.equal(beatPadSecs(152, { ...measured, phases: { '76.00': 0.0127, '152.00': 0.017 } }),
+               beatPadSecs(152, measured));
+});
+
 test('padAudioBuffer prepends silence to every channel', () => {
   const ctx = { createBuffer: (ch, len, sr) => {
     const data = Array.from({ length: ch }, () => new Float32Array(len));
