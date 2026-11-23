@@ -258,10 +258,16 @@ function run(lib, s, diff, hints = {}, seed = 7, sink = null) {
   } finally { for (const [k, f] of quiet) console[k] = f; delete globalThis.window; }
 }
 
+// The obstacle comfort-reach rule (2026-11-22) deliberately moves notes during walls. Its
+// aerobicReach mode is the pre-rule placement (tests/obstacles pins that against the commit
+// before it), so running NOW in that mode keeps these checks isolating the triplet change.
+// The mode tags each wall `aerobic: true`; drop the tag before comparing.
+const LEGACY_REACH = { aerobicReach: true };
+const untag = r => ({ ...r, walls: r.walls.map(({ aerobic, ...w }) => w) });
 for (const diff of [9, 8, 6, 2]) {
   test(`onsetsToNotes diff ${diff}: straight song is identical to the pre-triplet baseline`, () => {
     const s = song('straight', { seed: 50 + diff });
-    const a = run(NOW, s, diff), b = run(HEAD, s, diff);
+    const a = untag(run(NOW, s, diff, LEGACY_REACH)), b = run(HEAD, s, diff);
     assert.ok(a.notes.length > 50, `only ${a.notes.length} notes`);
     assert.deepEqual(a, b);
   });
@@ -269,7 +275,7 @@ for (const diff of [9, 8, 6, 2]) {
 
 test('onsetsToNotes: a swung song with the swing snap switched off is identical to the pre-triplet baseline', () => {
   const s = song('swung', { seed: 61 });
-  assert.deepEqual(run(NOW, s, 9, { swingMode: 'off' }), run(HEAD, s, 9));
+  assert.deepEqual(untag(run(NOW, s, 9, { swingMode: 'off', ...LEGACY_REACH })), run(HEAD, s, 9));
 });
 
 for (const diff of [9, 8, 6]) {
