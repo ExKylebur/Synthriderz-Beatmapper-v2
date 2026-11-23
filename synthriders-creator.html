@@ -1557,14 +1557,20 @@ function createMotifMemory(sections) {
 // ── Two-hand move library — shared by [DenseSweep] and [SparseSweep] ─────────────────────
 // Each move is a fixed sequence of { l:[col,row]|null, r:[col,row]|null } steps (col 0-14,
 // row 1-9). `cross` lets a move reach across the centre line. Previewed in move_playbook.html.
+// Circles are NOT step moves any more: a dense region is too short to draw one (see the
+// [Orbit] block below), so they are placed per phrase by applyOrbitPhrases instead.
 function buildDanceMoves() {
   const cc = (v, a, b) => Math.max(a, Math.min(b, Math.round(v)));
   const MOVES = [];
   const addMove = (name, cross, steps) => MOVES.push({ name, cross, steps });
-  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.6, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI, dx = Math.cos(a), dy = Math.sin(a); s.push({ l: [cc(Lc + rc * dx, 0, 7), cc(cy - rr * dy, 1, 9)], r: [cc(Rc + rc * dx, 7, 14), cc(cy - rr * dy, 1, 9)] }); } addMove('parallelSpiral', false, s); }
-  { let s = []; const N = 8, Lc = 3.5, Rc = 10.5, cy = 5, rc = 2.8, rr = 3; for (let k = 0; k < N; k++) { const a = k / N * 2 * Math.PI; s.push({ l: [cc(Lc - rc * Math.cos(a), 0, 7), cc(cy - rr * Math.sin(a), 1, 9)], r: [cc(Rc + rc * Math.cos(a), 7, 14), cc(cy - rr * Math.sin(a), 1, 9)] }); } addMove('mirrorSpiral', false, s); }
   { const Lr = [9, 7, 5, 3, 1, 3, 5, 7], Rr = [1, 3, 5, 7, 9, 7, 5, 3]; addMove('scissors', false, Lr.map((v, k) => ({ l: [4, v], r: [10, Rr[k]] }))); }
-  { const a = [5, 1, 5, 1, 5, 1], b = [9, 13, 9, 13, 9, 13], rw = [5, 5, 3, 3, 7, 7]; addMove('doublePunch', false, a.map((v, k) => ({ l: [v, rw[k]], r: [b[k], rw[k]] }))); }
+  // starPunch: both hands jab out from a home spot beside the body and come back, fanning
+  // through five directions (out, out-up, out-down, up, down). Every jab is exactly 3
+  // Manhattan from home, the dense step cap, so the cap never bends a jab. Mirror images.
+  { const home = [5, 5], fan = [[-3, 0], [-2, -1], [-2, 1], [-1, -2], [-1, 2]], s = [];
+    const pair = (c, r) => ({ l: [c, r], r: [14 - c, r] });
+    for (const [dc, dr] of fan) { s.push(pair(home[0] + dc, home[1] + dr)); s.push(pair(home[0], home[1])); }
+    addMove('starPunch', false, s); }
   { addMove('altJabs', false, [{ l: [2, 5], r: null }, { l: null, r: [12, 5] }, { l: [3, 4], r: null }, { l: null, r: [11, 4] }, { l: [1, 6], r: null }, { l: null, r: [13, 6] }]); }
   { let s = []; for (let k = 0; k < 6; k++) s.push({ l: [1 + k, 9 - k], r: [8 + k, 9 - k] }); addMove('parallelStairs', false, s); }
   { const a = [1, 3, 5, 6, 5, 3, 1], b = [13, 11, 9, 8, 9, 11, 13]; addMove('accordion', false, a.map((v, k) => ({ l: [v, 5], r: [b[k], 5] }))); }
@@ -1582,8 +1588,8 @@ const DANCE_MOVES = buildDanceMoves();
 // Notes whose position is owned by a two-hand choreography move. Obstacle occlusion clamps
 // them instead of re-scattering (_toBand), C3 prefers to move loose notes over them, and
 // boundary smoothing treats them as anchors. GoldSweep is NOT included: it is gold-only and
-// has its own handling everywhere it matters.
-function isPattern(n) { return !!(n && (n._denseSweep || n._sparseSweep)); }
+// has its own handling everywhere it matters. [Orbit] circles count too (tag _orbit).
+function isPattern(n) { return !!(n && (n._denseSweep || n._sparseSweep || n._orbit)); }
 
 // Pattern-edge smoothing. Where exactly one of a consecutive same-hand pair is
 // pattern-tagged and the jump exceeds C3 (>7 cols or >5 rows), nudge the LOOSE note to
@@ -1609,6 +1615,196 @@ function smoothPatternBoundaries(orbs) {
     }
   }
   return clamped;
+}
+
+// ── [Orbit] circular two-hand phrases (2026-11-22) ───────────────────────────────────────
+// Why the old circles never read in VR (measured offline on 4 songs at Master): they were 8
+// fixed steps walked once per DENSE REGION, and dense regions are tiny (median span 1-2.7
+// beats) because any gap over 0.5 beat splits them. Each hand drew 4-7 points, about HALF a
+// turn, and obstacle occlusion then clamped half of those flat. They read as arcs.
+// An orbit is placed per PHRASE instead. Every free red/blue orb in a window takes the point
+// of a circle at its own TIME: angle = start + dir·2π·(beat − t0)/period. So the circle
+// carries straight across the gaps that split dense regions, both hands stay in step whatever
+// their rhythm, and each hand completes 1-3 full turns at 6-16 notes per turn.
+// Geometry, in cells. In-game a column step equals a row step (both 0.1365 units), so equal
+// radii are a true circle. (The 3D preview scales x by P3D.x and y by P3D.y, so it draws a
+// game circle as a 1.35:1 wide ellipse.)
+//   parallel: both hands turn the same way, centres col 3.5 / 10.5, radius 3 → rows 2-8,
+//             left cols 1-7, right 8-14 (the hands stay 7 columns apart);
+//   mirror:   left turns clockwise and right counter-clockwise, centres 3 / 11, 2.5 columns
+//             wide, so at the inner point the hands are still 3 columns apart (cols 6 / 9).
+// Robust to the post-passes by construction, not by repair:
+//   * no window touches a lean/slide occlusion window (a side wall squeezes a hand into 3-4
+//     columns and a centre slide moves rows ±3, so no circle survives either). A crouch only
+//     pushes rows 0-3 down, so a phrase under a crouch just uses rows 4+;
+//   * no rail ±1 beat (C1 would re-snap the notes onto the rail) and no gold/green orb ±1
+//     beat (C2 clearance, and a both-hand note would interrupt the circle);
+//   * per-hand gaps are capped at a quarter turn, so a consecutive same-hand step is at most
+//     a 90° chord (4.2 cells) — never a C3 jump; the entry/exit neighbours get the shared
+//     smoothPatternBoundaries nudge, and clampC3Jumps stays the backstop.
+// [DenseSweep], [SparseSweep] and [Crossover] skip _orbit notes, and [PatternCoverage] counts
+// them but never demotes them (like rails and GoldSweep).
+const ORBIT_VARIANTS = ['parallel', 'mirror'];
+const ORBIT_GEOM = {
+  parallel: { cx: [10.5, 3.5], rc: 3, mirror: false },
+  mirror:   { cx: [11, 3], rc: 2.5, mirror: true },
+};
+const ORBIT_PERIODS = [2, 3, 4, 6, 8, 12];  // beats per turn: half a bar … three bars
+const ORBIT_NPR = 10;                // target notes per turn per hand (6-16 still reads round)
+const ORBIT_NPR_MIN = 6;
+const ORBIT_NPR_MAX = 16;
+const ORBIT_TURN_SEC_MIN = 1.6;      // a turn faster than this is arm-flailing
+const ORBIT_TURN_SEC_MAX = 6.0;      // slower than this stops reading as a circle
+const ORBIT_MIN_TURNS = 1.0;
+const ORBIT_MAX_TURNS = 3.0;
+const ORBIT_MIN_NOTES = 6;           // on the busier hand
+const ORBIT_JOIN_GAP = 3;            // beats between consecutive orbs (any hand) before a segment ends;
+                                     // the per-hand quarter-turn rule does the real cutting
+const ORBIT_SPACING = 8;             // min beats between two phrases
+const ORBIT_MAX_SHARE = 0.15;        // orbit notes as a share of all notes
+// The point (unrounded col, row) a hand sits at, angle theta, on a circle centred on row cy
+// with vertical radius rr. theta grows counter-clockwise as the player sees it (col 14 is the
+// player's right, row 0 the top).
+function orbitPoint(variant, hand, theta, cy, rr) {
+  const g = ORBIT_GEOM[variant] || ORBIT_GEOM.parallel;
+  const c = Math.cos(theta), s = Math.sin(theta);
+  const dx = g.mirror && hand === 1 ? -g.rc * c : g.rc * c;
+  return [g.cx[hand === 0 ? 0 : 1] + dx, cy - rr * s];
+}
+// Candidate beats-per-turn for a phrase whose hands play every `gap` beats: the ORBIT_PERIODS
+// entries within the notes-per-turn and seconds-per-turn bounds, best first (notes-per-turn
+// nearest ORBIT_NPR; ties → the shorter period, more turns). Empty when none fits.
+function orbitPeriods(gap, bps) {
+  return ORBIT_PERIODS.filter(P => {
+    const npr = P / gap, sec = P / bps;
+    return npr >= ORBIT_NPR_MIN && npr <= ORBIT_NPR_MAX && sec >= ORBIT_TURN_SEC_MIN && sec <= ORBIT_TURN_SEC_MAX;
+  }).sort((a, b) => Math.abs(a / gap - ORBIT_NPR) - Math.abs(b / gap - ORBIT_NPR) || a - b);
+}
+function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, sectionAt = () => null,
+                                     pickVariant = (_sec, k) => ORBIT_VARIANTS[k % ORBIT_VARIANTS.length],
+                                     maxShare = ORBIT_MAX_SHARE } = {}) {
+  const isFree = n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail;
+  const orbs = result.filter(isFree).sort((a, b) => a.beat - b.beat);
+  const block = [], low = [];
+  for (const w of walls || []) {
+    const span = [w.beat - OBSTACLE_LEAD_BEATS, w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS];
+    (w.wallType === 'crouch' ? low : block).push(span);
+  }
+  for (const n of result) {
+    if (n.railEndBeat !== undefined) block.push([n.beat - 1, n.railEndBeat + 1]);
+    else if (!isFree(n)) block.push([n.beat - 1, n.beat + 1]);   // gold, green, rail companions
+  }
+  const hit = (b, spans) => spans.some(([s, e]) => b >= s - 1e-9 && b <= e + 1e-9);
+  const median = a => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+  // 1. Candidate phrases: unblocked orbs joined while every gap <= ORBIT_JOIN_GAP. For each
+  //    period that suits the per-hand rhythm, cut wherever one hand rests longer than a
+  //    quarter turn, chop long pieces into back-to-back chunks of <= ORBIT_MAX_TURNS, and keep
+  //    the chunks that give >= ORBIT_MIN_TURNS. The best-preference period wins unless another
+  //    one covers clearly more notes, so a short gap between two walls still gets a full
+  //    (quicker) turn instead of nothing.
+  const cands = [];
+  const piecesFor = (seg, P, g) => {
+    const out = [];
+    let piece = [];
+    const last = [null, null];
+    const take = keep => {
+      const t0 = keep[0].beat, turns = (keep[keep.length - 1].beat - t0 + g) / P;
+      const busy = Math.max(...[0, 1].map(h => keep.filter(n => n.type === h).length));
+      if (turns >= ORBIT_MIN_TURNS && busy >= ORBIT_MIN_NOTES) out.push({ notes: keep, P, t0, t1: keep[keep.length - 1].beat, turns });
+    };
+    const flush = () => {
+      let rest = piece;
+      while (rest.length) {
+        const t0 = rest[0].beat, k = rest.findIndex(n => n.beat - t0 >= ORBIT_MAX_TURNS * P - 1e-9);
+        take(k < 0 ? rest : rest.slice(0, k));
+        rest = k < 0 ? [] : rest.slice(k);
+      }
+      piece = []; last[0] = last[1] = null;
+    };
+    for (const n of seg) {
+      const l = last[n.type];
+      if (l !== null && n.beat - l > P / 4 + 1e-9) flush();
+      piece.push(n); last[n.type] = n.beat;
+    }
+    flush();
+    return out;
+  };
+  const consider = seg => {
+    const gaps = [];
+    for (const h of [0, 1]) { const hn = seg.filter(n => n.type === h); for (let i = 1; i < hn.length; i++) gaps.push(hn[i].beat - hn[i - 1].beat); }
+    if (gaps.length < ORBIT_MIN_NOTES) return;
+    const g = median(gaps);
+    const opts = orbitPeriods(g, bps).map(P => {
+      const ps = piecesFor(seg, P, g);
+      return { ps, n: ps.reduce((t, c) => t + c.notes.length, 0) };
+    });
+    const most = Math.max(0, ...opts.map(o => o.n));
+    const pick = opts.find(o => o.n > 0 && o.n >= 0.8 * most);     // preference order, unless it loses >20%
+    if (pick) cands.push(...pick.ps);
+  };
+  let seg = [];
+  for (const n of orbs) {
+    const blocked = hit(n.beat, block);
+    if (seg.length && (blocked || n.beat - seg[seg.length - 1].beat > ORBIT_JOIN_GAP)) { consider(seg); seg = []; }
+    if (!blocked) seg.push(n);
+  }
+  if (seg.length) consider(seg);
+  // 2. Choose: fullest phrases first (turns capped at 2, times notes), >= ORBIT_SPACING beats
+  //    apart, within the note budget.
+  const budget = Math.floor(maxShare * result.length);
+  const chosen = [];
+  let used = 0;
+  for (const c of cands.sort((a, b) => Math.min(2, b.turns) * b.notes.length - Math.min(2, a.turns) * a.notes.length)) {
+    if (used + c.notes.length > budget) continue;
+    if (chosen.some(o => c.t0 < o.t1 + ORBIT_SPACING && o.t0 < c.t1 + ORBIT_SPACING)) continue;
+    chosen.push(c); used += c.notes.length;
+  }
+  chosen.sort((a, b) => a.t0 - b.t0);
+  // 3. Place each phrase on its circle.
+  const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  let tagged = 0, turns = 0;
+  chosen.forEach((c, k) => {
+    let lo = rowLo, hi = rowHi;
+    if (c.notes.some(n => hit(n.beat, low))) lo = Math.max(lo, 4);    // under a crouch bar
+    const rr = Math.min(3, (hi - lo) / 2), cy = (lo + hi) / 2;
+    if (rr < 1.5) return;
+    const variant = pickVariant(sectionAt(c.t0), k);
+    const dir = k % 2 === 0 ? 1 : -1;
+    const ang = t => dir * 2 * Math.PI * (t - c.t0) / c.P;
+    // Start angle: of 16, the one whose first point per hand sits nearest that hand's previous
+    // note (within 4 beats), so the circle begins where the hand already is. Else the bottom.
+    const prev = [0, 1].map(h => result.filter(n => n.type === h && n.beat < c.t0 && c.t0 - n.beat <= 4)
+      .sort((a, b) => b.beat - a.beat)[0] || null);
+    const first = [0, 1].map(h => c.notes.find(n => n.type === h) || null);
+    let th0 = -Math.PI / 2, bestD = Infinity;
+    if (prev.some((p, h) => p && first[h])) {
+      for (let q = 0; q < 16; q++) {
+        const th = q * Math.PI / 8;
+        let d = 0;
+        for (const h of [0, 1]) {
+          if (!prev[h] || !first[h]) continue;
+          const [pc, pr] = orbitPoint(variant, h, th + ang(first[h].beat), cy, rr);
+          const p = prev[h];
+          const px = p.railEndBeat !== undefined ? (p.railEnd_x ?? p._x) : p._x;
+          const prow = p.railEndBeat !== undefined ? (p.railEndRow ?? p.row) : p.row;
+          d += (pc - xCol(px)) ** 2 + (pr - (prow || 0)) ** 2;
+        }
+        if (d < bestD - 1e-9) { bestD = d; th0 = th; }
+      }
+    }
+    for (const n of c.notes) {
+      const z = handZoneCols(n.type);
+      const [pc, pr] = orbitPoint(variant, n.type, th0 + ang(n.beat), cy, rr);
+      n._preSweep = n._preSweep || { x: n._x, row: n.row };   // [PatternCoverage] snapshot contract
+      n._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, Math.round(pc)))];
+      n.row = Math.max(lo, Math.min(hi, Math.round(pr)));
+      n._orbit = variant;
+      tagged++;
+    }
+    turns += c.turns;
+  });
+  return { phrases: chosen.length, tagged, turns: Math.round(turns * 10) / 10,
+           smoothed: tagged ? smoothPatternBoundaries(orbs) : 0 };
 }
 
 // ── [SparseSweep] choreograph LOOSE runs with the same move library ─────────────────────
@@ -1673,9 +1869,9 @@ function applySparseSweep(result, { rowLo = 2, rowHi = 8, maxGap = SSW_MAXGAP, m
 
 // ── [PatternCoverage] keep choreographed coverage in band ─────────────────────────────
 // Coverage = share of ALL notes owned by a shape: rails (heads + companions), DenseSweep,
-// SparseSweep, GoldSweep. Under the band: one promotion attempt (caller passes a relaxed
+// SparseSweep, [Orbit], GoldSweep. Under the band: one promotion attempt (caller passes a relaxed
 // SparseSweep). Over the band: demote SparseSweep runs (shortest first), then DenseSweep,
-// restoring each note's pre-sweep position. Rails and GoldSweep are never touched.
+// restoring each note's pre-sweep position. Rails, [Orbit] circles and GoldSweep are never touched.
 const PATTERN_COVERAGE_BAND = { lo: 0.60, hi: 0.80 };
 function isCoverageNote(n) { return n.railEndBeat !== undefined || !!n._comp || isPattern(n) || !!n._goldSweep; }
 function patternCoverage(notes) { return notes.length ? notes.filter(isCoverageNote).length / notes.length : 0; }
@@ -7857,13 +8053,28 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     if (gReshaped > 0) console.log(`[GoldSweep] Choreographed ${gReshaped} gold run(s) across ${GOLD_SHAPES} path shapes`);
   }
 
+  // ── [Orbit] circular two-hand phrases — see applyOrbitPhrases ─────────────────────────
+  // Runs BEFORE DenseSweep/SparseSweep (both skip _orbit notes) so a circle owns its whole
+  // window, and after GoldSweep and wall generation, whose golds and walls it steers around.
+  {
+    const _orb = applyOrbitPhrases(result, {
+      walls: autoWalls, rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), bps, sectionAt,
+      pickVariant: (sec, k) => {
+        const v = motifMemory.replay(sec, 'orbit') ?? ORBIT_VARIANTS[k % ORBIT_VARIANTS.length];
+        motifMemory.record(sec, 'orbit', v);
+        return v;
+      },
+    });
+    if (_orb.phrases) console.log(`[Orbit] ${_orb.phrases} circular phrase(s), ${_orb.tagged} orbs, ${_orb.turns} turn(s) in all; boundary-smoothed ${_orb.smoothed}`);
+  }
+
   // ── [DenseSweep] flowing groups for dense runs (v2) ───────────────────────────────────
   // In tight/dense sections the per-note arc + jitter scatter notes across the grid (hectic).
   // This reshapes dense runs of FREE orbs into smooth, readable GROUPS built from a LIBRARY of
-  // choreographed TWO-HAND MOVES (parallel/mirror spirals, scissors, staccato punches, jabs,
-  // stairs, accordion, wings, DNA helix, pendulum, bloom, box step, heartbeat + a controlled
-  // cross-body). A dense run walks ONE move, one step per beat, then rotates to the next when
-  // the move ends (~6-8 beats), so a long run reads as varied choreography instead of one
+  // choreographed TWO-HAND MOVES (scissors, star punches, jabs, stairs, accordion, wings, DNA
+  // helix, pendulum, bloom, box step, heartbeat + a controlled cross-body; circles are [Orbit]
+  // phrases above, never cut into 1-3-beat regions). A dense run walks ONE move, one step per
+  // beat, then rotates to the next when the move ends (~6-10 beats), so a long run reads as varied choreography instead of one
   // motion. Reds take the move's right-hand spot, blues the left; a null hand holds its last
   // spot. Each applied step is reachability-capped. Only fires on dense runs (<=0.5-beat
   // spacing, >=4 orbs over >=3 beats); sparser sections keep the normal arc flow. Protects
@@ -7886,8 +8097,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     let _dswRuns = 0, _dswNotes = 0, _reg = 0;
     let i = 0;
     while (i < orbs.length) {
+      if (orbs[i]._orbit) { i++; continue; }              // an [Orbit] circle owns this note
       let j = i;
-      while (j + 1 < orbs.length && orbs[j + 1].beat - orbs[j].beat <= _dswGap(orbs[j].beat)) j++;
+      while (j + 1 < orbs.length && !orbs[j + 1]._orbit && orbs[j + 1].beat - orbs[j].beat <= _dswGap(orbs[j].beat)) j++;
       const region = orbs.slice(i, j + 1);
       const beatKeys = new Set(region.map(o => Math.round(o.beat * 64)));
       if (region.length >= DSW_MINRUN && beatKeys.size >= 3) {
@@ -7997,7 +8209,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (const hand of [0, 1]) {
       const opp = 1 - hand;
       const seq = result
-        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail && !n._sparseSweep)
+        .filter(n => n.type === hand && n.railEndBeat == null && !n._comp && !n._gapFill && !n._underSquatRail && !n._sparseSweep && !n._orbit)
         .sort((a, b) => a.beat - b.beat);
       _xDiag[hand].pool = seq.length;
       let lastCrossBeat = -99;
@@ -10929,9 +11141,9 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       rail_dur: n.railEndBeat != null
         ? parseFloat(((n.railEndBeat - n.beat) / bps).toFixed(1))
         : null,
-      // pattern: which choreography pass placed this note ('dense'/'gold'), else omitted.
+      // pattern: which choreography pass placed this note ('dense'/'sparse'/'orbit'/'gold'), else omitted.
       // Lets the critic accept intended in-pattern movement while still judging loose sections.
-      ...(n._denseSweep ? { pattern: 'dense' } : n._sparseSweep ? { pattern: 'sparse' } : n._goldSweep ? { pattern: 'gold' } : {}),
+      ...(n._denseSweep ? { pattern: 'dense' } : n._sparseSweep ? { pattern: 'sparse' } : n._orbit ? { pattern: 'orbit' } : n._goldSweep ? { pattern: 'gold' } : {}),
     }));
 
   // Row distribution across 11 layers (Ceiling … Floor)
@@ -11414,7 +11626,7 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       const _c3Detail = [];
       // tag string for diagnosis: which pass owns each offending note
       const _tags = n => [n.railEndBeat != null && 'rail', n._comp && 'comp',
-        n._denseSweep && 'dsw', n._sparseSweep && 'ssw', n._goldSweep && 'gsw', n._crossover && 'xover',
+        n._denseSweep && 'dsw', n._sparseSweep && 'ssw', n._orbit && 'orbit', n._goldSweep && 'gsw', n._crossover && 'xover',
         n._gapFill && 'gap'].filter(Boolean).join('+') || 'plain';
       const _railsByHandFin = buildRailsByHand(currentNotes);
       for (let h = 0; h <= 1; h++) {

@@ -28,11 +28,12 @@ These are correct by design. Never penalize them:
 
 ### Choreographed patterns (pattern-tagged notes)
 
-The generator reshapes some sections into deliberate choreography. Sampled notes carry `pattern: "dense"`, `pattern: "sparse"` or `pattern: "gold"` when they belong to one:
+The generator reshapes some sections into deliberate choreography. Sampled notes carry `pattern: "dense"`, `pattern: "sparse"`, `pattern: "orbit"` or `pattern: "gold"` when they belong to one:
 
 - **[GoldSweep] `pattern:"gold"`** — gold runs of 3+ shaped along a 5-shape palette (diagonal/circle/pendulum/wave/valley), moving in BOTH axes (cols 3–11, rows 2–8), ≤3 Manhattan step/orb. Vertical/curved/non-linear gold motion is intentional. Gold-to-gold spacing exempt from C2.
-- **[DenseSweep] `pattern:"dense"`** — dense runs choreographed from a 14-move library incl. **spiral** and **spike** shapes, ≤3 Manhattan step/hand/beat. A dense run may trace a spiral or spike, not just a simple arc.
-- **[SparseSweep] `pattern:"sparse"`** — LOOSE runs (0.5–1.5-beat spacing) choreographed from the SAME 14-move library, ≤3–5 Manhattan step/hand (cap grows with the gap). Treat like `dense`: intended shape, judge only its entry/exit via `nonpattern_big_jumps`.
+- **[DenseSweep] `pattern:"dense"`** — dense runs choreographed from a 12-move library (scissors, star punch, jabs, stairs, accordion, wings, helix, pendulum, bloom, box step, heartbeat, cross-return), ≤3 Manhattan step/hand/beat.
+- **[Orbit] `pattern:"orbit"`** — a whole phrase (1–3 full turns per hand, 6–16 notes per turn) where both hands circle at radius ~3 cells, in parallel or as mirror images. Every orb in the phrase sits on the circle at its own time, so large continuous circular motion, both axes changing every note, is the intent. Treat like `dense`; judge only its entry/exit via `nonpattern_big_jumps`.
+- **[SparseSweep] `pattern:"sparse"`** — LOOSE runs (0.5–1.5-beat spacing) choreographed from the SAME 12-move library, ≤3–5 Manhattan step/hand (cap grows with the gap). Treat like `dense`: intended shape, judge only its entry/exit via `nonpattern_big_jumps`.
 - **Chorus motifs** — later choruses deliberately REPLAY the first chorus's rail shapes / sweep moves / gold shapes (intensity still escalates). Repetition across choruses is intended; do not flag it as "repetitive".
 - **[RailShapes]** — shape is length-tiered, not one flat roll: short rails (<2.5 beats) use ellipse/hook/flick; mid (2.5–8 beats) add wave/zigzag/pendulum/switchback/ramp; long (8+ beats) add spiral/figure8/staircase. Sharp corners (hook/flick/switchback), a tightening spiral, a figure-8 crossing pattern, or discrete stair-step rows are all intentional shaping, not "erratic" — they satisfy the ≥60% X-variation target the same way the older ellipse/wave/zigzag/pendulum set did. Rails ≥6 beats chain 2–3 of these shapes back to back (e.g. wave→hook); a mid-rail change of character is intentional.
 
