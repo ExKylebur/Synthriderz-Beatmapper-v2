@@ -160,6 +160,76 @@ test('beat-1 pad: every stem\'s onsets shift by the pad and stay locked', () => 
   }
 });
 
+// ── dense loud passage vs quiet passage (drum gate, 2026-11-22) ──────────────
+// Painkiller at Master lost ~20% of its notes to the SuperFlux detector: in a continuous double-kick
+// passage the hits raise the ±15 s mean and σ, so the weaker 16ths fell under the 1σ gate, and a
+// lockout of exactly one 16th dropped 16ths that land a few ms early. The drum stem now uses an NMS
+// gap of 0.8 x the lockout and z > 0.5 where the MIX is in its louder half; quiet passages keep 1σ.
+// 103 BPM, 48 s, three levels so the quiet part sits clearly in the song's quieter half (the gate is
+// RELATIVE to the song: a two-level 50/50 song puts its median inside the quiet level).
+// 0-24 s LOUD (loud chord + bass in the other stems): a kick on every 16th, the off-16ths at 0.42 and
+// 8 ms early, a snare on 2 & 4. 24-36 s medium, 36-48 s quiet: a soft hat on each 8th; the quiet
+// part also has ghost hits (0.016) on the "e", z 0.70-0.86 (measured): a flat z > 0.5 gate catches
+// 100% of them, the 1σ gate none.
+const dense = py(`
+import numpy as np, soundfile as sf, tempfile, os, server
+SR = 44100; bpm, phase, dur, split = 103.0, 0.30, 48.0, 24.0
+P = 60 / bpm; n = int(dur * SR); tt = np.arange(n) / SR; rng = np.random.default_rng(11)
+burst = lambda d: np.arange(int(d * SR)) / SR
+def ad(d, att, dec):
+    t = burst(d); return np.minimum(t / att, 1) * np.exp(-np.maximum(t - att, 0) / dec)
+def add(y, t0, b):
+    i = int(round(t0 * SR)); j = min(n, i + len(b)); y[i:j] += b[:j - i]
+kick = np.sin(2 * np.pi * (50 + 80 * np.exp(-burst(0.2) / 0.03)) * burst(0.2)) * ad(0.2, 0.002, 0.06)
+snare = rng.normal(0, 0.6, int(0.2 * SR)) * ad(0.2, 0.001, 0.05) + 0.4 * np.sin(2 * np.pi * 190 * burst(0.2)) * ad(0.2, 0.001, 0.07)
+hat = np.diff(rng.normal(0, 0.5, int(0.05 * SR) + 1)) * ad(0.05, 0.0005, 0.012)
+drums = np.zeros(n); slots, early, quiet, ghosts = [], [], [], []
+for k, s in enumerate(phase + P / 4 * np.arange(int((dur - phase - 0.5) / (P / 4)))):
+    if s < split - 0.3:
+        t0 = s if k % 2 == 0 else s - 0.008
+        add(drums, t0, kick * (1.0 if k % 2 == 0 else 0.42))
+        if k % 8 == 4: add(drums, s, 0.8 * snare)
+        slots.append(s)
+        if k % 2: early.append(t0)
+    elif s > split + 0.3:
+        if k % 2 == 0: add(drums, s, 0.35 * hat); quiet.append(s)
+        elif k % 4 == 1 and s > 37.0: add(drums, s, 0.016 * hat); ghosts.append(s)
+drums += rng.normal(0, 0.002, n)
+level = np.where(tt < split, 1.0, np.where(tt < 36.0, 0.4, 0.1))
+other = 0.5 * level * sum(np.sin(2 * np.pi * f * tt) for f in (196, 247, 294)) / 3
+bass = 0.4 * level * np.sin(2 * np.pi * 55 * tt)
+d = tempfile.mkdtemp(); stems = {}
+for name, y in (('drums', drums), ('bass', bass), ('vocals', rng.normal(0, 0.001, n)), ('other', other)):
+    y = y / np.abs(y).max() * 0.8
+    stems[name] = os.path.join(d, name + '.wav'); sf.write(stems[name], np.stack([y, y], 1), SR, subtype='PCM_16')
+t = np.array([o['time'] for o in server.analyse_stems(stems, bpm, None, 0.0)['stems']['drums']['onsets']])
+sig, _ = server.load_wav_mono(stems['drums'], 22050)
+old = np.array([o['time'] for o in server.stem_onsets(sig, 22050, 0.25 * P)])          # 1σ gate, gap 1.0
+flat = np.array([o['time'] for o in server.stem_onsets(sig, 22050, 0.25 * P, thresh=0.5, gap_tol=0.8)])
+for p in stems.values(): os.remove(p)
+os.rmdir(d)
+hit = lambda on, ref, tol=0.02: float(np.mean([np.min(np.abs(on - s)) < tol for s in ref])) if len(on) else 0.0
+A, B = t[t < split], t[t > split]
+print(json.dumps({'dense': hit(A, slots), 'early': hit(A, early, 0.015), 'quiet': hit(B, quiet), 'ghost': hit(B, ghosts),
+                  'old_dense': hit(old[old < split], slots), 'old_early': hit(old[old < split], early, 0.015),
+                  'flat_ghost': hit(flat[flat > split], ghosts), 'n_quiet': int(len(B)), 'quiet_hits': len(quiet),
+                  'n_ghosts': len(ghosts), 'lock': server.onset_phase_lock(t, bpm, phase)}))
+`);
+
+test('drum gate: a loud dense passage keeps its weaker and early 16ths', () => {
+  assert.ok(dense.dense >= 0.8, `dense-passage 16ths found ${dense.dense} (1σ gate: ${dense.old_dense})`);
+  assert.ok(dense.early >= 0.6, `early off-16ths found ${dense.early} (gap 1.0: ${dense.old_early})`);
+  // the old settings really miss them: otherwise this test proves nothing
+  assert.ok(dense.old_dense <= 0.6 && dense.old_early <= 0.1, `old ${dense.old_dense} / ${dense.old_early}`);
+  assert.ok(dense.lock.R[3] >= 0.95 && Math.abs(dense.lock.offset_ms) <= 6, JSON.stringify(dense.lock));
+});
+
+test('drum gate: a quiet passage still needs a clear hit (no ghost notes)', () => {
+  assert.equal(dense.quiet, 1, `quiet hats found ${dense.quiet}`);
+  assert.ok(dense.ghost <= 0.15, `${dense.ghost} of ${dense.n_ghosts} ghost hits picked up in the quiet passage`);
+  assert.ok(dense.flat_ghost >= 0.8, `a flat z > 0.5 gate caught only ${dense.flat_ghost} ghosts: weak test`);
+});
+
 // ── real full mixes (skipped when ..\MP3 is absent) ──────────────────────────
 // stem_onsets at the drum lockout on the full mix, against the folded grid. Measured 2026-11-21:
 // Resist and Disorder 0.907 (legacy 0.049), Electric Love 0.938 at k=3 (swung; legacy 0.093).

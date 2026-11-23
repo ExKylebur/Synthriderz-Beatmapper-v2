@@ -1415,6 +1415,10 @@ const PLAY_Y_LAYER_H = (PLAY_Y_MAX - PLAY_Y_MIN) / 11; // ≈ 0.1241 per row
 const PROB_BASS_SKIP_WHEN_OWNER = 0.50; // bass 50% thinning even when dominant (breaks metronomic patterns)
 const PROB_NON_OWNER_PASS       = 0.05; // non-dominant stem events pass through at this rate (accent texture — lowered from 0.20 to reduce single-beat stem halos)
 const PROB_SPARSE_SKIP          = 0.40; // sparse noteStyle: drop this fraction of events (breathing room)
+// [FEAT-4] gap-fill coverage in soft passages (see the gap-fill block in onsetsToNotes)
+const GAPFILL_MIN_ENERGY  = 0.10; // an onset above this energy counts as music (digital silence ~0.05); was 0.25
+const GAPFILL_SOFT_ENERGY = 0.30; // below this, or in a 'sparse' section, the soft grid applies
+const GAPFILL_SOFT_SCALE  = 4;    // soft grid = 4x the normal 0.5 s: fill trigger 2 s, fills >= 1 s apart
 
 // ── Shared obstacle buffer ───────────────────────────────────────────────────
 // Beats of clearance appended AFTER an obstacle ends.
@@ -5924,7 +5928,21 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // Currently 1 second worth of beats. Set higher to allow longer silences.
   {
     const gapThreshBeats = (0.5 * bpm) / 60;  // [FEAT-4-ADJUST] 0.5-second threshold (was 1.0s)
-    const minEnergy      = 0.25;               // [FEAT-4-ADJUST] ignore truly silent passages below this
+    // Energy floor for a stem onset to count as "music is playing". Was 0.25, which is ABOVE the
+    // energy of a soft passage (Echolokators 218-234 s sits at 0.15-0.20 with ~40 audible guitar
+    // onsets): gap-fill refused every candidate there, so a section that the main loop had
+    // already thinned (noteStyle 'sparse' drops 40-70% of events) came out with 8 s of dead air.
+    // Digital silence measures ~0.05, so 0.10 still ignores that but admits quiet music.
+    const minEnergy      = GAPFILL_MIN_ENERGY;
+    // Soft passages (sparse noteStyle, or energy below GAPFILL_SOFT_ENERGY) are SUPPOSED to be thin,
+    // so they get the same coverage guarantee on a coarser grid: a gap only triggers a fill once it
+    // is GAPFILL_SOFT_SCALE x longer, and fills are that much further apart. Normal sections keep
+    // the original 0.5 s behaviour exactly.
+    const _gfScaleAt = beat => {
+      const _sec = sectionAt(beat);
+      return (_sec && _sec.noteStyle === 'sparse') || energyAt(beat) < GAPFILL_SOFT_ENERGY
+        ? GAPFILL_SOFT_SCALE : 1;
+    };
 
     // Build an activity timeline: beat of each placed note, or its rail end-beat
     // (whichever is later), so rails count as continuous sound across their window.
@@ -5952,20 +5970,22 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     for (let ai = 0; ai <= actUniq.length; ai++) {
       const nextAct = ai < actUniq.length ? actUniq[ai] : totalBeats;
       const gapLen  = nextAct - prevAct;
+      // Soft passages use a coarser grid (see _gfScaleAt); decided at the gap's midpoint.
+      const gapThresh = gapThreshBeats * _gfScaleAt((prevAct + nextAct) / 2);
 
-      if (gapLen > gapThreshBeats) {
+      if (gapLen > gapThresh) {
         // Find unplaced events inside this gap window (with small inset so fills don't
         // cluster right against the boundary notes on either side).
         const inGap = unplaced.filter(ev =>
-          ev.beat > prevAct + gapThreshBeats * 0.25 &&
-          ev.beat < nextAct - gapThreshBeats * 0.25
+          ev.beat > prevAct + gapThresh * 0.25 &&
+          ev.beat < nextAct - gapThresh * 0.25
         );
 
-        // Place one fill note per gapThreshBeats-wide window so a 3-second gap gets
+        // Place one fill note per gapThresh-wide window so a 3-second gap gets
         // ≈3 fills, each individually anchored to a real onset.
         let windowFloor = prevAct;
         for (const ev of inGap) {
-          if (ev.beat < windowFloor + gapThreshBeats * 0.5) continue; // too close to last fill
+          if (ev.beat < windowFloor + gapThresh * 0.5) continue; // too close to last fill
           const bk = Math.round(ev.beat * 100);
           if (beatOccupied.has(bk)) continue;
 
@@ -8459,16 +8479,22 @@ function reconcileBpm(srv, ref) {
 // Returns 0 without a measurement, or when `bpm` is not an octave of the measured tempo within
 // BEAT_PAD_OCTAVE_TOL (a hand-typed or conflicting BPM: the phase would mean nothing). The
 // measured beat nearest mid-song is the anchor, so a period that differs slightly (the 2-dp BPM
-// field) splits its residual across the song instead of growing from t=0. Half-time picks
-// either of the two beat phases — both are musical beats.
+// field) splits its residual across the song instead of growing from t=0.
+// Slower octave (half-time): the measured lattice holds two interleaved phases, and the anchor's
+// parity picked one blindly. Echolokators (measured 152, mapped at 76) got the weak half: every
+// map beat sat +0.5 beat off (2026-11-22). So when the server sends `phases` (each candidate
+// folded at its OWN period), the chosen octave's phase and period are the lattice instead.
 const BEAT_PAD_OCTAVE_TOL = 0.005;
 function beatPadSecs(bpm, srv) {
   if (!(bpm > 0) || !srv || !(srv.bpm > 0) || typeof srv.phase !== 'number') return 0;
   const oct = 2 ** Math.round(Math.log2(bpm / srv.bpm));
   if (Math.abs(bpm / (srv.bpm * oct) - 1) > BEAT_PAD_OCTAVE_TOL) return 0;
-  const Pm = 60 / srv.bpm, P = 60 / bpm;
+  let base = srv.bpm, phase = srv.phase;
+  const key = srv.phases && Object.keys(srv.phases).find(k => Math.abs(+k / (srv.bpm * oct) - 1) < 1e-3);
+  if (key !== undefined && typeof srv.phases[key] === 'number') { base = srv.bpm * oct; phase = srv.phases[key]; }
+  const Pm = 60 / base, P = 60 / bpm;
   const mid = (srv.duration || 0) / 2;
-  const anchor = srv.phase + Math.max(0, Math.round((mid - srv.phase) / Pm)) * Pm;
+  const anchor = phase + Math.max(0, Math.round((mid - phase) / Pm)) * Pm;
   const pad = (P - (((anchor % P) + P) % P)) % P;
   return (pad < 0.001 || pad > P - 0.001) ? 0 : +pad.toFixed(4);
 }
