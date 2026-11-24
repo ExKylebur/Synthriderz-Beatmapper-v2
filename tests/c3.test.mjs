@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { load, colOf } from './harness.mjs';
 
-const K = load(['COL_X', 'isPattern', 'railPosAt', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast',
-  'buildRailsByHand', 'sameRailWindow', 'clampC3Jumps']);
+const K = load(['COL_X', 'isPattern', 'railPosAt', '_htCol', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast',
+  'buildRailsByHand', 'sameRailWindow', 'c3Pos', 'c3Movable', 'c3Jump', 'clampC3Jumps']);
 const g = (beat, c, row) => ({ beat, type: 3, _x: K.COL_X[c], row, _goldSweep: true });
 
 // Real case from Another Life (Master, BPM 184.57), 2026-11-21: a 6-orb GoldSweep run ending

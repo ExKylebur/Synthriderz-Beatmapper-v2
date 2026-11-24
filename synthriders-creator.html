@@ -1643,6 +1643,10 @@ function smoothPatternBoundaries(orbs) {
 //     pushes rows 0-3 down, so a phrase under a crouch just uses rows 4+;
 //   * no rail ±1 beat (C1 would re-snap the notes onto the rail) and no gold/green orb ±1
 //     beat (C2 clearance, and a both-hand note would interrupt the circle);
+//   * a hand's first and last circle notes reach the gold / green / rail next to them on its
+//     C3 path when that gap is under C3_MIN_GAP_SEC (the clamp would move the circle note, not
+//     the anchor): the start angle counts those misses, and an end note that still misses is
+//     left off the circle as a free note;
 //   * per-hand gaps are capped at a quarter turn, so a consecutive same-hand step is at most
 //     a 90° chord (4.2 cells) — never a C3 jump; the entry/exit neighbours get the shared
 //     smoothPatternBoundaries nudge, and clampC3Jumps stays the backstop.
@@ -1766,6 +1770,19 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
   chosen.sort((a, b) => a.t0 - b.t0);
   // 3. Place each phrase on its circle.
   const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  // C3 anchors at a phrase's edges: the note just before a hand's first circle note (or just
+  // after its last) on that hand's C3 path (handTrajectory), when clampC3Jumps may not move it
+  // (gold, a zone green, a rail, a companion) and the gap is under C3_MIN_GAP_SEC. The ±1-beat
+  // block above doesn't cover that window, and when such a neighbour is out of reach the clamp
+  // moves the CIRCLE's end note instead (seen as an end note pulled into the circle's centre,
+  // 1.5 beats before a gold). Free neighbours are left to smoothPatternBoundaries and the clamp.
+  const traj = [0, 1].map(h => handTrajectory(result, h));
+  const railsByHand = buildRailsByHand(result);
+  const edgeAnchor = (h, n, before) => {
+    const t = traj[h], i = t.indexOf(n), m = t[before ? i - 1 : i + 1];
+    if (!m || c3Movable(m, h, railsByHand) || !c3TooFast(Math.abs(n.beat - m.beat), bps)) return null;
+    return { h, n, pos: c3Pos(m, before) };
+  };
   let tagged = 0, turns = 0;
   chosen.forEach((c, k) => {
     let lo = rowLo, hi = rowHi;
@@ -1775,13 +1792,24 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     const variant = pickVariant(sectionAt(c.t0), k);
     const dir = k % 2 === 0 ? 1 : -1;
     const ang = t => dir * 2 * Math.PI * (t - c.t0) / c.P;
+    const at = (n, th) => {
+      const z = handZoneCols(n.type);
+      const [pc, pr] = orbitPoint(variant, n.type, th + ang(n.beat), cy, rr);
+      return { _x: COL_X[Math.max(z.colMin, Math.min(z.colMax, Math.round(pc)))], row: Math.max(lo, Math.min(hi, Math.round(pr))) };
+    };
     // Start angle: of 16, the one whose first point per hand sits nearest that hand's previous
     // note (within 4 beats), so the circle begins where the hand already is. Else the bottom.
+    // Fewest out-of-reach edge anchors comes first; with none, the choice is the plain one.
     const prev = [0, 1].map(h => result.filter(n => n.type === h && n.beat < c.t0 && c.t0 - n.beat <= 4)
       .sort((a, b) => b.beat - a.beat)[0] || null);
     const first = [0, 1].map(h => c.notes.find(n => n.type === h) || null);
-    let th0 = -Math.PI / 2, bestD = Infinity;
-    if (prev.some((p, h) => p && first[h])) {
+    const last = [0, 1].map(h => [...c.notes].reverse().find(n => n.type === h) || null);
+    const anchors = [0, 1].flatMap(h => [first[h] && edgeAnchor(h, first[h], true), last[h] && edgeAnchor(h, last[h], false)])
+      .filter(Boolean);
+    const misses = th => anchors.filter(a => c3Jump(a.pos, at(a.n, th)));
+    const hasPrev = prev.some((p, h) => p && first[h]);
+    let th0 = -Math.PI / 2, bestD = hasPrev ? Infinity : 0, bestV = anchors.length ? misses(th0).length : 0;
+    if (hasPrev || bestV) {
       for (let q = 0; q < 16; q++) {
         const th = q * Math.PI / 8;
         let d = 0;
@@ -1793,15 +1821,20 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
           const prow = p.railEndBeat !== undefined ? (p.railEndRow ?? p.row) : p.row;
           d += (pc - xCol(px)) ** 2 + (pr - (prow || 0)) ** 2;
         }
-        if (d < bestD - 1e-9) { bestD = d; th0 = th; }
+        const v = anchors.length ? misses(th).length : 0;
+        if (v < bestV || (v === bestV && d < bestD - 1e-9)) { bestV = v; bestD = d; th0 = th; }
       }
     }
-    for (const n of c.notes) {
-      const z = handZoneCols(n.type);
-      const [pc, pr] = orbitPoint(variant, n.type, th0 + ang(n.beat), cy, rr);
+    // An end note still out of reach stays off the circle: a free note the clamp may move, which
+    // can always sit within reach of both the anchor and the circle's new end (zones are 8 cols).
+    const drop = new Set(misses(th0).map(a => a.n));
+    const keep = c.notes.filter(n => !drop.has(n));
+    if (Math.max(...[0, 1].map(h => keep.filter(n => n.type === h).length)) < ORBIT_MIN_NOTES) return;
+    for (const n of keep) {
+      const p = at(n, th0);
       n._preSweep = n._preSweep || { x: n._x, row: n.row };   // [PatternCoverage] snapshot contract
-      n._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, Math.round(pc)))];
-      n.row = Math.max(lo, Math.min(hi, Math.round(pr)));
+      n._x = p._x;
+      n.row = p.row;
       n._orbit = variant;
       tagged++;
     }
@@ -10873,23 +10906,37 @@ function sameRailWindow(a, b, railsByHand, h) {
                                    b.beat >= r.beat && b.beat <= r.railEndBeat);
 }
 
+// The C3 rules clampC3Jumps applies, shared with the passes that must place notes the clamp
+// won't have to move ([Orbit] phrase edges).
+// A note's EFFECTIVE position for reachability purposes. If it's a rail-defining note
+// (owns railEndBeat) and it's the EARLIER side of a comparison, the hand is actually at
+// the rail's END when it releases — not the stored start `.row`/`._x` (using the start
+// here was a latent inaccuracy; sameRailWindow already guarantees b.beat > a.railEndBeat
+// whenever a is a rail, so the rail has fully finished before b happens). The LATER side
+// always uses its stored (start) position, whether it's a lone orb or a rail's own start,
+// since that's the position the hand needs to arrive at.
+function c3Pos(n, isEarlierSide) {
+  return (isEarlierSide && n.railEndBeat != null)
+    ? railPosAt(n, n.railEndBeat)
+    : { _x: n._x ?? 0, row: n.row || 0 };
+}
+// Only FREE red/blue orbs move. Gold (3) / green (2) are anchors (moving a both-hands or
+// either-hand note to satisfy one hand would break the other hand / GoldSweep shape).
+function c3Movable(n, h, railsByHand) {
+  return n.type !== 2 && n.type !== 3 && n.railEndBeat == null && !n._comp &&
+    !railsByHand[h].some(r => n !== r && n.beat >= r.beat && n.beat <= r.railEndBeat);
+}
+// Out of a hand's reach between two positions: more than 7 columns or 5 rows. Only a
+// violation when c3TooFast says the gap is short.
+function c3Jump(aPos, bPos) {
+  return Math.abs(_htCol(bPos._x) - _htCol(aPos._x)) > 7 || Math.abs(bPos.row - aPos.row) > 5;
+}
+
 function clampC3Jumps(notes, bps) {
   const _c3col = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
   const _railsByHand = buildRailsByHand(notes);
-  // A note's EFFECTIVE position for reachability purposes. If it's a rail-defining note
-  // (owns railEndBeat) and it's the EARLIER side of a comparison, the hand is actually at
-  // the rail's END when it releases — not the stored start `.row`/`._x` (using the start
-  // here was a latent inaccuracy; sameRailWindow already guarantees b.beat > a.railEndBeat
-  // whenever a is a rail, so the rail has fully finished before b happens). The LATER side
-  // always uses its stored (start) position, whether it's a lone orb or a rail's own start,
-  // since that's the position the hand needs to arrive at.
-  const _effPos = (n, isEarlierSide) => (isEarlierSide && n.railEndBeat != null)
-    ? railPosAt(n, n.railEndBeat)
-    : { _x: n._x ?? 0, row: n.row || 0 };
-  // Only FREE red/blue orbs move. Gold (3) / green (2) are anchors (moving a both-hands or
-  // either-hand note to satisfy one hand would break the other hand / GoldSweep shape).
-  const _movable = (n, h) => n.type !== 2 && n.type !== 3 && n.railEndBeat == null && !n._comp &&
-    !_railsByHand[h].some(r => n !== r && n.beat >= r.beat && n.beat <= r.railEndBeat);
+  const _effPos = c3Pos;
+  const _movable = (n, h) => c3Movable(n, h, _railsByHand);
   // Last resort: an UNTAGGED solo gold/green orb (not itself a rail, not a rail companion,
   // not part of an intentional GoldSweep/DenseSweep shape) can be repositioned when nothing
   // else can move. Confirmed root cause (2026-07-10, "Another Life"): gold accents and rail
@@ -10922,8 +10969,7 @@ function clampC3Jumps(notes, bps) {
         if (sameRailWindow(a, b, _railsByHand, h)) continue;  // continuous rail slide, not a jump
         if (!c3TooFast(b.beat - a.beat, bps)) continue;  // enough time to move — not a violation
         const aPos = _effPos(a, true), bPos = _effPos(b, false);
-        const dC = _c3col(bPos._x) - _c3col(aPos._x), dR = bPos.row - aPos.row;
-        if (Math.abs(dC) <= 7 && Math.abs(dR) <= 5) continue;
+        if (!c3Jump(aPos, bPos)) continue;
         // pick the note to move: prefer loose (non-pattern) movable, then any movable,
         // then (last resort) an untagged solo gold/green orb
         let mv = null;
