@@ -7,6 +7,7 @@ import { execSync } from 'node:child_process';
 import { ROOT, appSource, extract, load, withSeed, colOf } from './harness.mjs';
 
 const O = load(['COL_X', 'OBSTACLE_BUFFER_BEATS', 'OBSTACLE_LEAD_BEATS', 'CROSS_REACH_COLS', 'handZoneCols',
+  'OBS_AEROBIC_REACH', 'OBS_REACH', 'obstacleSide', 'obstacleReachBand',
   'isPattern', 'smoothPatternBoundaries', 'ORBIT_VARIANTS', 'ORBIT_GEOM', 'ORBIT_PERIODS', 'ORBIT_NPR',
   'ORBIT_NPR_MIN', 'ORBIT_NPR_MAX', 'ORBIT_TURN_SEC_MIN', 'ORBIT_TURN_SEC_MAX', 'ORBIT_MIN_TURNS',
   'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE',
@@ -99,7 +100,7 @@ test('a clean 16th stream becomes full circles: round, one way, radius ~3, in zo
   }
 });
 
-test('walls: never inside a lean/slide occlusion window; a phrase under a crouch keeps to rows 4+', () => {
+test('walls: never inside a lean/slide window; under a crouch the loop keeps to its comfort rows', () => {
   const lead = O.OBSTACLE_LEAD_BEATS, buf = O.OBSTACLE_BUFFER_BEATS;
   for (const wallType of ['leanLeft', 'leanRight', 'slide']) {
     const notes = stream(0, 24);
@@ -108,12 +109,17 @@ test('walls: never inside a lean/slide occlusion window; a phrase under a crouch
     assert.ok(orb.length > 20, `${wallType}: ${orb.length} orbit notes`);
     assert.deepEqual(orb.filter(n => n.beat >= 6 - lead && n.beat <= 7 + buf).map(n => n.beat), [], wallType);
   }
-  const notes = stream(0, 12);
-  O.applyOrbitPhrases(notes, { walls: [{ beat: 6, duration: 2, wallType: 'crouch' }], bps: 2, maxShare: 1 });
-  const orb = notes.filter(n => n._orbit);
-  assert.equal(orb.length, notes.length, 'a crouch does not block the phrase');
-  assert.ok(orb.every(n => n.row >= 4 && n.row <= 8), 'the whole phrase sits under the crouch bar');
-  for (const hn of hands(notes)) assert.ok(readable(circle(pts(hn))), JSON.stringify(circle(pts(hn))));
+  // Default crouch: main's comfort band holds notes to rows 4-7 → a 3 x 1.5 oval, still one round loop.
+  // Aerobic crouch (no comfort band): only the occlusion's rows 0-3 push applies → rows 4-8.
+  for (const [aerobic, maxRow] of [[false, 7], [true, 8]]) {
+    const notes = stream(0, 12);
+    O.applyOrbitPhrases(notes, { walls: [{ beat: 6, duration: 2, wallType: 'crouch', aerobic }], bps: 2, maxShare: 1 });
+    const orb = notes.filter(n => n._orbit);
+    assert.equal(orb.length, notes.length, `aerobic ${aerobic}: a crouch does not block the phrase`);
+    assert.ok(orb.every(n => n.row >= 4 && n.row <= maxRow), `aerobic ${aerobic}: rows 4-${maxRow}`);
+    assert.ok(orb.some(n => n.row === 4) && orb.some(n => n.row === maxRow), 'uses the whole band');
+    for (const hn of hands(notes)) assert.ok(readable(circle(pts(hn))), JSON.stringify(circle(pts(hn))));
+  }
 });
 
 test('rails, gold and green: no orbit note within a beat of them', () => {
@@ -240,52 +246,71 @@ function run(lib, s, diff, seed) {
   } finally { for (const [k, f] of quiet) console[k] = f; delete globalThis.window; delete globalThis.__orbPlaced; }
 }
 // Per-hand circle instances in a final map: consecutive same-hand notes sharing one circle tag.
-function instances(notes, tagOf) {
-  const res = [];
+// Instances of the two hands that overlap in time form one PHRASE; its lead circle is the hand
+// that played the most notes (a sparse second hand draws a partial arc of the same circle).
+function phrases(notes, tagOf) {
+  const inst = [];
   for (const h of [0, 1]) {
     let cur = null;
+    const flush = () => { if (cur && cur.p.length >= 3) inst.push({ b0: cur.b0, b1: cur.last, m: circle(cur.p), rows: [Math.min(...cur.p.map(q => q[1])), Math.max(...cur.p.map(q => q[1]))] }); };
     for (const n of notes.filter(m => m.type === h).sort((a, b) => a.beat - b.beat)) {
       const t = tagOf(n);
       if (t && cur && cur.t === t && n.beat - cur.last <= 3.5) { cur.p.push([colOf(n._x), n.row]); cur.last = n.beat; }
-      else { if (cur) res.push(cur.p); cur = t ? { t, p: [[colOf(n._x), n.row]], last: n.beat } : null; }
+      else { flush(); cur = t ? { t, p: [[colOf(n._x), n.row]], b0: n.beat, last: n.beat } : null; }
     }
-    if (cur) res.push(cur.p);
+    flush();
   }
-  return res.filter(p => p.length >= 3).map(circle);
+  inst.sort((a, b) => a.b0 - b.b0);
+  const out = [];
+  for (const i of inst) {
+    const ph = out.find(p => i.b0 <= p.b1 && p.b0 <= i.b1);
+    if (ph) { ph.all.push(i.m); ph.b1 = Math.max(ph.b1, i.b1); if (i.m.n > ph.lead.n) { ph.lead = i.m; ph.rows = i.rows; } }
+    else out.push({ b0: i.b0, b1: i.b1, lead: i.m, all: [i.m], rows: i.rows });
+  }
+  return out;
 }
 const oldTag = n => (n._denseSweep || n._sparseSweep) && /Spiral/.test(n._move || '') ? n._move : null;
 const nowTag = n => n._orbit || null;
 
 for (const diff of [9, 6]) {
   test(`onsetsToNotes diff ${diff}: circles survive every post-pass and read far better than the old spiral moves`, () => {
-    let readNow = 0, readOld = 0, moved = 0, placedN = 0, turnsNow = [], turnsOld = [], nNow = [], nOld = [];
-    for (const seed of [1, 2, 3]) {
+    let moved = 0, placedN = 0;
+    const now = [], old = [];
+    for (const seed of [1, 2, 3, 4, 5]) {
       const s = song({ seed: 10 + seed });
-      const now = run(NOW, s, diff, seed), old = run(OLD, s, diff, seed);
-      for (const [n, [x, row]] of now.placed) { placedN++; if (now.out.notes.includes(n) && (n._x !== x || n.row !== row || !n._orbit)) moved++; }
-      const iN = instances(now.out.notes, nowTag), iO = instances(old.out.notes, oldTag);
-      readNow += iN.filter(readable).length; readOld += iO.filter(readable).length;
-      turnsNow.push(...iN.map(m => m.turns)); turnsOld.push(...iO.map(m => m.turns));
-      nNow.push(...iN.map(m => m.n)); nOld.push(...iO.map(m => m.n));
+      const a = run(NOW, s, diff, seed), b = run(OLD, s, diff, seed);
+      for (const [n, [x, row]] of a.placed) { placedN++; if (a.out.notes.includes(n) && (n._x !== x || n.row !== row || !n._orbit)) moved++; }
+      now.push(...phrases(a.out.notes, nowTag)); old.push(...phrases(b.out.notes, oldTag));
       // the invariants still hold on the new output
       const bps = s.bpm / 60;
-      assert.equal(NOW._detectC1Count(now.out.notes), 0, 'C1');
-      assert.equal(NOW.clearGoldC2(structuredClone(now.out.notes)), 0, 'gold C2');
-      const c3 = NOW.clampC3Jumps(structuredClone(now.out.notes), bps);
+      assert.equal(NOW._detectC1Count(a.out.notes), 0, 'C1');
+      assert.equal(NOW.clearGoldC2(structuredClone(a.out.notes)), 0, 'gold C2');
+      const c3 = NOW.clampC3Jumps(structuredClone(a.out.notes), bps);
       assert.equal(c3.clamped, 0, 'a C3 jump survived the final clamp');
     }
     assert.ok(placedN > 0, 'no orbit placed');
     assert.ok(moved <= 0.05 * placedN, `${moved} of ${placedN} orbit notes moved after placement`);
-    // Measured at commit time (3 seeds): Master — old 35 spiral pieces, median 0.40 turns / 6 notes,
-    // 5 readable (14%); now 8, median 1.29 turns / 14 notes, 6 readable (75%). Hard — old 29 pieces,
-    // 0.41 turns, 2 readable; now 6, 1.0 turns, 3 readable. Real songs: see the commit message.
+    // The old 8-step spirals give many short pieces (lead median ~0.4-0.6 turn, 4-6 notes, few
+    // readable); orbits give fewer, whole circles. Since main's crouch comfort band (rows 4-7)
+    // orbits also skip default crouch windows, so counts are modest on this wall-heavy song.
+    // Real songs: see the commit message and the merge log.
     const med = a => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
-    const stats = `now ${readNow}/${turnsNow.length} readable, median ${med(turnsNow)?.toFixed(2)} turns, ${med(nNow)} notes; ` +
-                  `old ${readOld}/${turnsOld.length}, ${med(turnsOld)?.toFixed(2)} turns, ${med(nOld)} notes`;
-    assert.ok(readNow >= 3, stats);
-    assert.ok(readNow >= 0.5 * turnsNow.length, `most circles read: ${stats}`);
-    assert.ok(readOld <= 0.3 * turnsOld.length, `premise: the old spiral pieces mostly did not: ${stats}`);
-    assert.ok(med(turnsNow) >= 0.95 && med(turnsNow) >= 2 * med(turnsOld), `full turns: ${stats}`);
-    assert.ok(med(nNow) >= 2 * med(nOld), `notes per circle: ${stats}`);
+    const sum = (ps, lab) => `${lab} ${ps.filter(p => readable(p.lead)).length}/${ps.length} phrases readable, ` +
+      `lead median ${med(ps.map(p => p.lead.turns))?.toFixed(2)} turns, ${med(ps.map(p => p.lead.n))} notes`;
+    const stats = `${sum(now, 'now')}; ${sum(old, 'old')}`;
+    const readNow = now.filter(p => readable(p.lead)).length, readOld = old.filter(p => readable(p.lead)).length;
+    // Measured on the merged code (5 seeds): Master now 8/8 phrases pass the strict circle test,
+    // lead 1.1 turns / 11 notes, vs old 5/35 pieces, 0.4 turn / 6 notes. Hard now 2/7 vs old 2/25:
+    // the rest are under a crouch (main's comfort rows 4-7 make them 3 x 1.5 ovals, whose flat
+    // ends read as >100° steps around a fitted circle) or sparse 6-7-note turns.
+    assert.ok(readNow >= 2 && readNow >= readOld, stats);
+    assert.ok(readNow / now.length >= 2 * readOld / old.length, `readable share at least doubles: ${stats}`);
+    for (const p of now) assert.ok(p.lead.mono >= 0.8 && p.lead.cv <= 0.3, `lead loop not round/one-way: ${JSON.stringify(p.lead)}`);
+    assert.ok(med(now.map(p => p.lead.turns)) >= 0.95, `full turns: ${stats}`);
+    assert.ok(med(now.map(p => p.lead.turns)) >= 1.5 * med(old.map(p => p.lead.turns)), `turns vs old: ${stats}`);
+    assert.ok(med(now.map(p => p.lead.n)) >= 6 && med(now.map(p => p.lead.n)) > med(old.map(p => p.lead.n)), `notes per circle: ${stats}`);
+    // every hand's orbit notes, partial second-hand arcs included, lie on a round one-way path
+    for (const p of now) for (const m of p.all) if (m.n >= 4)
+      assert.ok(m.cv <= 0.3 && m.mono >= 0.8, `orbit arc not round/one-way: ${JSON.stringify(m)}`);
   });
 }

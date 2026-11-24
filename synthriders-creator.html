@@ -910,6 +910,11 @@
             <span>No obstacles / walls</span>
           </label>
           <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;"
+            title="Off (default): during a crouch, notes stay in rows 4-7 just under the bar; during a lean, the hands stay in the lean's comfortable band and out of the floor rows. On: notes may reach as deep as the wall geometry allows (floor rows in crouches, far edges and floor rows in leans) for a more physical, aerobic map.">
+            <input type="checkbox" id="settAerobicReach" style="accent-color:var(--accent);" />
+            <span>Aerobic reach (deep crouches &amp; leans)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;"
             title="Disables gold (both-hand simultaneous) notes.">
             <input type="checkbox" id="settNoGold" style="accent-color:var(--accent);" />
             <span>No gold (both-hand) notes</span>
@@ -1639,8 +1644,11 @@ function smoothPatternBoundaries(orbs) {
 //             wide, so at the inner point the hands are still 3 columns apart (cols 6 / 9).
 // Robust to the post-passes by construction, not by repair:
 //   * no window touches a lean/slide occlusion window (a side wall squeezes a hand into 3-4
-//     columns and a centre slide moves rows ±3, so no circle survives either). A crouch only
-//     pushes rows 0-3 down, so a phrase under a crouch just uses rows 4+;
+//     columns and a centre slide moves rows ±3, so no circle survives either). A crouch
+//     pushes rows 0-3 down and, unless the wall is aerobic, holds notes to its comfortable
+//     band (obstacleReachBand, rows 4-7). A phrase under a crouch keeps to the rows left over:
+//     a 3 x 1.5 oval in rows 4-7 (an aerobic crouch: 3 x 2 in rows 4-8). Fewer than 3 rows
+//     left blocks like a side wall. (At Master, blocking every crouch cost ~1/3 of the circles);
 //   * no rail ±1 beat (C1 would re-snap the notes onto the rail) and no gold/green orb ±1
 //     beat (C2 clearance, and a both-hand note would interrupt the circle);
 //   * per-hand gaps are capped at a quarter turn, so a consecutive same-hand step is at most
@@ -1689,10 +1697,13 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
                                      maxShare = ORBIT_MAX_SHARE } = {}) {
   const isFree = n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail;
   const orbs = result.filter(isFree).sort((a, b) => a.beat - b.beat);
-  const block = [], low = [];
+  const block = [], low = [];                                   // low: [start, end, rowLo, rowHi]
   for (const w of walls || []) {
     const span = [w.beat - OBSTACLE_LEAD_BEATS, w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS];
-    (w.wallType === 'crouch' ? low : block).push(span);
+    if (w.wallType !== 'crouch') { block.push(span); continue; }
+    const band = obstacleReachBand(w, 0);                       // null for an aerobic crouch
+    const lo = Math.max(rowLo, 4, band ? band.minRow : 0), hi = Math.min(rowHi, band ? band.maxRow : 10);
+    if (hi - lo >= 3) low.push([...span, lo, hi]); else block.push(span);
   }
   for (const n of result) {
     if (n.railEndBeat !== undefined) block.push([n.beat - 1, n.railEndBeat + 1]);
@@ -1769,7 +1780,8 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
   let tagged = 0, turns = 0;
   chosen.forEach((c, k) => {
     let lo = rowLo, hi = rowHi;
-    if (c.notes.some(n => hit(n.beat, low))) lo = Math.max(lo, 4);    // under a crouch bar
+    for (const [s, e, l, h] of low)                                     // under a crouch bar
+      if (c.notes.some(n => n.beat >= s - 1e-9 && n.beat <= e + 1e-9)) { lo = Math.max(lo, l); hi = Math.min(hi, h); }
     const rr = Math.min(3, (hi - lo) / 2), cy = (lo + hi) / 2;
     if (rr < 1.5) return;
     const variant = pickVariant(sectionAt(c.t0), k);
@@ -6489,8 +6501,14 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   //      pushing orbs back into the blocked zones.
   // When freeOrbsOnly is true, rail companions (_comp) are skipped — they're governed
   // by the rail path (the FinalSweep would just re-snap them back anyway).
+  // Aerobic reach (Advanced setting, or OBS_AEROBIC_REACH): tag the walls themselves, because
+  // they travel to every later path (rail clamp, FinalSweep, mutateMap, section splice) and
+  // those paths never see these hints. Re-tagged before [RailObstacle] for [HoldStreak] walls.
+  const _aerobicReach = !!hints.aerobicReach || OBS_AEROBIC_REACH;
+  const _markAerobicWalls = () => { if (_aerobicReach) for (const w of autoWalls) w.aerobic = true; };
   const applyObstacleOcclusion = (freeOrbsOnly = false) => {
     if (hints.noObstacles) return;
+    _markAerobicWalls();
     const _skip = n => n.railEndBeat !== undefined || (freeOrbsOnly && n._comp);
     // Relocate note n (currently at `col`) into the safe column band [lo, hi].
     // Loose notes get a random column in the band (spread, so a cluster doesn't pile onto
@@ -6601,6 +6619,16 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         }
       }
     }
+    // Comfortable reach (shared module rule; rails get the same one in clampRailsToObstacles).
+    // The bands above only pull notes off the wall side and the ceiling rows. This also stops a
+    // crouch from asking for rows 8-10 and a lean from asking for a floor row or the far edge.
+    // No-op for aerobic walls, so aerobic maps keep exactly the placement above.
+    // Companions are included even in the final pass: their rail is already held to the same
+    // band, so the nearest-edge move keeps them on its path. Without them, 2-4% of crouch-window
+    // points were companions at rows 1-3 (within fixC1's 1-row tolerance of a row-4 rail), and the
+    // [ObstacleFinal] fixC1 re-snaps any that a window edge leaves off-path.
+    const _reach = clampNotesToObstacleReach(result, autoWalls);
+    if (_reach.moved) console.log(`[ObsReach] Held ${_reach.moved} note(s) to the comfortable reach band during obstacles${freeOrbsOnly ? ' (final)' : ''}`);
   };
   applyObstacleOcclusion(false);
 
@@ -8013,6 +8041,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     //   • ALL WALLS, not only the ones on a hand's "own" side. Rails built with
     //     allowCrossCenter reach the far side, which the old per-hand mapping never tested.
     // Runs BEFORE the FinalSweep so its fixC1 re-snaps companions onto the corrected path.
+    // It also holds rail points to the comfortable reach band (rows too), unless aerobic.
+    _markAerobicWalls();
     const { clamped: _railPtsClamped } = clampRailsToObstacles(result, autoWalls);
     if (_railPtsClamped > 0) console.log(`[RailObstacle] Clamped ${_railPtsClamped} rail point(s) out of obstacle volumes`);
   }
@@ -10196,6 +10226,103 @@ function obstacleBandAt(walls, beatStart, beatEnd, row, lead = 0, buffer = 0) {
   return { minCol, maxCol };
 }
 
+// ── Comfortable reach during an obstacle: the POSE the wall forces, not just the wall ──
+// obstacleColLimit answers "is this point inside the wall?". A note can be legally outside
+// the wall and still ask for more than the pose allows. Measured 2026-11-22 on real Master
+// maps (4 songs x 5 seeds): free orbs already kept to the play-tested lean bands below, but
+// RAILS and their companions only obeyed the wall's geometry. 76-81% of the wall-side
+// hand's rail points during a lean sat at cols 9-12, hugging the leaning wall's underside.
+// During crouches, rails sat at rows 1-3 and orbs reached row 8. Since the 11-row export
+// (2026-11-21) those rows are real heights, which the player felt as low crouches and deep leans.
+//   Crouch: the bar's underside (OBS_BOX y 2.05) is game y 0.79, above row 0. Rows 0-3
+//     (y >= 0.27) are above a ducked head (the play-tested C6 rule). The band is the next 4
+//     rows, 4-7 (y +0.14 to -0.27). Rows 8-10 (y <= -0.41) ask for a crouch AND a floor reach.
+//   Lean: the hypotenuse runs from game (0.14, 0.89) to (0.94, -0.65), mirrored for leanRight.
+//     Wall-side hand at cols 6-8, lean-side hand at 2-5, gold/green at 5-8: the bands
+//     applyObstacleOcclusion already used for free orbs. Rows <= 7 for every hand: the lean
+//     tilts the torso, so a floor row needs a bend on top of the lean.
+//   Slide: a plain box; the player side-steps upright. Box-side hand and gold/green at cols
+//     5-7. No row limit, because the body does not tilt.
+// Bands are written for a wall on the HIGH-column side and mirrored (col -> 14 - col) for a
+// low-side wall. OBS_AEROBIC_REACH (or Advanced > "Aerobic reach", which tags each generated
+// wall `aerobic: true`) switches every comfort rule off. Notes then keep only the wall-geometry
+// limit: exactly the deeper-reach placement shipped before 2026-11-22.
+const OBS_AEROBIC_REACH = false;
+const OBS_REACH = {
+  crouch: { minRow: 4, maxRow: 7 },
+  lean:   { maxRow: 7, wall: [6, 8], free: [2, 5], shared: [5, 8] },
+  slide:  { wall: [5, 7], shared: [5, 7] },
+};
+
+// Comfortable box for a note of `type` during wall `w`: { minCol, maxCol, minRow, maxRow },
+// or null when this wall sets no comfort rule (aerobic wall, centre slide).
+function obstacleReachBand(w, type) {
+  if (w.aerobic ?? OBS_AEROBIC_REACH) return null;
+  if (w.wallType === 'crouch')
+    return { minCol: 0, maxCol: 14, minRow: OBS_REACH.crouch.minRow, maxRow: OBS_REACH.crouch.maxRow };
+  const side = obstacleSide(w);
+  if (!side) return null;
+  const rule = (w.wallType === 'leanLeft' || w.wallType === 'leanRight') ? OBS_REACH.lean : OBS_REACH.slide;
+  const wallHand = side > 0 ? 0 : 1;                 // the hand whose zone faces the wall
+  const band = type >= 2 ? rule.shared : type === wallHand ? rule.wall : rule.free;
+  const box = { minCol: 0, maxCol: 14, minRow: 0, maxRow: rule.maxRow ?? 10 };
+  if (band) [box.minCol, box.maxCol] = side > 0 ? band : [14 - band[1], 14 - band[0]];
+  return box;
+}
+
+// Tightest comfortable box over every wall whose clearance window (the occlusion window:
+// lead-in before, buffer after) contains `beat`. null when no wall sets a comfort rule there.
+// `closed` includes the window's end beat. Rail points use it: a rail path is linear between
+// its points, so a point exactly at the end still steers the path just before it.
+function obstacleReachAt(walls, beat, type, closed = false) {
+  let box = null;
+  for (const w of walls || []) {
+    const end = w.beat + w.duration + OBSTACLE_BUFFER_BEATS;
+    if (beat < w.beat - OBSTACLE_LEAD_BEATS || (closed ? beat > end : beat >= end)) continue;
+    const b = obstacleReachBand(w, type);
+    if (!b) continue;
+    if (!box) { box = { ...b }; continue; }
+    box.minCol = Math.max(box.minCol, b.minCol); box.maxCol = Math.min(box.maxCol, b.maxCol);
+    box.minRow = Math.max(box.minRow, b.minRow); box.maxRow = Math.min(box.maxRow, b.maxRow);
+  }
+  // Opposite walls can invert a range. Collapse it to the midpoint, as obstacleBandAt does.
+  if (box && box.minCol > box.maxCol) box.minCol = box.maxCol = Math.round((box.minCol + box.maxCol) / 2);
+  if (box && box.minRow > box.maxRow) box.minRow = box.maxRow = Math.round((box.minRow + box.maxRow) / 2);
+  return box;
+}
+
+// Clamp one point to the nearest edge of its comfortable box, then back out of every wall
+// volume (the geometry always wins). Nearest-edge is 1-Lipschitz: it can only shrink the
+// distance between two neighbours that are both clamped, so it cannot add a C3 jump inside
+// a window. Returns { col, row }, or null when no comfort rule applies (nothing to do).
+function obstacleReachClamp(walls, beat, type, col, row, closed = false) {
+  const box = obstacleReachAt(walls, beat, type, closed);
+  if (!box) return null;
+  let c = Math.max(box.minCol, Math.min(box.maxCol, col));
+  const r = typeof row === 'number' ? Math.max(box.minRow, Math.min(box.maxRow, row)) : row;
+  const g = obstacleBandAt(walls, closed ? beat - 1e-6 : beat, beat, r ?? 5, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+  c = Math.max(g.minCol, Math.min(g.maxCol, c));
+  return { col: c, row: r };
+}
+
+// Free orbs (and, unless skipComps, rail companions) into their comfortable obstacle band.
+// Rails are not touched here: clampRailsToObstacles applies the same rule to every rail point,
+// and fixC1 then re-snaps companions onto the corrected path. Returns { moved }.
+function clampNotesToObstacleReach(notes, walls, { skipComps = false } = {}) {
+  let moved = 0;
+  if (!walls || !walls.length) return { moved };
+  for (const n of notes) {
+    if (n.railEndBeat !== undefined || (skipComps && n._comp)) continue;
+    const c = Math.max(0, Math.min(14, Math.round(((n._x ?? 0) + 0.9555) / 0.1365)));
+    const p = obstacleReachClamp(walls, n.beat, n.type, c, n.row);
+    if (!p || (p.col === c && p.row === n.row)) continue;
+    if (p.col !== c) n._x = COL_X[p.col];
+    n.row = p.row;
+    moved++;
+  }
+  return { moved };
+}
+
 // Clamp every rail point (head, waypoints, end) out of any obstacle volume it sits inside.
 // Shared between the in-pipeline [RailObstacle] pass and runFinalSweep's obstacle stage so
 // the two cannot drift apart — divergent copies of one geometric rule is the exact failure
@@ -10203,27 +10330,58 @@ function obstacleBandAt(walls, beatStart, beatEnd, row, lead = 0, buffer = 0) {
 // Covers EVERY rail type: gold (3) and green (2) rails are skipped by applyObstacleOcclusion
 // (which skips all rails) and were skipped by the old per-hand rail clamp too, leaving them
 // with no obstacle handling anywhere in the pipeline.
+// Each point is also held to the comfortable reach band (obstacleReachClamp, the rule free orbs
+// follow), ROWS included: that is what keeps a rail out of the floor rows during a crouch and
+// off the leaning wall's underside. Aerobic walls set no band, so they keep the geometry-only clamp.
 function clampRailsToObstacles(notes, walls) {
   let clamped = 0;
   if (!walls || !walls.length) return { clamped };
   const _col = x => Math.max(0, Math.min(14, Math.round(((x ?? 0) + 0.9555) / 0.1365)));
-  const _pt = (x, row, beat) => {
+  // Returns { x, row } for a point that has to move, or null when it is already fine.
+  const _pt = (x, row, beat, type) => {
+    const c = _col(x);
+    const p = obstacleReachClamp(walls, beat, type, c, row, true);
+    if (p) return (p.col === c && p.row === row) ? null : { x: p.col === c ? x : COL_X[p.col], row: p.row };
     const band = obstacleBandAt(walls, beat, beat, row, OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
-    const c  = _col(x);
     const nc = Math.max(band.minCol, Math.min(band.maxCol, c));
-    return nc === c ? null : COL_X[nc];
+    return nc === c ? null : { x: COL_X[nc], row };
   };
   for (const rail of notes) {
     if (rail.railEndBeat === undefined) continue;
-    const h = _pt(rail._x, rail.row, rail.beat);
-    if (h !== null) { rail._x = h; clamped++; }
+    // The path is linear between points, so a stretch that ENTERS or LEAVES a window between two
+    // points passes through positions no point clamp sees: the 1-row companions at crouch lead-ins,
+    // and rails cutting through a slide box at its window edge. Pin the path with a point at each
+    // window edge it crosses (only where the edge sits outside the band). The clamp below then holds
+    // that point too, and a box is convex, so the whole in-window path stays in it. Walls with no
+    // comfort rule (aerobic) are skipped, which keeps the old path exactly.
+    for (const w of walls) {
+      if (!obstacleReachBand(w, rail.type)) continue;
+      for (const [b, closed] of [[w.beat - OBSTACLE_LEAD_BEATS, false], [w.beat + w.duration + OBSTACLE_BUFFER_BEATS, true]]) {
+        if (b <= rail.beat || b >= rail.railEndBeat) continue;
+        if ((rail.railSegments || []).some(s => Math.abs(s.beat - b) < 1e-6)) continue;
+        const pos = railPosAt(rail, b);
+        const c = _col(pos._x), r = Math.round(pos.row);
+        const p = obstacleReachClamp(walls, b, rail.type, c, r, closed);
+        if (!p || (p.col === c && p.row === r)) continue;
+        (rail.railSegments ??= []).push({ beat: b, row: p.row, _x: COL_X[p.col] });
+        rail.railSegments.sort((a, z) => a.beat - z.beat);
+        clamped++;
+      }
+    }
+    const h = _pt(rail._x, rail.row, rail.beat, rail.type);
+    if (h !== null) { rail._x = h.x; rail.row = h.row; clamped++; }
     for (const seg of (rail.railSegments || [])) {
-      const s = _pt(seg._x, seg.row, seg.beat);
-      if (s !== null) { seg._x = s; clamped++; }
+      const s = _pt(seg._x, seg.row, seg.beat, rail.type);
+      if (s !== null) { seg._x = s.x; seg.row = s.row; clamped++; }
     }
     if (rail.railEnd_x !== undefined) {
-      const e = _pt(rail.railEnd_x, rail.railEndRow ?? rail.row, rail.railEndBeat);
-      if (e !== null) { rail.railEnd_x = e; clamped++; }
+      const endRow = rail.railEndRow ?? rail.row;
+      const e = _pt(rail.railEnd_x, endRow, rail.railEndBeat, rail.type);
+      if (e !== null) {
+        rail.railEnd_x = e.x;
+        if (e.row !== endRow) rail.railEndRow = e.row;
+        clamped++;
+      }
     }
   }
   return { clamped };
@@ -13003,6 +13161,9 @@ Rules:
             }
           }
         }
+        // Same comfortable-reach rule onsetsToNotes applies (rows 8+ in a crouch, the far edge or
+        // a floor row in a lean). Rails are held to it by runFinalSweep's obstacle stage below.
+        pushed += clampNotesToObstacleReach(result, resultWalls).moved;
         mutStats.C6 += pushed;
         if (pushed) console.log(`[Mutate] C6: Pushed ${pushed} notes out of obstacle-blocked zones`);
       }
@@ -13158,6 +13319,7 @@ Rules:
       return {
         noRails:        document.getElementById('settNoRails')?.checked        || false,
         noObstacles:    document.getElementById('settNoObstacles')?.checked    || false,
+        aerobicReach:   document.getElementById('settAerobicReach')?.checked   || OBS_AEROBIC_REACH,
         noGold:         document.getElementById('settNoGold')?.checked         || false,
         noGreen:        document.getElementById('settNoGreen')?.checked        || false,
         noSingleArm:    document.getElementById('settNoSingleArm')?.checked    || false,

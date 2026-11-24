@@ -207,7 +207,8 @@ for (const name of ['scissors', 'crossReturn']) {
 // Circles via the real [Orbit] pass (applyOrbitPhrases) ----------------------------------------
 // Both hands every 1/2 beat, offset by 1/4 (a dense 16th stream), 12 beats with no walls: the pass
 // picks a 4-beat turn (8 notes per hand per turn) at 100 BPM, so this draws 3 full turns per hand.
-// The last one runs the same stream under a crouch bar, where the circle keeps to rows 4-8.
+// The last one runs the same stream under a crouch bar: the comfort band (rows 4-7) makes it a
+// 3 x 1.5 oval.
 for (const [variant, label, say, walls] of [
   ['parallel', 'Orbit: parallel circles', 'Circles, both hands turning the same way', []],
   ['mirror', 'Orbit: mirrored circles', 'Circles, mirrored hands', []],
