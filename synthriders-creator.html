@@ -10452,6 +10452,68 @@ function clampNotesToObstacleReach(notes, walls, { skipComps = false } = {}) {
 // Each point is also held to the comfortable reach band (obstacleReachClamp, the rule free orbs
 // follow), ROWS included: that is what keeps a rail out of the floor rows during a crouch and
 // off the leaning wall's underside. Aerobic walls set no band, so they keep the geometry-only clamp.
+// Shape-preserving fit of one axis: values v (one per point) into per-point bounds [lo, hi].
+// Maps v -> off + s * (v - mid) with the LARGEST scale s <= 1 that fits (a rigid shift when the
+// shape already fits the box), then the smallest shift. Integer bounds keep the rounded result
+// inside them. Returns the new integer values, or null when even s = 0 cannot satisfy every
+// point (the boxes along the stretch do not overlap) — the caller then falls back to the clamp.
+function fitAxisToBounds(v, lo, hi) {
+  const mid = (Math.min(...v) + Math.max(...v)) / 2, d = v.map(x => x - mid);
+  const range = s => [Math.max(...lo.map((l, i) => l - s * d[i])), Math.min(...hi.map((h, i) => h - s * d[i]))];
+  const ok = s => { const [a, b] = range(s); return a <= b + 1e-9; };
+  let s = 1;
+  if (!ok(1)) {
+    if (!ok(0)) return null;
+    let a = 0, b = 1;
+    for (let i = 0; i < 30; i++) { const m = (a + b) / 2; if (ok(m)) a = m; else b = m; }
+    s = a;
+  }
+  const [A, B] = range(s), off = Math.max(A, Math.min(B, mid));
+  return d.map(x => Math.round(off + s * x));
+}
+
+// Fit each stretch of a rail that runs through a wall's comfort window (consecutive points with
+// a comfortable-reach box) into those boxes AS A WHOLE, rows then columns (fitAxisToBounds),
+// instead of point by point. Clamping each point to its box's nearest edge flattened rail
+// shapes: a 4-row zigzag under a crouch became a 4-7-4 line, and a lean pressed a 6-column
+// swing onto one column (Electric Love Master, 2026-11-24: 84 of 106 rail points sat in a wall
+// window). Shifted and, only if it must, scaled down, the shape survives. Columns use the wall
+// geometry at the fitted row as well as the band. Aerobic walls set no box, so nothing moves.
+// The per-point clamp in clampRailsToObstacles still runs after this and wins.
+// Returns the number of points moved.
+function fitRailToReach(rail, walls) {
+  const _col = x => Math.max(0, Math.min(14, Math.round(((x ?? 0) + 0.9555) / 0.1365)));
+  const pts = [
+    { beat: rail.beat, col: _col(rail._x), row: rail.row, set: (c, r) => { rail._x = COL_X[c]; rail.row = r; } },
+    ...(rail.railSegments || []).map(sg => ({ beat: sg.beat, col: _col(sg._x), row: sg.row,
+      set: (c, r) => { sg._x = COL_X[c]; sg.row = r; } })),
+    { beat: rail.railEndBeat, col: _col(rail.railEnd_x ?? rail._x), row: rail.railEndRow ?? rail.row,
+      set: (c, r) => { rail.railEnd_x = COL_X[c]; rail.railEndRow = r; } },
+  ];
+  // Read every point's position (and box) before any write: the head's setter also moves the
+  // default the end point reads.
+  for (const p of pts) p.box = obstacleReachAt(walls, p.beat, rail.type, true);
+  let moved = 0;
+  for (let i = 0; i < pts.length;) {
+    if (!pts[i].box) { i++; continue; }
+    let j = i;
+    while (j + 1 < pts.length && pts[j + 1].box) j++;
+    const run = pts.slice(i, j + 1);
+    i = j + 1;
+    if (run.length < 2) continue;                   // a lone point: the clamp handles it
+    const rows = fitAxisToBounds(run.map(p => p.row), run.map(p => p.box.minRow), run.map(p => p.box.maxRow));
+    if (!rows) continue;
+    const geo = run.map((p, k) => obstacleBandAt(walls, p.beat - 1e-6, p.beat, rows[k], OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS));
+    const cols = fitAxisToBounds(run.map(p => p.col),
+      run.map((p, k) => Math.max(p.box.minCol, geo[k].minCol)), run.map((p, k) => Math.min(p.box.maxCol, geo[k].maxCol)));
+    run.forEach((p, k) => {
+      const c = cols ? cols[k] : p.col;
+      if (c !== p.col || rows[k] !== p.row) { p.set(c, rows[k]); moved++; }
+    });
+  }
+  return moved;
+}
+
 function clampRailsToObstacles(notes, walls) {
   let clamped = 0;
   if (!walls || !walls.length) return { clamped };
@@ -10467,6 +10529,7 @@ function clampRailsToObstacles(notes, walls) {
   };
   for (const rail of notes) {
     if (rail.railEndBeat === undefined) continue;
+    clamped += fitRailToReach(rail, walls);
     // The path is linear between points, so a stretch that ENTERS or LEAVES a window between two
     // points passes through positions no point clamp sees: the 1-row companions at crouch lead-ins,
     // and rails cutting through a slide box at its window edge. Pin the path with a point at each

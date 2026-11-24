@@ -7,7 +7,7 @@ import { execSync } from 'node:child_process';
 import { appSource, extract, load, withSeed, ROOT, RAIL_DEPS, colOf } from './harness.mjs';
 
 const REACH = ['OBS_AEROBIC_REACH', 'OBS_REACH', 'obstacleReachBand', 'obstacleReachAt',
-  'obstacleReachClamp', 'clampNotesToObstacleReach', 'railPosAt', 'clampRailsToObstacles'];
+  'obstacleReachClamp', 'clampNotesToObstacleReach', 'railPosAt', 'fitAxisToBounds', 'fitRailToReach', 'clampRailsToObstacles'];
 const G = load([...RAIL_DEPS, ...REACH]);
 const Y_OFFSET = 0.0012;                      // export offset (server.py / exportBtn)
 const LL = { beat: 20, duration: 2, wallType: 'leanLeft' };
@@ -143,14 +143,45 @@ test('rails: the wall-side hand is held off the leaning wall\'s underside (band,
     railSegments: [{ beat: 20, row: 5, _x: COL(12) }, { beat: 21, row: 8, _x: COL(11) }, { beat: 22, row: 4, _x: COL(10) }] });
   const now = rail();
   G.clampRailsToObstacles([now], [LL]);
-  assert.deepEqual([colOf(now._x), ...now.railSegments.map(s => colOf(s._x)), colOf(now.railEnd_x)], [8, 8, 8, 8, 8]);
-  assert.deepEqual(now.railSegments.map(s => s.row), [5, 7, 4]);                 // the row-8 point comes up to 7
+  // Since fitRailToReach (2026-11-24) the in-window stretch moves AS A WHOLE: cols 11-12-11-10-12
+  // shift 4 into the 6-8 band (they used to collapse onto col 8), rows shift up 1 so the row-8
+  // point reaches 7 (the lean's row cap) and the shape keeps its 4-row dip.
+  assert.deepEqual([colOf(now._x), ...now.railSegments.map(s => colOf(s._x)), colOf(now.railEnd_x)], [7, 8, 7, 6, 8]);
+  assert.deepEqual([now.row, ...now.railSegments.map(s => s.row), now.railEndRow], [4, 4, 7, 3, 5]);
   // Aerobic: only the wall's own limit applies (old behaviour), so the rail can hug the underside.
   const old = rail();
   G.clampRailsToObstacles([old], [{ ...LL, aerobic: true }]);
   const lim = r => G.obstacleColLimit(LL, r).maxCol;
   assert.deepEqual(old.railSegments.map(s => colOf(s._x)), [Math.min(12, lim(5)), Math.min(11, lim(8)), Math.min(10, lim(4))]);
   assert.ok(colOf(old._x) > 8, 'aerobic rail no longer reaches past the comfort band');
+});
+
+test('rails keep their shape through a comfort window: shifted and scaled as a whole, not flattened per point', () => {
+  const COL = c => G.COL_X[c];
+  // A zigzag swinging rows 2-6 entirely inside a crouch window (rows 4-7): the per-point clamp
+  // gave 4-6-4-6-4 (2 rows). Fitted, it scales 0.75 into 4-7-4-7-4 (the band's full 3 rows).
+  const zz = { beat: 19, row: 2, type: 0, _x: COL(10), railEndBeat: 23, railEndRow: 2, railEnd_x: COL(10),
+    railSegments: [{ beat: 20, row: 6, _x: COL(10) }, { beat: 21, row: 2, _x: COL(10) }, { beat: 22, row: 6, _x: COL(10) }] };
+  G.clampRailsToObstacles([zz], [CR]);
+  assert.deepEqual([zz.row, ...zz.railSegments.map(s => s.row), zz.railEndRow], [4, 7, 4, 7, 4]);
+  // The wall-side hand swinging cols 9-13 during a leanLeft (its band is cols 6-8): every point
+  // sat past the band, so the clamp put the whole rail on col 8. Fitted, it still swings 6-8.
+  const sw = { beat: 19, row: 5, type: 0, _x: COL(9), railEndBeat: 23, railEndRow: 5, railEnd_x: COL(13),
+    railSegments: [{ beat: 20, row: 5, _x: COL(13) }, { beat: 21, row: 5, _x: COL(9) }, { beat: 22, row: 5, _x: COL(13) }] };
+  G.clampRailsToObstacles([sw], [LL]);
+  assert.deepEqual([colOf(sw._x), ...sw.railSegments.map(s => colOf(s._x)), colOf(sw.railEnd_x)], [6, 8, 6, 8, 8]);
+  // Fitting is a no-op for a rail already inside its boxes, and for aerobic walls.
+  const fine = { beat: 19, row: 5, type: 0, _x: COL(10), railEndBeat: 23, railEndRow: 6, railEnd_x: COL(10),
+    railSegments: [{ beat: 21, row: 7, _x: COL(10) }] };
+  assert.equal(G.fitRailToReach(structuredClone(fine), [CR]), 0);
+  assert.equal(G.fitRailToReach(structuredClone(zz), [{ ...CR, aerobic: true }]), 0);
+});
+
+test('fitAxisToBounds: rigid shift when it fits, largest scale when it does not, null when boxes are disjoint', () => {
+  assert.deepEqual(G.fitAxisToBounds([1, 3, 1], [4, 4, 4], [7, 7, 7]), [4, 6, 4]);          // shift only
+  assert.deepEqual(G.fitAxisToBounds([0, 8, 0], [4, 4, 4], [7, 7, 7]), [4, 7, 4]);          // scale 3/8
+  assert.deepEqual(G.fitAxisToBounds([5, 5], [4, 4], [7, 7]), [5, 5]);                      // already inside
+  assert.equal(G.fitAxisToBounds([5, 5], [0, 6], [3, 9]), null);                            // no common row
 });
 
 // ── The real pipeline: onsetsToNotes on a 4-stem song with crouch and lean walls ─────────────
