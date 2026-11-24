@@ -213,7 +213,9 @@ function closure(src, roots) {
 // BASE = the last commit before the triplet snap. Pinned (not HEAD) so the check stays meaningful
 // after this work is committed. If a later change MEANS to alter straight-song output, re-pin
 // BASE to that commit and say so in its message (as tests/rail-shapes does with acd1853).
-const BASE = '999514c';
+// Re-pinned 999514c -> 9998da6 ([Orbit] circles): that commit moves notes onto circles on purpose
+// and is otherwise the triplet-snap code, so straight output must still match it exactly.
+const BASE = '9998da6';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'clearGoldC2'];
 const NOW  = closure(appSource(), ROOTS);
 const HEAD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ROOTS);
@@ -269,7 +271,8 @@ for (const diff of [9, 8, 6, 2]) {
 
 test('onsetsToNotes: a swung song with the swing snap switched off is identical to the pre-triplet baseline', () => {
   const s = song('swung', { seed: 61 });
-  assert.deepEqual(run(NOW, s, 9, { swingMode: 'off' }), run(HEAD, s, 9));
+  // BASE has had the snap since the 9998da6 re-pin, so it too runs with the switch off.
+  assert.deepEqual(run(NOW, s, 9, { swingMode: 'off' }), run(HEAD, s, 9, { swingMode: 'off' }));
 });
 
 for (const diff of [9, 8, 6]) {

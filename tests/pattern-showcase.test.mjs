@@ -33,9 +33,16 @@ test('showcase: every DenseSweep move note was actually shaped by the real block
     assert.equal(p.info.taggedNotes, p.info.of, p.name);
 });
 
-test('showcase: parallel spiral turns one way on both hands, mirrored spiral turns opposite ways', () => {
+test('showcase: parallel circles turn one way on both hands, mirrored circles turn opposite ways', () => {
+  // Circles are [Orbit] phrases (applyOrbitPhrases) since the spiral step moves were removed.
   const get = n => out.patterns.find(p => p.name === n).info;
-  const par = get('Move: parallelSpiral'), mir = get('Move: mirrorSpiral');
+  const par = get('Orbit: parallel circles'), mir = get('Orbit: mirrored circles');
+  for (const o of [par, mir, get('Orbit: circles under a crouch bar')]) {
+    assert.equal(o.tagged, o.of, 'every orb of the stream is on the circle');
+    assert.ok(o.turns >= 2.5, `turns ${o.turns}`);
+  }
+  assert.ok(par.rightStats.turn !== 'none');
   assert.equal(par.rightStats.turn, par.leftStats.turn);
   assert.notEqual(mir.rightStats.turn, mir.leftStats.turn);
+  assert.ok(get('Orbit: circles under a crouch bar').right.every(p => p.row >= 4));
 });

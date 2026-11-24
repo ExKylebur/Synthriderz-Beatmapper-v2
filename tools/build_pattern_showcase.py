@@ -235,7 +235,7 @@ def main():
             extra = '  path(col,row): ' + ' '.join(f"{c['col']},{c['row']}" for c in info['path'])
         elif 'rightStats' in info:
             rs, ls = info['rightStats'], info['leftStats']
-            spiral = 'spiral' in info.get('move', '').lower()      # turn direction is only meaningful for loops
+            spiral = any(k in info.get('move', '').lower() for k in ('spiral', 'orbit'))   # turn direction: loops only
             extra = f"  R{' ' + rs.get('turn', '') if spiral else ''} r={rs.get('radiusMin')}-{rs.get('radiusMax')} span {rs.get('colSpan')}c x {rs.get('rowSpan')}r"
             if info.get('left') and spiral:
                 extra += f" | L {ls.get('turn', '')}"

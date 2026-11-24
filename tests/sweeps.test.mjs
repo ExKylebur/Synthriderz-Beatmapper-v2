@@ -5,19 +5,36 @@ import { load, colOf } from './harness.mjs';
 const S = load(['COL_X', 'CROSS_REACH_COLS', 'handZoneCols', 'buildDanceMoves', 'DANCE_MOVES',
   'isPattern', 'smoothPatternBoundaries']);
 
-test('DANCE_MOVES: the 14 named moves, in-range steps, non-cross moves stay home', () => {
-  assert.deepEqual(S.DANCE_MOVES.map(m => m.name), ['parallelSpiral', 'mirrorSpiral', 'scissors',
-    'doublePunch', 'altJabs', 'parallelStairs', 'accordion', 'mirrorWings', 'crossReturn',
-    'dnaHelix', 'pendulum', 'outwardBloom', 'boxStep', 'heartbeat']);
+test('DANCE_MOVES: the 12 named moves, in-range steps, non-cross moves stay home', () => {
+  // Circles left the step library (2026-11-22): they are [Orbit] phrases (tests/orbit.test.mjs).
+  assert.deepEqual(S.DANCE_MOVES.map(m => m.name), ['scissors', 'starPunch', 'altJabs',
+    'parallelStairs', 'accordion', 'mirrorWings', 'crossReturn', 'dnaHelix', 'pendulum',
+    'outwardBloom', 'boxStep', 'heartbeat']);
+  assert.ok(!S.DANCE_MOVES.some(m => /spiral|double/i.test(m.name)), 'old spiral/spike moves are gone');
   for (const m of S.DANCE_MOVES) for (const st of m.steps) {
     if (st.l) { assert.ok(st.l[1] >= 1 && st.l[1] <= 9); if (!m.cross) assert.ok(st.l[0] <= 7); }
     if (st.r) { assert.ok(st.r[1] >= 1 && st.r[1] <= 9); if (!m.cross) assert.ok(st.r[0] >= 7); }
   }
 });
 
-test('isPattern covers dense + sparse only', () => {
+test('starPunch: every jab is exactly 3 Manhattan from home (the dense step cap) and comes back', () => {
+  const mv = S.DANCE_MOVES.find(m => m.name === 'starPunch');
+  const home = mv.steps[1];
+  const dirs = new Set();
+  mv.steps.forEach((st, k) => {
+    assert.equal(st.r[0], 14 - st.l[0]);                                       // mirror images
+    assert.equal(st.r[1], st.l[1]);
+    if (k % 2) { assert.deepEqual(st, home); return; }                          // back home
+    assert.equal(Math.abs(st.l[0] - home.l[0]) + Math.abs(st.l[1] - home.l[1]), 3);
+    dirs.add(`${st.l[0] - home.l[0]},${st.l[1] - home.l[1]}`);
+  });
+  assert.equal(dirs.size, 5, 'five jab directions');
+});
+
+test('isPattern covers dense + sparse + orbit only', () => {
   assert.equal(S.isPattern({ _denseSweep: true }), true);
   assert.equal(S.isPattern({ _sparseSweep: true }), true);
+  assert.equal(S.isPattern({ _orbit: 'mirror' }), true);
   assert.equal(S.isPattern({ _goldSweep: true }), false);
   assert.equal(S.isPattern(null), false);
 });

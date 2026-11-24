@@ -12,6 +12,7 @@
 //                     block already consults), so the 3-Manhattan step cap, row band, zone clamp
 //                     and boundary smoothing are the shipped ones
 //   * sparse moves -> applySparseSweep (module-level)
+//   * circles      -> applyOrbitPhrases (module-level), the [Orbit] pass, variant forced via pickVariant
 //   * gold shapes  -> the literal text of the [GoldSweep] block of onsetsToNotes (shape forced the same way)
 // What is a faithful re-statement, NOT shipped code (the logic is inline in onsetsToNotes and bound
 // to its local state, so it cannot be evaluated in isolation): [GoldAccent] cross-field sweep,
@@ -41,7 +42,7 @@ function closure(src, roots) {
 }
 
 const G = closure(SRC, ['generateRailArc', 'planRailSegments', 'fitRailPlan', 'applySparseSweep',
-  'DANCE_MOVES', 'COL_X', 'smoothPatternBoundaries', 'RAIL_SHAPE_TIERS', 'railTierOf']);
+  'DANCE_MOVES', 'COL_X', 'smoothPatternBoundaries', 'RAIL_SHAPE_TIERS', 'railTierOf', 'applyOrbitPhrases']);
 const { COL_X, DANCE_MOVES } = G;
 
 // ── slice a block of onsetsToNotes by its marker comments ──────────────────────────────
@@ -51,7 +52,7 @@ function slice(startMarker, endMarker) {
   const lineStart = SRC.lastIndexOf('\n', a) + 1;
   return SRC.slice(lineStart, SRC.lastIndexOf('\n', b));
 }
-const GOLD_SRC  = slice('// ── [GoldSweep] choreograph clustered gold runs', '// ── [DenseSweep] flowing groups for dense runs (v2)');
+const GOLD_SRC  = slice('// ── [GoldSweep] choreograph clustered gold runs', '// ── [Orbit] circular two-hand phrases — see applyOrbitPhrases');
 const DENSE_SRC = slice('// ── [DenseSweep] flowing groups for dense runs (v2)', '// ── [SparseSweep] choreograph loose runs');
 const CTX = ['result', 'hints', 'diffRowMin', 'diffRowMax', 'sectionAt', 'motifMemory', 'swungAt',
              'DENSE_SWEEP', 'DANCE_MOVES', 'smoothPatternBoundaries', 'COL_X', 'console'];
@@ -155,10 +156,8 @@ function pathStats(points) {
            turn: area > 0.5 ? 'counter-clockwise' : area < -0.5 ? 'clockwise' : 'none' };
 }
 const MOVE_SAY = {
-  parallelSpiral: 'Spiral, both hands the same way',
-  mirrorSpiral: 'Spiral, mirrored hands',
   scissors: 'Scissors, hands up and down in opposite directions',
-  doublePunch: 'Double punch, out and in',
+  starPunch: 'Star punch, jabs fanning out and back',
   altJabs: 'Alternating jabs',
   parallelStairs: 'Stairs, both hands climbing',
   accordion: 'Accordion, hands in and out',
@@ -193,8 +192,9 @@ DANCE_MOVES.forEach((mv, idx) => {
                 right: R, left: L, rightStats: pathStats(R), leftStats: pathStats(L) } });
 });
 // SparseSweep (1-beat spacing) for two moves, real applySparseSweep
-for (const [name, idx] of [['parallelSpiral', 0], ['crossReturn', 8]]) {
-  const mv = DANCE_MOVES[idx];
+for (const name of ['scissors', 'crossReturn']) {
+  const idx = DANCE_MOVES.findIndex(m => m.name === name), mv = DANCE_MOVES[idx];
+  if (idx < 0) throw new Error(`move not in DANCE_MOVES: ${name}`);
   const result = [];
   mv.steps.forEach((st, k) => { if (st.r) result.push({ beat: k, row: 5, type: 0, _x: 0 }); if (st.l) result.push({ beat: k, row: 5, type: 1, _x: 0 }); });
   const out = G.applySparseSweep(result, { pickMove: () => idx });
@@ -202,6 +202,29 @@ for (const [name, idx] of [['parallelSpiral', 0], ['crossReturn', 8]]) {
   add({ group: 'Dance moves (SparseSweep, 1-beat steps)', name: `Sparse move: ${name}`, say: `Sparse ${MOVE_SAY[name].split(',')[0]}, one beat apart`,
         beats: mv.steps.length, notes: result.map(({ beat, row, type, _x, _crossover }) => ({ beat, row, type, _x, _crossover })), walls: [],
         info: { fn: 'applySparseSweep', move: name, tagged: out.tagged, right: R, left: L, rightStats: pathStats(R), leftStats: pathStats(L) } });
+}
+
+// Circles via the real [Orbit] pass (applyOrbitPhrases) ----------------------------------------
+// Both hands every 1/2 beat, offset by 1/4 (a dense 16th stream), 12 beats with no walls: the pass
+// picks a 4-beat turn (8 notes per hand per turn) at 100 BPM, so this draws 3 full turns per hand.
+// The last one runs the same stream under a crouch bar, where the circle keeps to rows 4-8.
+for (const [variant, label, say, walls] of [
+  ['parallel', 'Orbit: parallel circles', 'Circles, both hands turning the same way', []],
+  ['mirror', 'Orbit: mirrored circles', 'Circles, mirrored hands', []],
+  ['parallel', 'Orbit: circles under a crouch bar', 'Circles, low, under a crouch', [{ beat: 4, duration: 4, wallType: 'crouch' }]],
+]) {
+  const result = [];
+  for (let t = 0; t < 12; t += 0.5) {
+    result.push({ beat: t, row: 5, type: 0, _x: COL_X[10] });
+    result.push({ beat: t + 0.25, row: 5, type: 1, _x: COL_X[4] });
+  }
+  const out = G.applyOrbitPhrases(result, { walls, bps: 100 / 60, maxShare: 1, pickVariant: () => variant });
+  const perHand = h => result.filter(n => n.type === h && n._orbit).sort((a, b) => a.beat - b.beat).map(pt);
+  const R = perHand(0), L = perHand(1);
+  add({ group: 'Circles (Orbit, both hands)', name: label, say, beats: 12,
+        notes: result.map(({ beat, row, type, _x }) => ({ beat, row, type, _x })), walls,
+        info: { fn: 'applyOrbitPhrases', move: `orbit (${variant})`, tagged: out.tagged, of: result.length, turns: out.turns,
+                right: R, left: L, rightStats: pathStats(R), leftStats: pathStats(L) } });
 }
 
 // Gold shapes via the real [GoldSweep] block ------------------------------------------------
