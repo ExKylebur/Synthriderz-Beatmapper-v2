@@ -3386,13 +3386,98 @@ function buildStemDominanceMap(stemData, bpm, duration) {
   return dominant;
 }
 
+// ── Stem → event density (2026-11-23) ────────────────────────────────────────────────────────
+// Master has NO density cap: every stem hit becomes an event, limited only by physics and the
+// snap grid. Physics = one hand repeats at most every PHYS_SAME_HAND_SEC, so a drum run faster
+// than 8ths (a double-bass stream) ALTERNATES hands L-R-L-R (each hand at half the rate) and gets
+// no parallel mirror in onsetsToNotes. Before, one drums-owned hand took the run and the old
+// MIN_DRUM_GAP (¼ beat of RAW time) dropped every real 16th that landed a few ms early.
+// Expert → Easy taper gently AND by loudness (stemKeepProb): the quiet passages give up their hits
+// first, so a lower tier still gets denser where the song gets louder. Replaced (all tiers):
+// bass a flat random 50% (PROB_BASS_SKIP_WHEN_OWNER), drums/bass a flat random keep of
+// 1.0/0.80/0.55/0.35/0.20, hi-hats dropped outright below Expert.
+//   keep   share of drum (and rhythm-'other') hits kept at the song's MEDIAN loudness
+//   bass   share of bass hits kept at the median loudness
+//   hats   hi-hat keep as a fraction of `keep` (0 = none)
+//   stream fast drum runs alternate hands (needs the ¼-beat grid: Expert/Master)
+const STEM_DENSITY_TIERS = [
+  { minDiff: 9, keep: 1.00, bass: 1.00, hats: 1.0, stream: true  },   // Master: uncapped
+  { minDiff: 8, keep: 0.90, bass: 0.70, hats: 1.0, stream: true  },   // Expert
+  { minDiff: 6, keep: 0.75, bass: 0.50, hats: 0.5, stream: false },   // Hard
+  { minDiff: 4, keep: 0.70, bass: 0.40, hats: 0,   stream: false },   // Normal
+  { minDiff: 0, keep: 0.55, bass: 0.30, hats: 0,   stream: false },   // Easy
+];
+function stemDensityProfile(diff) {
+  return STEM_DENSITY_TIERS.find(t => diff >= t.minDiff) || STEM_DENSITY_TIERS[STEM_DENSITY_TIERS.length - 1];
+}
+// Chance a hit survives the taper: `base` at the song's median loudness, 1 at its loudest beat,
+// base² at its quietest (eRank = the beat's energy percentile, 0..1). base ≥ 1 never thins.
+function stemKeepProb(base, eRank) {
+  if (!(base < 1)) return 1;
+  if (!(base > 0)) return 0;
+  const r = Number.isFinite(eRank) ? Math.max(0, Math.min(1, eRank)) : 0.5;
+  return Math.pow(base, 2 * (1 - r));
+}
+const PHYS_SAME_HAND_SEC = 0.14;   // one hand repeats at most ~7 Hz (a Painkiller 16th at 103 BPM = 146 ms)
+const STREAM_GAP_BEATS   = 0.375;  // drum hits closer than this (16ths, early or late; a swung 8th's
+                                   // ⅓) form a stream. 0.3 lost Chaos Control's late 16ths (ρ 0.44 → 0.35)
+const TAPER_MAX_HOLE_SEC = 1.0;    // the difficulty taper never leaves the rhythm silent longer than this
+const DRUM_GAP_JITTER    = 0.8;    // the drum detector's NMS is 0.8 × ¼ beat: real 16ths sit 0.2-0.25 beat apart
+// 'other' as the RHYTHM source. htdemucs has no piano stem, so piano (Kin, Faith) lands in 'other',
+// whose onsets only ever started rails, or became orbs after ≥ 1 beat of drum silence. Where
+// 'other' is beat-locked and the drums are sparse, it plays the drums' role instead (free orbs,
+// companions on rails, stream alternation). Window ±RHYTHM_OTHER_WIN beats.
+const RHYTHM_OTHER_WIN       = 4;
+const RHYTHM_OTHER_MIN       = 4;     // ≥ 4 'other' onsets in the window (≥ 0.5 per beat)
+const RHYTHM_OTHER_LOCK      = 0.6;   // beat-phase lock (max_k R_k, as server.onset_phase_lock)
+const RHYTHM_OTHER_DRUM_FRAC = 0.5;   // and the drums have at most half as many hits there
+// ...and the lock must be significant: n·R² ≥ 6 (Rayleigh: random phases reach it with p ≈ 4·e^-6 ≈ 1%
+// over the four grids). 8 random onsets clear R 0.6 a fifth of the time; this needs R ≥ 0.87 from 8.
+const RHYTHM_OTHER_SIG       = 6;
+
+// Beat-phase lock of onset positions in BEATS on the map clock (the beat-1 pad puts the musical
+// beats on integers): max over k = 1..4 (beats, 8ths, triplets, 16ths) of |mean e^{2πi·k·b}|.
+// 1 = every onset on that grid; ~sqrt(π/4N) = random. Same statistic as server.onset_phase_lock.
+function beatPhaseLock(beats) {
+  const n = beats.length;
+  if (!n) return 0;
+  let best = 0;
+  for (let k = 1; k <= 4; k++) {
+    let c = 0, s = 0;
+    for (const b of beats) { c += Math.cos(2 * Math.PI * k * b); s += Math.sin(2 * Math.PI * k * b); }
+    best = Math.max(best, Math.hypot(c, s) / n);
+  }
+  return best;
+}
+
+// Per-beat flags (Uint8Array, index = floor(beat)): 1 where 'other' is the rhythm source.
+function rhythmOtherMap(stemData, bps, totalBeats) {
+  const flags = new Uint8Array(Math.max(0, Math.ceil(totalBeats)) + 1);
+  const ob = (stemData.other?.onsets || []).map(o => o.time * bps).sort((a, b) => a - b);
+  const db = (stemData.drums?.onsets || []).map(o => o.time * bps).sort((a, b) => a - b);
+  if (ob.length < RHYTHM_OTHER_MIN) return flags;
+  const lowerBound = (arr, x) => { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (arr[m] < x) lo = m + 1; else hi = m; } return lo; };
+  for (let b = 0; b < flags.length; b++) {
+    const lo = b + 0.5 - RHYTHM_OTHER_WIN, hi = b + 0.5 + RHYTHM_OTHER_WIN;
+    const oi = lowerBound(ob, lo), oj = lowerBound(ob, hi);
+    const nO = oj - oi;
+    if (nO < RHYTHM_OTHER_MIN) continue;
+    const nD = lowerBound(db, hi) - lowerBound(db, lo);
+    if (nD > RHYTHM_OTHER_DRUM_FRAC * nO) continue;
+    const R = beatPhaseLock(ob.slice(oi, oj));
+    if (R >= RHYTHM_OTHER_LOCK && nO * R * R >= RHYTHM_OTHER_SIG) flags[b] = 1;
+  }
+  return flags;
+}
+
 // Convert stem onset data into typed note events.
 // ── Phase 5: simultaneous stem role separation ───────────────────────────────
 //
 // All stems contribute simultaneously:
 //   • Percussion (drums) + bass → orb note events (note strikes)
 //   • Strings (other) + vocals  → rail events when a sustained region is available
-//   • Bass thinned 50% to prevent metronomic flooding
+//   • 'other' plays the drums' role where it is the rhythm source (rhythmOtherMap)
+//   • Density per difficulty: stemDensityProfile (Master uncapped), physics: PHYS_SAME_HAND_SEC
 //   • Section-level stem overrides (sectionStemMap) still suppress non-matching stems
 //
 // This means rails and notes coexist in the same time windows: percussion fires
@@ -3419,11 +3504,17 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   ].sort((a, b) => a.startSec - b.startSec);
 
   const usedRegions = new Set();
-  function railDurationAt(t) {
+  // A rail lasts what onsetsToNotes will actually make of it: 'other' (guitar) rails are capped at
+  // maxRailDurationBeats (5) beats, every other rail at 2 s (its [FEAT-3] caps). The old 4 s here
+  // held the hand — and turned every drum hit after the real rail end into a 'companion' with no
+  // rail to ride, which onsetsToNotes then dropped: 199-225 drum hits per song (Chaos Control /
+  // Painkiller, Master, 2026-11-23), whole beats of double bass with no notes at all.
+  function railDurationAt(t, src) {
+    const cap = src === 'other' ? (hints.maxRailDurationBeats ?? 5) / bps : 2.0;
     for (let i = 0; i < stemRegions.length; i++) {
       const r = stemRegions[i];
       if (!usedRegions.has(i) && t >= r.startSec - 0.05 && t <= r.endSec - railThresh) {
-        return { dur: Math.min(r.endSec - t, 4.0), idx: i };
+        return { dur: Math.min(r.endSec - t, 4.0, cap), idx: i };
       }
     }
     return { dur: 0, idx: -1 };
@@ -3466,35 +3557,73 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   let   stemWindowStart  = 0;             // when the current ownership window began
   // Per-hand minimum spacing (seconds) — prevents rapid-fire same-hand triggering
   // even within a single stem.  Drums: 1/16th note minimum; Bass: 1/8th note minimum.
-  const lastFreeOrbAt    = [0, 0];         // per-hand: time of last free orb placed
-  const MIN_DRUM_GAP     = beatSec * 0.25; // 1/16th note (matches snap resolution)
-  const MIN_BASS_GAP     = beatSec * 0.5;  // 1/8th note (bass rarely faster than this)
+  // Expert/Master (prof.stream): physics only — PHYS_SAME_HAND_SEC, or the detector's jittered
+  // 16th, whichever is longer — and a faster run alternates hands (see the free-orb branch).
+  const prof             = stemDensityProfile(diff);
+  // per-hand: time of last free orb placed (−∞: it was 0, which dropped every hit in the first ¼ beat)
+  const lastFreeOrbAt    = [-Infinity, -Infinity];
+  const SAME_HAND_GAP    = Math.max(PHYS_SAME_HAND_SEC, DRUM_GAP_JITTER * 0.25 * beatSec);
+  const MIN_DRUM_GAP     = prof.stream ? SAME_HAND_GAP : beatSec * 0.25; // 1/16th note (matches snap resolution)
+  const MIN_BASS_GAP     = prof.stream ? SAME_HAND_GAP : beatSec * 0.5;  // 1/8th note (bass rarely faster than this)
+  let   lastRhythm       = null;           // { t, hand, ev } — last drum / rhythm-'other' free orb
+  // Last drum ONSET (before the taper): 'drums quiet' must mean quiet in the music. Counting only
+  // emitted drum events made every taper-thinned beat look drumless, and the guitar orbs below
+  // refilled the easier tiers (Faith Easy: 110 -> 332 guitar orbs).
+  let   lastDrumOnsetT   = -Infinity;
+  // Loudness percentile per beat for the taper (stemKeepProb). No curve → every beat is median.
+  const _eCurve  = Array.isArray(hints._energyCurve) ? hints._energyCurve : null;
+  const _eSorted = _eCurve ? [..._eCurve].sort((a, b) => a - b) : null;
+  function eRankAt(t) {
+    if (!_eCurve || !_eSorted.length) return 0.5;
+    const e = _eCurve[Math.max(0, Math.min(_eCurve.length - 1, Math.floor(t * bps)))] ?? 0;
+    let lo = 0, hi = _eSorted.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (_eSorted[m] < e) lo = m + 1; else hi = m; }
+    return _eSorted.length > 1 ? lo / (_eSorted.length - 1) : 0.5;
+  }
+  const _rhythmOther = rhythmOtherMap(stemData, bps, duration * bps);
+  const snapBeats    = diff >= 8 ? 0.25 : diff >= 5 ? 0.5 : 1.0;   // == onsetsToNotes' snapSize
+  const slotKeep     = new Map();                                   // taper decision per snap slot
+  // true = the difficulty taper drops this orb hit (see the loop). Master never drops.
+  // It never opens a hole longer than TAPER_MAX_HOLE_SEC: a hit that far after the last kept one is
+  // kept (taper-dropped hits never reach `events`, so gap-fill cannot refill a hole it made).
+  let lastTaperKeptT = -Infinity;
+  function taperDrops(ev) {
+    if (!(prof.keep < 1 || prof.bass < 1 || prof.hats < 1)) return false;
+    const slot = Math.round(ev.t * bps / snapBeats);
+    let ok = prof.keep < 1 ? slotKeep.get(slot) : true;
+    if (ok === undefined) {
+      ok = ev.t - lastTaperKeptT >= TAPER_MAX_HOLE_SEC || Math.random() < stemKeepProb(prof.keep, eRankAt(ev.t));
+      slotKeep.set(slot, ok);
+    }
+    if (!ok) return true;
+    const isHat = ev.stemSource === 'drums' && ev.band === 'high';
+    const rel   = ev.stemSource === 'bass' ? prof.bass / prof.keep : isHat ? prof.hats : 1;
+    if (rel < 1 && Math.random() >= rel) return true;
+    lastTaperKeptT = ev.t;
+    return false;
+  }
 
   for (const ev of all) {
     if (ev.t >= duration) continue;
 
     // Stem enable/disable — skip events from stems the user has turned off
     if (hints.enabledStems && !hints.enabledStems[ev.stemSource]) continue;
+    if (ev.stemSource === 'drums') lastDrumOnsetT = ev.t;
 
     // Expire rails that have ended
     for (let i = activeRails.length - 1; i >= 0; i--) {
       if (activeRails[i].endSec <= ev.t) activeRails.splice(i, 1);
     }
 
-    const isPercussive = ev.stemSource === 'drums' || ev.stemSource === 'bass';
+    // 'other' where it is the rhythm source plays the drums' role (rhythmOtherMap)
+    const isRhythmOther = ev.stemSource === 'other' && _rhythmOther[Math.floor(ev.t * bps)] === 1;
+    const isPercussive  = ev.stemSource === 'drums' || ev.stemSource === 'bass' || isRhythmOther;
 
-    // Bass thinning — suppress ~50% to avoid metronomic flooding
-    if (ev.stemSource === 'bass' && Math.random() < PROB_BASS_SKIP_WHEN_OWNER) continue;
-
-    // Difficulty-based percussion thinning.
-    // Hi-hats are fast, frequent hits that only belong on Expert/Master.
-    // Kick/snare are also thinned on lower difficulties to reduce total note count.
-    if (isPercussive) {
-      const isHat = ev.stemSource === 'drums' && ev.band === 'high';
-      if (isHat && diff < 8) continue; // Hard and below: drop all hi-hats
-      const keepProb = diff >= 9 ? 1.0 : diff >= 8 ? 0.80 : diff >= 6 ? 0.55 : diff >= 4 ? 0.35 : 0.20;
-      if (Math.random() > keepProb) continue;
-    }
+    // Difficulty taper (stemDensityProfile / stemKeepProb). Master keeps every hit. The keep is
+    // decided per SNAP SLOT (one grid step: ¼ beat at Expert, ½ at Hard, 1 at Normal/Easy), shared
+    // by every percussive stem: on a coarse grid a slot holds several hits and a per-hit coin let
+    // nearly every beat through anyway. Bass and hats then thin further, relative to `keep`.
+    if (isPercussive && taperDrops(ev)) continue;
 
     // Section-level stem override
     if (hints.sectionStemMap && hints._sections?.length) {
@@ -3515,9 +3644,12 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
         // interrupting a guitar/vocal rail hold with bass hits.
         // Only drums generate companions on active rails.
         if (ev.stemSource === 'bass') {
-          // Bass plays freely on its own hand even while the other holds a rail
-          const bh = bassHand;
-          if (ev.t >= nextFreeAt[bh] && ev.t - lastFreeOrbAt[bh] >= MIN_BASS_GAP) {
+          // Bass plays freely on its own hand even while the other holds a rail. When the rail IS
+          // on the bass hand, the free hand takes the hit (it used to be dropped, so the free hand
+          // sat idle through every rail that landed on the bass hand).
+          const bh = ev.t >= nextFreeAt[bassHand] ? bassHand
+                   : ev.t >= nextFreeAt[1 - bassHand] ? 1 - bassHand : -1;
+          if (bh >= 0 && ev.t - lastFreeOrbAt[bh] >= MIN_BASS_GAP) {
             lastFreeOrbAt[bh] = ev.t;
             events.push({
               time: ev.t, duration: 0, type: 'orb',
@@ -3538,6 +3670,7 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
           companionHand: targetRail.hand,
           band: ev.band, stemSource: ev.stemSource,
           pitchRow: null, forcedNoteType: undefined,
+          ...(isRhythmOther ? { rhythm: true } : {}),
         });
       } else {
         // ── Free orb: stem-hand ownership ─────────────────────────────────
@@ -3548,38 +3681,76 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
           stemWindowStart = ev.t;
         }
 
-        // Assign hand by stem type — drums own one hand, bass own the other
-        const preferredHand = ev.stemSource === 'bass' ? bassHand : drumsHand;
-        const fallbackHand  = 1 - preferredHand;
+        const isRhythm = ev.stemSource !== 'bass';   // drums, or 'other' in the drums' role
+        let handIdx, stream = false;
+        const canTake = h => ev.t >= nextFreeAt[h] && ev.t - lastFreeOrbAt[h] >= SAME_HAND_GAP;
+        if (isRhythm && prof.stream && lastRhythm && ev.t - lastRhythm.t < STREAM_GAP_BEATS * beatSec) {
+          // ── Stream (faster than 8ths, e.g. double bass): alternate hands L-R-L-R ───────
+          // The other hand takes the hit; the same hand only if the other can't and physics
+          // allows. Both ends are marked `stream` so onsetsToNotes adds no parallel mirror
+          // (a mirrored stream = both hands on every 16th).
+          const alt = 1 - lastRhythm.hand;
+          if (canTake(alt)) handIdx = alt;
+          else if (canTake(lastRhythm.hand)) handIdx = lastRhythm.hand;
+          else continue;
+          stream = true;
+          lastRhythm.ev.stream = true;
+        } else {
+          // Assign hand by stem type — drums own one hand, bass own the other
+          const preferredHand = ev.stemSource === 'bass' ? bassHand : drumsHand;
+          const fallbackHand  = 1 - preferredHand;
 
-        // Enforce rail occupancy guard
-        const preferredFree = ev.t >= nextFreeAt[preferredHand];
-        const fallbackFree  = ev.t >= nextFreeAt[fallbackHand];
-        if (!preferredFree && !fallbackFree) continue;
+          // Enforce rail occupancy guard
+          const preferredFree = ev.t >= nextFreeAt[preferredHand];
+          const fallbackFree  = ev.t >= nextFreeAt[fallbackHand];
+          if (!preferredFree && !fallbackFree) continue;
 
-        // Enforce strict stem-hand ownership: if the preferred hand is busy,
-        // DROP this event rather than placing it on the wrong hand.
-        // Fallback mixing was the cause of rapid drum+bass interleaving on the
-        // same hand — drums belong on drumsHand only, bass on bassHand only.
-        if (!preferredFree) continue;
-        const handIdx = preferredHand;
+          // Enforce strict stem-hand ownership: if the preferred hand is busy,
+          // DROP this event rather than placing it on the wrong hand.
+          // Fallback mixing was the cause of rapid drum+bass interleaving on the
+          // same hand — drums belong on drumsHand only, bass on bassHand only.
+          if (!preferredFree) continue;
+          handIdx = preferredHand;
 
-        // Per-hand minimum spacing — prevents rapid same-hand firing
-        const minGap = ev.stemSource === 'bass' ? MIN_BASS_GAP : MIN_DRUM_GAP;
-        if (ev.t - lastFreeOrbAt[handIdx] < minGap) continue;
+          // Per-hand minimum spacing — prevents rapid same-hand firing
+          const minGap = ev.stemSource === 'bass' ? MIN_BASS_GAP : MIN_DRUM_GAP;
+          if (ev.t - lastFreeOrbAt[handIdx] < minGap) continue;
+        }
 
         lastFreeOrbAt[handIdx] = ev.t;
-        events.push({
+        const out = {
           time: ev.t, duration: 0, type: 'orb',
           hand: handIdx === 0 ? 'right' : 'left',
           band: ev.band, stemSource: ev.stemSource,
           pitchRow: null, forcedNoteType: hints.stemNoteTypeMap?.[ev.stemSource],
-        });
+        };
+        if (stream) out.stream = true;
+        if (isRhythmOther) out.rhythm = true;
+        events.push(out);
+        if (isRhythm) lastRhythm = { t: ev.t, hand: handIdx, ev: out };
       }
     } else {
       // ── Melodic: start a rail if a sustained region is available ────────────
-      const { dur: railDur, idx: regionIdx } = railDurationAt(ev.t);
-      const isRail = railDur >= railThresh;
+      const { dur: railDur, idx: regionIdx } = railDurationAt(ev.t, ev.stemSource);
+      // onsetsToNotes turns a rail under 2 beats into a plain orb, so emit it as one: holding the
+      // hand for it here only orphaned the drum hits inside its window (see railDurationAt).
+      const isRail  = railDur >= railThresh && railDur * bps >= 2.0;
+      const isShort = !isRail && railDur >= railThresh;
+
+      if (isShort) {
+        const rightFree = ev.t >= nextFreeAt[0], leftFree = ev.t >= nextFreeAt[1];
+        if (rightFree || leftFree) {
+          const handIdx = !rightFree ? 1 : !leftFree ? 0 : railToggle++ % 2;
+          usedRegions.add(regionIdx);
+          events.push({
+            time: ev.t, duration: 0, type: 'orb',
+            hand: handIdx === 0 ? 'right' : 'left',
+            band: ev.band, pitchRow: ev.pitchRow, stemSource: ev.stemSource,
+            forcedNoteType: hints.stemNoteTypeMap?.[ev.stemSource],
+          });
+        }
+        continue;
+      }
 
       if (isRail) {
         // Need a free hand for the rail — also enforce 1-beat gap between
@@ -3615,12 +3786,12 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
         // breakdowns and solos get populated without competing with drum sections.
         // Spacing: 1/8th note minimum so a fast guitar run doesn't flood one hand.
         if (ev.stemSource === 'other') {
-          const lastDrumT = events.reduce((m, e) =>
-            e.stemSource === 'drums' ? Math.max(m, e.time) : m, 0);
-          const drumQuiet = ev.t - lastDrumT > beatSec; // drums quiet for ≥ 1 beat
-          if (drumQuiet) {
-            // Alternate guitar orbs between both hands for a natural solo feel
-            const ghHand = railToggle % 2;
+          const drumQuiet = ev.t - lastDrumOnsetT > beatSec; // drums quiet for ≥ 1 beat
+          if (drumQuiet && !taperDrops(ev)) {
+            // Alternate guitar orbs between both hands for a natural solo feel; when that hand
+            // holds a rail, the free one takes the hit (it used to be dropped)
+            let ghHand = railToggle % 2;
+            if (!(ev.t >= nextFreeAt[ghHand]) || activeRails.some(r => r.hand === ghHand)) ghHand = 1 - ghHand;
             const ghFree = ev.t >= nextFreeAt[ghHand];
             const ghGap  = ev.t - lastFreeOrbAt[ghHand] >= beatSec * 0.25; // 1/16th min
             // Skip if this hand already has an active rail — guitar orbs on a rail
@@ -4428,7 +4599,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const motifMemory = createMotifMemory(sections);   // per Generate call (spec decision 2026-11-21)
 
 
-  const events = extractNoteEvents(analysis, bpm, diff, { ...hints, _sections: sections });
+  // _energyCurve: the stem taper thins by loudness (stemKeepProb)
+  const events = extractNoteEvents(analysis, bpm, diff, { ...hints, _sections: sections, _energyCurve: energyCurve });
   if (events.length < 10) {
     // Loud diagnostic: this is the ONLY silent zero-notes path. If a song ever generates
     // "0 notes", this line says whether the analysis fed us an empty/near-empty event list
@@ -4600,7 +4772,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   const elevateCues    = hints.lyricCues?.filter(c => c.action === 'elevate') ?? [];
   const nonElevateCues = hints.lyricCues?.filter(c => c.action !== 'elevate') ?? [];
 
-  for (const ev of events) {
+  let _evIdx = -1;                       // index of ev in events (the stream mirror looks ahead)
+  for (let ev of events) {
+    _evIdx++;
     const beat = snapBeat(ev.time);
     if (beat < 0 || beat >= totalBeats) continue;
     const bk = Math.round(beat * 100);
@@ -4629,10 +4803,17 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           beat > n.beat && beat < n.railEndBeat
         );
       }
-      if (!railNote) continue; // no active rail on either hand — skip
-      result.push({ beat, row: railNote.row, type: railNote.type, _x: railNote._x, _comp: true, stemSource: ev.stemSource });
-      beatOccupied.add(bk);
-      continue;
+      if (railNote) {
+        result.push({ beat, row: railNote.row, type: railNote.type, _x: railNote._x, _comp: true, stemSource: ev.stemSource });
+        beatOccupied.add(bk);
+        continue;
+      }
+      // No rail here after all (it was skipped, shortened or moved below): the hit is still a
+      // real drum hit, so place it as a free orb on that hand — or the other one if that hand hit
+      // too recently — instead of dropping it. No parallel mirror (`stream`): these come in runs.
+      const _fh = [hand, 1 - hand].find(h => (beat - lastHandBeat[h]) / bps >= PHYS_SAME_HAND_SEC);
+      if (_fh === undefined) continue;
+      ev = { ...ev, type: 'orb', hand: _fh === 0 ? 'right' : 'left', stream: true };
     }
 
     // ── Stem→NoteType: forced color — designed in from the first placement decision ──
@@ -4707,7 +4888,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     // Rail events come pre-assigned from extractNoteEventsFromStems with nextFreeAt tracking
     // to prevent same-hand overlap. Do NOT let handBias/panning flip the hand for rails —
     // that invalidates the nextFreeAt guard and causes simultaneous same-hand rails.
-    if (ev.type !== 'rail') {
+    // Stream hits (an alternating L-R drum run) keep their hand too: a flip puts two hits on one hand.
+    if (ev.type !== 'rail' && !ev.stream) {
       // Section-scoped handBias constraint takes priority over global handBias
       const _hbConstraint = constraintAt(beat, 'handBias');
       const _effectiveHandBias = _hbConstraint ? _hbConstraint.value : handBias;
@@ -5164,7 +5346,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       });
       beatOccupied.add(bk);
     } else {
-      result.push({ beat, row, type: hand, _x: xStart, stemSource: ev.stemSource || null });
+      result.push({ beat, row, type: hand, _x: xStart, stemSource: ev.stemSource || null,
+                    ...(ev.rhythm ? { _rhythm: true } : {}) });
       beatOccupied.add(bk);
     }
     if (row === 0) row0Count++; else if (row >= 8) row8plusCount++; // consistent with lines above
@@ -5186,12 +5369,23 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const _dbCompRate = secHandMode === 'single-arm'
       ? (_isSoloSection ? 0.15 : 0.50)
       : _baseDbComp;
-    if (_fnt === undefined && Math.random() < _dbCompRate) {
+    // Stream hits (an alternating L-R drum run, extractNoteEventsFromStems) are already both hands:
+    // they get a mirror only ON THE BEAT (a two-hand accent inside the run), and only if that
+    // hand's next hit is ≥ PHYS_SAME_HAND_SEC away. Mirroring every stream hit = both hands on
+    // every 16th. Every mirror also needs that hand's previous note ≥ PHYS_SAME_HAND_SEC back.
+    const _ohName   = hand === 0 ? 'left' : 'right';
+    const _streamOk = !ev.stream || (Math.abs(beat - Math.round(beat)) < 1e-6 && (() => {
+      for (let j = _evIdx + 1; j < events.length && events[j].time - ev.time < PHYS_SAME_HAND_SEC; j++)
+        if (events[j].hand === _ohName) return false;
+      return true;
+    })());
+    if (_fnt === undefined && _streamOk && Math.random() < _dbCompRate) {
       const oh = 1 - hand;
       const ohRailActive = result.some(n => n.type === oh && n.railEndBeat !== undefined &&
                                             beat >= n.beat && beat < n.railEndBeat);
       const ohHasNote    = result.some(n => n.type === oh && Math.abs(n.beat - beat) < 0.05);
-      if (!ohRailActive && !ohHasNote && !isHandResting(beat, oh)) {
+      const ohTooSoon    = (beat - lastHandBeat[oh]) / bps < PHYS_SAME_HAND_SEC;
+      if (!ohRailActive && !ohHasNote && !ohTooSoon && !isHandResting(beat, oh)) {
         // Row matches primary so both hands are at the same height (parallel arcs).
         const compRow = Math.max(diffRowMin, Math.min(diffRowMax, row));
         // Mirror column: find the primary's relative position within its zone (0–1)
@@ -6861,8 +7055,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     let i = 0;
     while (i < sorted.length) {
       const n = sorted[i];
+      // _rhythm: 'other' playing the drums' role (rhythmOtherMap) is a beat, not a sustained tone
       if (!sustainStems.includes(n.stemSource) || n.railEndBeat !== undefined
-          || n._comp || n._dbComp || n._gapFill) { i++; continue; }
+          || n._comp || n._dbComp || n._gapFill || n._rhythm) { i++; continue; }
       // Collect run
       const run = [n];
       let lastBeat = n.beat;

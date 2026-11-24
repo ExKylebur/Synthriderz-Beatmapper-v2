@@ -377,6 +377,11 @@ test('DenseSweep: a swung-8th run (2/3 + 1/3 gaps) counts as dense', () => {
   let fixed = 0, old = 0;
   for (const seed of [71, 72, 73]) {
     const s = song('swung', { seed, beats: 256 });
+    // Swung 8ths only (the beat + its ⅔ "a"): drop the hits on the first third. With the triplet
+    // hats in, the drum line itself fills the ⅔ gaps since the 2026-11-23 density work (drum hits
+    // that rode a rail onsetsToNotes never placed are no longer dropped), so the gate couldn't show.
+    const bps = s.bpm / 60, onFirstThird = o => Math.abs((((o.time * bps) % 1) + 1) % 1 - 1 / 3) < 0.1;
+    for (const k of ['drums', 'bass', 'other']) s.analysis.stemData[k].onsets = s.analysis.stemData[k].onsets.filter(o => !onFirstThird(o));
     fixed += run(NOW, s, 9).notes.filter(n => n._denseSweep).length;
     old   += run(back, s, 9).notes.filter(n => n._denseSweep).length;
   }
