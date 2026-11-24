@@ -177,7 +177,9 @@ function closure(src, roots) {
 // still everything except the comfort-reach rule.
 // Re-pinned ab9e2f1 -> 3d387b1 (stem density, 2026-11-23): ab9e2f1 merged with the density work,
 // so again everything except the comfort-reach rule.
-const BASE = '3d387b1';
+// Re-pinned 3d387b1 -> c0777cb (Orbit C3 edge anchors, 2026-11-24): 3d387b1 plus that fix, so
+// again everything except the comfort-reach rule.
+const BASE = 'c0777cb';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);
