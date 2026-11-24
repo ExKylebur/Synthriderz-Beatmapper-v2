@@ -179,7 +179,9 @@ function closure(src, roots) {
 // so again everything except the comfort-reach rule.
 // Re-pinned 3d387b1 -> c0777cb (Orbit C3 edge anchors, 2026-11-24): 3d387b1 plus that fix, so
 // again everything except the comfort-reach rule.
-const BASE = 'c0777cb';
+// Re-pinned c0777cb -> e421a8e (rail shape fidelity, 2026-11-24): c0777cb plus the 1f535b0 rail
+// geometry, nothing else.
+const BASE = 'e421a8e';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);
