@@ -7901,6 +7901,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       for (let i = result.length - 1; i >= 0; i--) {
         if (toRemove.has(result[i])) result.splice(i, 1);
       }
+      // Their companions become free orbs (see releaseRailCompanions); the ones inside a
+      // surviving rail are re-snapped and re-tagged by the snap pass below.
+      const released = releaseRailCompanions(result, toRemove);
+      if (released) console.log(`[PlacementDebug] Released ${released} companion(s) of the removed rail(s) as free orbs`);
     }
   }
 
@@ -10837,6 +10841,30 @@ function railPosAt(rail, beat) {
   }
   const nearest = beat <= pts[0].beat ? pts[0] : pts[pts.length - 1];
   return { _x: nearest._x ?? 0, row: nearest.row };
+}
+
+// Companions of rails a pass has deleted (`removed`, already out of `notes`) lose their rail.
+// Left tagged _comp they keep the dead rail's positions: protected from the C3 clamp and the
+// sweeps, and never re-snapped, since snapping only covers surviving rails. A rail dragged
+// across centre and then head-corrected by [ZoneEnforce] left a left-hand companion at col 10
+// that way (Faith Expert, 2026-11-24: HARD ZONE in validate.py). Each one becomes a free orb in
+// its own hand's zone; one inside a surviving same-hand (or gold) rail keeps its tag for the
+// caller's snap pass. Returns the number released.
+function releaseRailCompanions(notes, removed) {
+  const kept = notes.filter(n => n.railEndBeat != null);
+  const inRail = (n, r) => n.beat >= r.beat - 0.05 && n.beat <= r.railEndBeat + 0.05;
+  let released = 0;
+  for (const r of removed) {
+    const z = handZoneCols(r.type);
+    for (const n of notes) {
+      if (!n._comp || n.type !== r.type || n.railEndBeat != null || !inRail(n, r)) continue;
+      if (kept.some(k => (k.type === n.type || k.type === 3) && inRail(n, k))) continue;
+      delete n._comp;
+      n._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, _htCol(n._x)))];
+      released++;
+    }
+  }
+  return released;
 }
 
 // True if `note` is a C1 violation against `rail` — same-hand note inside the
