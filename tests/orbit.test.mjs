@@ -11,6 +11,7 @@ const O = load(['COL_X', 'OBSTACLE_BUFFER_BEATS', 'OBSTACLE_LEAD_BEATS', 'CROSS_
   'isPattern', 'smoothPatternBoundaries', 'ORBIT_VARIANTS', 'ORBIT_GEOM', 'ORBIT_PERIODS', 'ORBIT_NPR',
   'ORBIT_NPR_MIN', 'ORBIT_NPR_MAX', 'ORBIT_TURN_SEC_MIN', 'ORBIT_TURN_SEC_MAX', 'ORBIT_MIN_TURNS',
   'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE',
+  'railPosAt', '_htCol', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast', 'buildRailsByHand', 'c3Pos', 'c3Movable', 'c3Jump',
   'orbitPoint', 'orbitPeriods', 'applyOrbitPhrases']);
 
 // ── circularity metric (the one used for the before/after numbers) ──────────────────────
@@ -133,6 +134,35 @@ test('rails, gold and green: no orbit note within a beat of them', () => {
     assert.ok(Math.abs(n.beat - 9) > 1 && Math.abs(n.beat - 25) > 1, `orbit note at ${n.beat}`);
     assert.ok(n.beat < 30 || n.beat > 35, `orbit note at ${n.beat} inside the rail window`);
   }
+});
+
+// clampC3Jumps (the backstop) moves a circle's END note when the hand's next note on its C3 path
+// is one it may not move (gold, zone green, rail) inside C3_MIN_GAP_SEC and out of reach. Seen
+// on the density branch (2026-11-24): a gold 1.5 beats past the phrase (outside the ±1-beat
+// block) at col 11, the left hand's last note pulled from col 1 into the circle's centre (col 4).
+const C3 = load(['COL_X', 'isPattern', 'railPosAt', '_htCol', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast',
+  'buildRailsByHand', 'sameRailWindow', 'c3Pos', 'c3Movable', 'c3Jump', 'clampC3Jumps']);
+test('a gold just past the phrase, inside C3 time: the circle ends within reach, the clamp moves no circle note', () => {
+  const quiet = console.log; console.log = () => {};
+  try {
+    // [gold col, gold row, circle notes that may be left off]: reachable by the start angle alone
+    // (col 11: the left hand ends at col >= 4), and unreachable for the right hand (col 0) or for
+    // most of the left circle (col 14 / row 10), where one end note stays a free note.
+    for (const [col, row, dropMax] of [[11, 5, 0], [11, 0, 0], [0, 0, 1], [14, 10, 1]]) {
+      const notes = stream(0, 12), end = Math.max(...notes.map(n => n.beat));
+      notes.push({ beat: end + 1.5, type: 3, _x: O.COL_X[col], row });
+      const res = O.applyOrbitPhrases(notes, { bps: 2, maxShare: 1 });
+      const lab = `gold c${col}/r${row}`;
+      assert.equal(res.phrases, 1, lab);
+      const orb = notes.filter(n => n._orbit);
+      assert.ok(orb.length >= notes.length - 1 - dropMax, `${lab}: ${notes.length - 1 - orb.length} left off the circle`);
+      for (const hn of hands(notes)) assert.ok(readable(circle(pts(hn))), `${lab}: ${JSON.stringify(circle(pts(hn)))}`);
+      const placed = orb.map(n => [n._x, n.row]);
+      C3.clampC3Jumps(notes, 2);
+      assert.deepEqual(orb.map(n => [n._x, n.row]), placed, `${lab}: the clamp moved a circle note`);
+      assert.equal(C3.clampC3Jumps(notes, 2).clamped, 0, `${lab}: a C3 jump is left`);
+    }
+  } finally { console.log = quiet; }
 });
 
 test('budget, spacing and sparse rhythm', () => {
