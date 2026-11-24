@@ -4168,13 +4168,34 @@ function computeEnergyCurve(mono, sr, beatDur, numBeats) {
 // roll, then any Math.random() calls inside the branch). Extracted from generateRailArc so
 // multi-segment rails can draw several shapes back to back.
 function buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng) {
-  const triS = u => { const ph = ((u % 1) + 1) % 1;
-    return ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4; };
   const zoneMid  = (colMin + colMax) / 2;
   const farSide  = startCol < zoneMid ? colMax - 1 : colMin + 1;
   const zoneHalf = (colMax - colMin) / 2;
   let stairSteps = 0;
   let posAt;
+  // Oscillating and cornered shapes swing at least RAIL_AMP_MIN rows each way: at 1.5 rows the
+  // integer row grid collapsed wave, zigzag and ramp onto the same 2-row path (~25 cm in game).
+  const RAIL_AMP_MIN = 2;
+  const colAt = t => startCol + (farSide - startCol) * t;
+  // Row baseline for those shapes: starts on the head row and by tFull (the first peak) reaches
+  // a centre with `amp` of room both ways, so a rail headed near the floor or ceiling still
+  // swings fully instead of flattening into the row clamp.
+  const baseAt = (amp, tFull) => {
+    const c = Math.max(1 + amp, Math.min(8 - amp, rowStart));
+    return t => rowStart + (c - rowStart) * Math.min(1, t / tFull);
+  };
+  // Vertex shapes are a polyline through explicit corners; `corners` (their t) goes back to
+  // generateRailArc so a waypoint lands ON each corner (see railCornerTs).
+  let corners = null;
+  const poly = verts => {
+    corners = verts.slice(1, -1).map(v => v.t);
+    return t => {
+      let i = 0;
+      while (i < verts.length - 2 && t > verts[i + 1].t) i++;
+      const a = verts[i], b = verts[i + 1], u = (t - a.t) / ((b.t - a.t) || 1);
+      return { col: a.col + (b.col - a.col) * u, row: a.row + (b.row - a.row) * u };
+    };
+  };
   if (railShape === 'ellipse') {
     let totalRotation;
     if      (len < 2.5)  totalRotation = Math.PI * (0.75 + rng * 0.75);
@@ -4193,21 +4214,26 @@ function buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayB
       const a = startAngle + t * totalRotation;
       return { col: centerCol + radiusCol * Math.cos(a), row: centerRow + radiusRow * Math.sin(a) };
     };
-  } else if (railShape === 'wave' || railShape === 'zigzag' || railShape === 'ramp') {
-    const amp = Math.min(3, Math.max(1.5, 1.5 * swayBoost));
-    if (railShape === 'wave') {
-      const cyc = Math.max(1, Math.round(len / 4));
-      posAt = t => ({ col: startCol + (farSide - startCol) * t,
-                      row: rowStart + amp * Math.sin(t * cyc * 2 * Math.PI) });
-    } else if (railShape === 'zigzag') {
-      const zigs = Math.max(2, Math.round(len / 1.5));
-      posAt = t => ({ col: startCol + (farSide - startCol) * t,
-                      row: rowStart + amp * triS(t * zigs / 2) });
-    } else {
-      const zigs = Math.max(2, Math.round(len / 2));
-      posAt = t => ({ col: startCol + (farSide - startCol) * t,
-                      row: rowStart + (0.35 + 0.95 * t) * amp * triS(t * zigs / 2) });
+  } else if (railShape === 'wave') {
+    const amp  = Math.min(3, Math.max(RAIL_AMP_MIN, RAIL_AMP_MIN * swayBoost));
+    const cyc  = Math.max(1, Math.round(len / 4));
+    const base = baseAt(amp, 1 / (4 * cyc));
+    posAt = t => ({ col: colAt(t), row: base(t) + amp * Math.sin(t * cyc * 2 * Math.PI) });
+  } else if (railShape === 'zigzag' || railShape === 'ramp') {
+    // zigzag: constant-amplitude peaks; ramp: more, faster peaks whose amplitude BUILDS.
+    const ramp = railShape === 'ramp';
+    const amp  = ramp ? Math.min(3, Math.max(2.4, 2.4 * swayBoost))
+                      : Math.min(3, Math.max(RAIL_AMP_MIN, RAIL_AMP_MIN * swayBoost));
+    const zigs = ramp ? Math.max(3, Math.round(len / 1.5)) : Math.max(2, Math.round(len / 1.5));
+    const ampAt = t => ramp ? Math.min(3.5, (0.35 + 0.95 * t) * amp) : amp;
+    const base = baseAt(ramp ? Math.min(3.5, 1.3 * amp) : amp, 0.5 / zigs);
+    const verts = [{ t: 0, col: startCol, row: rowStart }];
+    for (let j = 0; j < zigs; j++) {
+      const t = (j + 0.5) / zigs;
+      verts.push({ t, col: colAt(t), row: base(t) + (j % 2 ? -1 : 1) * ampAt(t) });
     }
+    verts.push({ t: 1, col: colAt(1), row: base(1) });
+    posAt = poly(verts);
   } else if (railShape === 'pendulum') {
     const swing = Math.min(zoneHalf * 0.8, 2 + 2 * swayBoost);
     const cyc   = Math.max(1, Math.round(len / 5));
@@ -4215,31 +4241,26 @@ function buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayB
       const s = Math.sin(t * cyc * 2 * Math.PI);
       return { col: startCol + swing * s, row: rowStart + 2 * Math.abs(s) };
     };
-  } else if (railShape === 'hook') {
-    const dir   = startCol < zoneMid ? 1 : -1;
-    const reach = Math.max(2, Math.min(4, zoneHalf * 0.7));
-    const midCol = startCol + dir * reach, endCol = midCol - dir * reach * 0.4;
-    const midRow = rowStart - 2.2,         endRow = rowStart + 2.4;
-    posAt = t => t < 0.5
-      ? { col: startCol + (midCol - startCol) * (t / 0.5), row: rowStart + (midRow - rowStart) * (t / 0.5) }
-      : { col: midCol + (endCol - midCol) * ((t - 0.5) / 0.5), row: midRow + (endRow - midRow) * ((t - 0.5) / 0.5) };
-  } else if (railShape === 'flick') {
-    const dir   = startCol < zoneMid ? 1 : -1;
-    const reach = Math.max(2, Math.min(4, zoneHalf * 0.7));
-    const peakCol = startCol + dir * reach;
-    posAt = t => t < 0.65
-      ? { col: startCol + (peakCol - startCol) * (t / 0.65), row: rowStart - 1.2 * (t / 0.65) }
-      : { col: peakCol - dir * reach * 0.28 * ((t - 0.65) / 0.35), row: rowStart - 1.2 + 3.0 * ((t - 0.65) / 0.35) };
+  } else if (railShape === 'hook' || railShape === 'flick') {
+    // hook: out-and-up to a corner at the midpoint, then back down past the start.
+    // flick: a long low push out, then a sharp short kick down and back.
+    // Reach runs to the far side of the zone (>= 3 cols when the zone allows); the vertical leg
+    // goes up first unless the head sits too close to the ceiling for it.
+    const dir    = startCol < zoneMid ? 1 : -1;
+    const reach  = Math.max(2, Math.min(4, Math.abs(farSide - startCol)));
+    const up     = rowStart >= 3.5 ? -1 : 1;
+    const hook   = railShape === 'hook';
+    const tc     = hook ? 0.5 : 0.65;
+    const cCol   = startCol + dir * reach;
+    const cRow   = rowStart + up * (hook ? 2.2 : 1.5);
+    const eCol   = cCol - dir * reach * (hook ? 0.4 : 0.3);
+    const eRow   = cRow - up * (hook ? 4.6 : 3.0);
+    posAt = poly([{ t: 0, col: startCol, row: rowStart }, { t: tc, col: cCol, row: cRow }, { t: 1, col: eCol, row: eRow }]);
   } else if (railShape === 'switchback') {
-    const amp   = Math.min(3.2, Math.max(1.8, 1.8 * swayBoost));
-    const knots = [[0, 0], [0.34, 1], [0.67, -1], [1, 0.35]];
-    posAt = t => {
-      let s = 0;
-      while (s < knots.length - 2 && t > knots[s + 1][0]) s++;
-      const [t0, v0] = knots[s], [t1, v1] = knots[s + 1];
-      const u = (t - t0) / (t1 - t0 || 1);
-      return { col: startCol + (farSide - startCol) * t, row: rowStart + amp * (v0 + (v1 - v0) * u) };
-    };
+    const amp  = Math.min(3.2, Math.max(2.2, 2.2 * swayBoost));
+    const base = baseAt(amp, 0.34);
+    posAt = poly([[0, 0], [0.34, 1], [0.67, -1], [1, 0.35]].map(([t, v], i) =>
+      ({ t, col: colAt(t), row: i ? base(t) + amp * v : rowStart })));
   } else if (railShape === 'spiral') {
     const rot = Math.PI * 2 * (2 + rng * 1.5) * (Math.random() < 0.5 ? -1 : 1);
     const rc0 = Math.min(zoneHalf * 0.75, Math.max(1.5, 2.5 * swayBoost));
@@ -4259,19 +4280,57 @@ function buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayB
       return { col: startCol + w8 * Math.sin(2 * u), row: rowStart + h8 * Math.sin(u) };
     };
   } else {
-    stairSteps = Math.max(3, Math.min(6, Math.round(len / 2.5)));
-    const rowDir = rowStart > 4 ? -1 : 1;
-    const colAt = j => startCol + (farSide - startCol) * (j / stairSteps);
-    const rowAt = j => rowStart + rowDir * Math.min(3, j * 0.9);
-    posAt = t => {
-      const k = Math.min(stairSteps - 1e-6, t * stairSteps);
-      const i = Math.floor(k), f = k - i;
-      return f < 0.5
-        ? { col: colAt(i) + (colAt(i + 1) - colAt(i)) * (f / 0.5), row: rowAt(i) }
-        : { col: colAt(i + 1), row: rowAt(i) + (rowAt(i + 1) - rowAt(i)) * ((f - 0.5) / 0.5) };
-    };
+    // staircase: discrete steps — a flat tread, then a quick riser (<= 3/4 beat, <= 35% of
+    // the step; a slower riser rounds onto the row grid as a ramp of its own).
+    // Steps were 1 grid cell (~13 cm) each and read as a straight diagonal in game; now each
+    // step is >= 2 cols x 2 rows wherever the zone has room. It climbs toward the zone edge
+    // and the row extreme with the MOST room (from the zone centre that is 4 cols / 4 rows).
+    const farEdge = startCol - colMin > colMax - startCol ? colMin : colMax;
+    const colDir  = Math.sign(farEdge - startCol) || 1, colRoom = Math.abs(farEdge - startCol);
+    const rowDir  = rowStart - 1 >= 8 - rowStart ? -1 : 1;
+    const rowRoom = rowDir < 0 ? rowStart - 1 : 8 - rowStart;
+    stairSteps = Math.max(2, Math.min(Math.max(2, Math.min(4, Math.round(len / 3))),
+                                      Math.floor(colRoom / 2), Math.floor(rowRoom / 2)));
+    const cs = Math.max(1, Math.floor(colRoom / stairSteps)), rs = Math.max(1, Math.min(3, Math.floor(rowRoom / stairSteps)));
+    const tread = 1 - Math.min(0.35, 0.75 * stairSteps / len);
+    const verts = [{ t: 0, col: startCol, row: rowStart }];
+    for (let i = 0; i < stairSteps; i++) {
+      verts.push({ t: (i + tread) / stairSteps, col: startCol + colDir * cs * (i + 1), row: rowStart + rowDir * rs * i });
+      verts.push({ t: (i + 1) / stairSteps,    col: startCol + colDir * cs * (i + 1), row: rowStart + rowDir * rs * (i + 1) });
+    }
+    posAt = poly(verts);
   }
-  return { posAt, stairSteps };
+  return { posAt, stairSteps, corners };
+}
+
+// Waypoint t-values for a VERTEX shape (buildRailPath's `corners`): a point ON every corner,
+// plus a sharpening point either side of it — half a beat away, or 30% of the way to the
+// neighbouring corner if that is closer. The game (and the 3D preview) draw a rail as a smooth
+// spline through its waypoints, which rounds every node; with only the corner itself the
+// spline's tangent there runs diagonal and a zigzag reads as a wave, a staircase as a ramp.
+// Sharpeners closer than one grid step to their corner are skipped. A straight stretch longer
+// than RAIL_NODE_MAX_BEATS (a staircase tread) gets evenly spaced fill points on the line —
+// invisible, but validate flags a > 2-beat node gap as a rail that may render wrong. Over
+// `cap`, fills go first, then post-corner sharpeners (latest first), the pre-corner ones,
+// and last the late corners.
+function railCornerTs(corners, len, snapSz, cap) {
+  const all = [0, ...corners, 1], minDt = snapSz / len - 1e-9, half = 0.5 / len;
+  let pts = [];
+  corners.forEach((tc, i) => {
+    const dL = Math.min(half, 0.3 * (tc - all[i])), dR = Math.min(half, 0.3 * (all[i + 2] - tc));
+    if (dL >= minDt) pts.push({ t: tc - dL, k: 'pre' });
+    pts.push({ t: tc, k: 'corner' });
+    if (dR >= minDt) pts.push({ t: tc + dR, k: 'post' });
+  });
+  const RAIL_NODE_MAX_BEATS = 2, edges = [0, ...pts.map(p => p.t), 1], fills = [];
+  for (let i = 1; i < edges.length; i++) {
+    const n = Math.ceil((edges[i] - edges[i - 1]) * len / RAIL_NODE_MAX_BEATS - 1e-9);
+    for (let j = 1; j < n; j++) fills.push({ t: edges[i - 1] + (edges[i] - edges[i - 1]) * j / n, k: 'fill' });
+  }
+  pts = [...pts, ...fills].sort((a, b) => a.t - b.t);
+  for (const k of ['fill', 'post', 'pre', 'corner'])
+    for (let i = pts.length - 1; i >= 0 && pts.length > cap; i--) if (pts[i].k === k) pts.splice(i, 1);
+  return pts;
 }
 
 // Waypoints for one shape: corners need a node ON each corner; cap 12 (render limit).
@@ -4387,21 +4446,35 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
 
   if (!plan || plan.length === 1) {
     const railShape = plan ? plan[0].shape : pickRailShape(len, _shapeRoll);
-    const { posAt, stairSteps } = buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng);
-    const numWP = railWaypointCount(railShape, len, stairSteps);
+    const { posAt, stairSteps, corners } = buildRailPath(railShape, len, startCol, rowStart, colMin, colMax, swayBoost, rng);
     const waypoints = [];
-    for (let i = 1; i <= numWP; i++) {
-      const t    = i / (numWP + 1);
-      const p    = posAt(t);
-      const beat = Math.round((startBeat + len * t) * _wpD) / _wpD;
-      const wp   = clampPt(p.col, p.row, beat);
-      waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
+    if (corners) {
+      // Vertex shape: waypoints on its corners (+ sharpeners), never two on one grid beat and
+      // never on the head or tail beat. A corner beats a sharpener for a contested beat.
+      let ts = railCornerTs(corners, len, snapSz, 12).map(p => ({ ...p,
+        beat: Math.round((startBeat + len * p.t) * _wpD) / _wpD }));
+      ts = ts.filter((p, i) => p.beat > startBeat && p.beat < endBeat
+        && !(p.k !== 'corner' && ts.some((q, j) => j !== i && q.k === 'corner' && q.beat === p.beat)));
+      for (const p of ts) {
+        if (waypoints.length && p.beat <= waypoints[waypoints.length - 1].beat) continue;
+        const q = posAt(p.t), wp = clampPt(q.col, q.row, p.beat);
+        waypoints.push({ beat: p.beat, row: wp.row, _x: COL_X[wp.col] });
+      }
+    } else {
+      const numWP = railWaypointCount(railShape, len, stairSteps);
+      for (let i = 1; i <= numWP; i++) {
+        const t    = i / (numWP + 1);
+        const p    = posAt(t);
+        const beat = Math.round((startBeat + len * t) * _wpD) / _wpD;
+        const wp   = clampPt(p.col, p.row, beat);
+        waypoints.push({ beat, row: wp.row, _x: COL_X[wp.col] });
+      }
     }
     const pEnd = posAt(1);
     const end  = clampPt(pEnd.col, pEnd.row, endBeat);
     return { waypoints, xEnd: COL_X[end.col], rowEnd: end.row,
              plan: [{ frac: 1, shape: railShape }],
-             segments: [{ shape: railShape, startCol, startRow: rowStart, endCol: end.col, endRow: end.row, count: numWP + 1 }] };
+             segments: [{ shape: railShape, startCol, startRow: rowStart, endCol: end.col, endRow: end.row, count: waypoints.length + 1 }] };
   }
 
   // Multi-segment: share the 12-waypoint render cap in proportion to segment length, >= 3 per
@@ -4416,7 +4489,7 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
   let segStart = startBeat, curCol = startCol, curRow = rowStart;
   for (let k = 0; k < nSeg; k++) {
     const segLen = len * plan[k].frac;
-    const { posAt: rawAt } = buildRailPath(plan[k].shape, segLen, curCol, curRow, colMin, colMax, swayBoost, Math.random());
+    const { posAt: rawAt, corners } = buildRailPath(plan[k].shape, segLen, curCol, curRow, colMin, colMax, swayBoost, Math.random());
     // Anchor to the seam. Some shapes do NOT pass through their own start: the ellipse/spiral
     // clamp their centre row into [1+r, 8-r], so a segment seeded near the floor begins its
     // loop up to ~6 rows away (seen at k=167 in tests: row 8 → row 2). A single rail hides that
@@ -4425,15 +4498,24 @@ function generateRailArc(startBeat, rowStart, endBeat, rowEnd, snapSz, xStart = 
     const p0 = rawAt(0), dC0 = curCol - p0.col, dR0 = curRow - p0.row;
     const posAt = t => { const p = rawAt(t); return { col: p.col + dC0 * (1 - t), row: p.row + dR0 * (1 - t) }; };
     let last = null;
-    for (let i = 1; i <= counts[k]; i++) {
-      const t    = i / counts[k];
+    const segEndBeat = k === nSeg - 1 ? endBeat : Math.round((segStart + segLen) * _wpD) / _wpD;
+    // Vertex shapes put their (counts[k] - 1) interior points on corners (railCornerTs); the
+    // rest sample evenly. Either way the segment's last point is its end (t = 1) and no point
+    // shares a grid beat with the one before it.
+    const segTs = corners
+      ? [...railCornerTs(corners, segLen, snapSz, counts[k] - 1).map(p => p.t), 1]
+      : Array.from({ length: counts[k] }, (_, i) => (i + 1) / counts[k]);
+    const prevBeat = () => waypoints.length ? waypoints[waypoints.length - 1].beat : startBeat;
+    let segCount = 0;
+    for (const t of segTs) {
       const p    = posAt(t);
-      const beat = k === nSeg - 1 && i === counts[k] ? endBeat
-                 : Math.round((segStart + segLen * t) * _wpD) / _wpD;
+      const beat = t === 1 ? segEndBeat : Math.round((segStart + segLen * t) * _wpD) / _wpD;
+      if (corners && t !== 1 && (beat <= prevBeat() || beat >= segEndBeat)) continue;
       last = clampPt(p.col, p.row, beat);
       waypoints.push({ beat, row: last.row, _x: COL_X[last.col] });
+      segCount++;
     }
-    segments.push({ shape: plan[k].shape, startCol: curCol, startRow: curRow, endCol: last.col, endRow: last.row, count: counts[k] });
+    segments.push({ shape: plan[k].shape, startCol: curCol, startRow: curRow, endCol: last.col, endRow: last.row, count: segCount });
     curCol = last.col; curRow = last.row;
     segStart += segLen;
   }
