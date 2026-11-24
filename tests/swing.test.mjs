@@ -215,7 +215,10 @@ function closure(src, roots) {
 // BASE to that commit and say so in its message (as tests/rail-shapes does with acd1853).
 // Re-pinned 999514c -> 9998da6 ([Orbit] circles): that commit moves notes onto circles on purpose
 // and is otherwise the triplet-snap code, so straight output must still match it exactly.
-const BASE = '9998da6';
+// Re-pinned 9998da6 -> 3d387b1 (stem density, 2026-11-23): Master uncapped, drum streams alternate
+// hands, rails no longer orphan their drum hits, the lower tiers taper by loudness. That commit is
+// the density work merged with the orbit circles, before the comfort-reach rule (aerobic mode here).
+const BASE = '3d387b1';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'clearGoldC2'];
 const NOW  = closure(appSource(), ROOTS);
 const HEAD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ROOTS);

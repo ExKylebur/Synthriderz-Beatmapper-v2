@@ -175,7 +175,9 @@ function closure(src, roots) {
 // If a later change MEANS to alter this song's output, re-pin BASE to that commit and say so.
 // Re-pinned 99ee4f3 -> ab9e2f1 ([Orbit] circles): main @ 99ee4f3 merged with the orbit work, so
 // still everything except the comfort-reach rule.
-const BASE = 'ab9e2f1';
+// Re-pinned ab9e2f1 -> 3d387b1 (stem density, 2026-11-23): ab9e2f1 merged with the density work,
+// so again everything except the comfort-reach rule.
+const BASE = '3d387b1';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);

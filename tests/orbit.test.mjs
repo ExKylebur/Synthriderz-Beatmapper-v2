@@ -198,7 +198,10 @@ const ANCHOR = '    if (_orb.phrases) console.log(';
 assert.ok(nowSrc.includes(ANCHOR));
 const NOW = closure(nowSrc.replace(ANCHOR, '    globalThis.__orbPlaced?.(result);\n' + ANCHOR), ROOTS);
 // OLD = the last commit with the 8-step spiral moves; its spiral notes get a _move tag in memory.
-const OLD_REV = '79cc1d9';
+// Re-pinned 79cc1d9 -> 4583f2a (stem density, 2026-11-23): still the 8-step spiral moves, now with
+// the density work's note input, so both sides choreograph the same notes (against 79cc1d9 the
+// alternating drum runs alone took the median notes per circle to 11, under 2x the old 6).
+const OLD_REV = '4583f2a';
 const oldSrc = execSync(`git show ${OLD_REV}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString()
   .replace('o._denseSweep = true;', 'o._denseSweep = true; o._move = mv.name;')
   .replace('o._sparseSweep = true;', 'o._sparseSweep = true; o._move = mv.name;');
