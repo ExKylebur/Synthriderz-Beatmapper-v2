@@ -42,11 +42,16 @@ import { loadAt, withSeed, RAIL_DEPS, colOf } from './harness.mjs';
 
 const RAIL_NEW = ['RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
   'fitShapeToLength', 'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS', 'assignSegmentShapes',
-  'planRailSegments', 'fitRailPlan', 'buildRailPath', 'railWaypointCount', 'generateRailArc'];
+  'planRailSegments', 'fitRailPlan', 'buildRailPath', 'railWaypointCount', 'railCornerTs', 'generateRailArc'];
 const OLD = loadAt('acd1853', [...RAIL_DEPS, 'generateRailArc']);
 const NEW = load([...RAIL_DEPS, ...RAIL_NEW]);
 
 // Same seed → identical rail. Lengths < 6 stay on the single-shape path forever (Task 4 keeps it).
+// Since the 2026-11-24 shape-fidelity rework the VERTEX shapes (hook, flick, zigzag, ramp,
+// switchback, staircase) and wave are drawn larger and sampled on their corners on purpose, so
+// only the untouched curves (ellipse, pendulum) are still pinned to acd1853; the reworked
+// shapes are covered by the fidelity tests below instead.
+const UNCHANGED = new Set(['ellipse', 'pendulum']);
 const goldenCase = (k, maxLen) => {
   const len = 1 + (k * 0.37) % (maxLen - 1);
   const hand = k % 2, cross = k % 3 === 0;
@@ -55,13 +60,17 @@ const goldenCase = (k, maxLen) => {
 };
 const strip = r => JSON.stringify({ w: r.waypoints, x: r.xEnd, r: r.rowEnd });
 
-test('golden: single-shape rails identical to acd1853 (len < 6)', () => {
+test('golden: single-shape ellipse/pendulum rails identical to acd1853 (len < 6)', () => {
+  let checked = 0;
   for (let k = 0; k < 400; k++) {
     const args = goldenCase(k, 5.99);
     const a = withSeed(k + 1, () => OLD.generateRailArc(...args));
     const b = withSeed(k + 1, () => NEW.generateRailArc(...args));
+    if (!UNCHANGED.has(b.plan[0].shape)) continue;
     assert.equal(strip(b), strip(a), `case ${k}`);
+    checked++;
   }
+  assert.ok(checked > 150, `only ${checked} unchanged-shape cases`);
 });
 
 test('railWaypointCount: corners get exact counts, cap 12', () => {
@@ -153,4 +162,101 @@ test('motifPlan replay: recorded shapes come back on a different length', () => 
   const rec = [{ frac: 0.6, shape: 'wave' }, { frac: 0.4, shape: 'pendulum' }];
   const r = withSeed(9, () => NEW.generateRailArc(0, 4, 9, 4, 0.25, NEW.COL_X[10], 0, false, 1, 120, null, null, rec));
   assert.deepEqual(r.plan.map(s => s.shape), ['wave', 'pendulum']);
+});
+
+// ── Shape fidelity (2026-11-24 play-test: "stairs were mostly straight", curves too shallow) ──
+// The game and the 3D preview draw a rail as a smooth spline through head, waypoints and tail.
+// These tests render it the same way (uniform Catmull-Rom, timed by beat) and check that what
+// the player sees keeps the shape's defining features.
+function railPts(r, head, row, col) {
+  return [{ b: head, c: col, r: row }, ...r.waypoints.map(w => ({ b: w.beat, c: colOf(w._x), r: w.row })),
+          { b: r.waypoints.length ? Infinity : head, c: colOf(r.xEnd), r: r.rowEnd }];
+}
+const forced = (shape, len, k, { snap = 0.25, head = 0 } = {}) => {
+  const hand = k % 2, col = hand === 0 ? 7 + (k % 8) : (k % 8), row = 1 + (k % 8);
+  const r = withSeed(k + 3, () => NEW.generateRailArc(head, row, head + len, row, snap, NEW.COL_X[col], hand, false, 1, 120, null, null, [{ frac: 1, shape }]));
+  const pts = railPts(r, head, row, col); pts[pts.length - 1].b = head + len;
+  return { r, pts, hand, col, row };
+};
+const span = (pts, k) => Math.max(...pts.map(p => p[k])) - Math.min(...pts.map(p => p[k]));
+
+test('fidelity: oscillating shapes swing >= 4 rows; wave, zigzag and ramp never draw the same path', () => {
+  for (let k = 0; k < 200; k++) {
+    for (const s of ['wave', 'zigzag', 'ramp', 'switchback']) {
+      const { pts } = forced(s, 4 + (k % 4), k);
+      assert.ok(span(pts, 'r') >= 4, `${s} k=${k}: row span ${span(pts, 'r')}`);
+    }
+    const key = s => JSON.stringify(forced(s, 4 + (k % 4), k).pts.map(p => [p.c, p.r]));
+    assert.ok(new Set(['wave', 'zigzag', 'ramp'].map(key)).size === 3, `k=${k}: two shapes coincide`);
+  }
+});
+
+test('fidelity: staircase is >= 2 discrete steps, each >= 2 cols and >= 2 rows, with flat treads', () => {
+  for (let k = 0; k < 300; k++) {
+    const { pts } = forced('staircase', 8 + (k % 7), k);
+    // collapse to the row levels the rail holds flat for >= 1 beat
+    const levels = [];
+    for (let i = 1; i < pts.length; i++)
+      if (pts[i].r === pts[i - 1].r && pts[i].b - pts[i - 1].b >= 0.5 - 1e-9) {
+        const lv = levels[levels.length - 1];
+        if (!lv || lv.r !== pts[i].r) levels.push({ r: pts[i].r, c0: pts[i - 1].c, c1: pts[i].c });
+        else lv.c1 = pts[i].c;
+      }
+    assert.ok(levels.length >= 2, `k=${k}: ${levels.length} flat treads`);
+    for (let i = 1; i < levels.length; i++)
+      assert.ok(Math.abs(levels[i].r - levels[i - 1].r) >= 2, `k=${k}: riser ${Math.abs(levels[i].r - levels[i - 1].r)} rows`);
+    // every tread but the landing carries the rail >= 2 cols sideways
+    for (const l of levels.slice(0, -1)) assert.ok(Math.abs(l.c1 - l.c0) >= 2, `k=${k}: tread ${Math.abs(l.c1 - l.c0)} cols`);
+    // monotone: rows never reverse direction (it is a staircase, not a zigzag)
+    const d = pts.slice(1).map((p, i) => Math.sign(p.r - pts[i].r)).filter(Boolean);
+    assert.ok(d.every(x => x === d[0]), `k=${k}: rows reverse`);
+  }
+});
+
+test('fidelity: every corner of a vertex shape gets a waypoint ON it (all grids)', () => {
+  const Z = NEW.handZoneCols;
+  for (const snap of [0.25, 1 / 3, 0.5])
+    for (let k = 0; k < 120; k++)
+      for (const [s, len] of [['zigzag', 5], ['switchback', 5], ['ramp', 6], ['hook', 2], ['flick', 2], ['staircase', 10]]) {
+        const { pts, hand, col, row } = forced(s, len, k, { snap });
+        const z = Z(hand, false);
+        const { posAt, corners } = NEW.buildRailPath(s, len, col, row, z.colMin, z.colMax, 1, 0.5);
+        assert.ok(corners && corners.length, s);
+        for (const tc of corners) {
+          const b = len * tc;
+          const near = pts.filter(p => Math.abs(p.b - b) <= snap / 2 + 1e-9);
+          if (!near.length) continue;                       // corner fell on a beat already taken
+          const q = posAt(tc), ic = Math.max(z.colMin, Math.min(z.colMax, q.col)), ir = Math.max(1, Math.min(8, q.row));
+          assert.ok(near.some(p => Math.abs(p.c - ic) <= 1 && Math.abs(p.r - ir) <= 1), `${s} k=${k} snap=${snap} corner t=${tc}`);
+        }
+        for (let i = 1; i < pts.length; i++) {
+          assert.ok(pts[i].b > pts[i - 1].b, `${s} k=${k}: beats not increasing`);
+          // validate.py RAIL_NODE_DIST: a node gap > 2 beats may render wrong (staircase treads)
+          assert.ok(pts[i].b - pts[i - 1].b <= 2 + snap, `${s} k=${k} snap=${snap}: node gap ${pts[i].b - pts[i - 1].b}`);
+        }
+      }
+});
+
+test('fidelity: corners survive the spline — rendered rail stays within 1 cell of the drawn polyline', () => {
+  const cr = (pts, b) => {
+    let i = 0; while (i < pts.length - 2 && b > pts[i + 1].b) i++;
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const u = Math.max(0, Math.min(1, (b - p1.b) / ((p2.b - p1.b) || 1)));
+    const f = key => 0.5 * (2 * p1[key] + (-p0[key] + p2[key]) * u + (2 * p0[key] - 5 * p1[key] + 4 * p2[key] - p3[key]) * u * u
+                             + (-p0[key] + 3 * p1[key] - 3 * p2[key] + p3[key]) * u * u * u);
+    return { c: f('c'), r: f('r') };
+  };
+  const lin = (pts, b) => {
+    let i = 0; while (i < pts.length - 2 && b > pts[i + 1].b) i++;
+    const a = pts[i], c = pts[i + 1], u = Math.max(0, Math.min(1, (b - a.b) / ((c.b - a.b) || 1)));
+    return { c: a.c + (c.c - a.c) * u, r: a.r + (c.r - a.r) * u };
+  };
+  for (let k = 0; k < 150; k++)
+    for (const [s, len] of [['zigzag', 5], ['switchback', 5], ['ramp', 6], ['staircase', 10]]) {
+      const { pts } = forced(s, len, k);
+      for (let j = 0; j <= 400; j++) {
+        const b = len * j / 400, p = cr(pts, b), q = lin(pts, b);
+        assert.ok(Math.hypot(p.c - q.c, p.r - q.r) <= 1.0, `${s} k=${k} beat ${b.toFixed(2)}`);
+      }
+    }
 });

@@ -175,7 +175,7 @@ test('planSnapLattice: off = the straight grid; auto follows detection; on = thi
 import { RAIL_DEPS } from './harness.mjs';
 const G = load([...RAIL_DEPS, 'RAIL_SHAPE_TIERS', 'railTierOf', 'pickRailShape', 'RAIL_SHAPE_DOWNGRADE',
   'fitShapeToLength', 'RAIL_SEG_MIN_BEATS', 'RAIL_MULTISEG_MIN_BEATS', 'assignSegmentShapes',
-  'planRailSegments', 'fitRailPlan', 'buildRailPath', 'railWaypointCount', 'generateRailArc']);
+  'planRailSegments', 'fitRailPlan', 'buildRailPath', 'railWaypointCount', 'railCornerTs', 'generateRailArc']);
 test('generateRailArc: on a thirds grid every waypoint is EXACTLY the third the notes use, none before its head', () => {
   // round(b / (1/3)) * (1/3) (the old rounding) left 800 of 2371 waypoints a few ulp off
   // round(b*3)/3, the value snapToGrid gives the notes on the same rail.
@@ -218,7 +218,9 @@ function closure(src, roots) {
 // Re-pinned 9998da6 -> 3d387b1 (stem density, 2026-11-23): Master uncapped, drum streams alternate
 // hands, rails no longer orphan their drum hits, the lower tiers taper by loudness. That commit is
 // the density work merged with the orbit circles, before the comfort-reach rule (aerobic mode here).
-const BASE = '3d387b1';
+// Re-pinned 3d387b1 -> 39de456 (rail shape fidelity, 2026-11-24): 3d387b1 plus the 1f535b0 rail
+// geometry (bigger swings, corner waypoints, real staircase steps), nothing else.
+const BASE = '39de456';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'clearGoldC2'];
 const NOW  = closure(appSource(), ROOTS);
 const HEAD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ROOTS);
