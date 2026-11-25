@@ -306,7 +306,7 @@ for (const [wall, name, say] of [
   const perHand = h => notes.filter(n => n.type === h).map(pt);
   add({ group: 'Obstacle moves (ObstacleChoreo)', name: `Obstacle: ${name}`, say, beats: len,
         notes: notes.map(({ beat, row, type, _x }) => ({ beat, row, type, _x })), walls: [wall],
-        info: { fn: 'applyObstacleChoreo', wall, stats: st, right: perHand(0), left: perHand(1),
+        info: { fn: 'applyObstacleChoreo', wall, choreo: st, right: perHand(0), left: perHand(1),
                 moved: notes.filter((n, i) => colOf(n._x) !== before[i][0] || n.row !== before[i][1]).length, of: notes.length } });
 }
 { // Crouch hold with a swoop rail on the right hand; the left hand's stream swoops as orbs.
