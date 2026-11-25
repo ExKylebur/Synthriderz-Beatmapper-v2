@@ -1830,8 +1830,12 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     const drop = new Set(misses(th0).map(a => a.n));
     const keep = c.notes.filter(n => !drop.has(n));
     if (Math.max(...[0, 1].map(h => keep.filter(n => n.type === h).length)) < ORBIT_MIN_NOTES) return;
+    const lastCell = [null, null];
     for (const n of keep) {
-      const p = at(n, th0);
+      let p = at(n, th0);
+      const lc = lastCell[n.type];
+      for (let q = 1; q <= 8 && lc && p._x === lc._x && p.row === lc.row; q++) p = at(n, th0 + dir * q * Math.PI / 32);
+      lastCell[n.type] = p;
       n._preSweep = n._preSweep || { x: n._x, row: n.row };   // [PatternCoverage] snapshot contract
       n._x = p._x;
       n.row = p.row;
@@ -7834,15 +7838,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // pass at iter 2+ — previously this only ran on subsequent iterations, which
   // is why the critic kept flagging 0% squat-underrail on every generation.
   if (!hints.noRails) {
-    const longSquats = autoWalls.filter(w =>
-      w.wallType === 'crouch' && (w.duration * 60 / bpm) >= 3
-    );
+    const longSquats = autoWalls.filter(w => w.wallType === 'crouch' && w.duration >= SWOOP_RAIL_MIN_BEATS);
     let added = 0;
     for (const sq of longSquats) {
-      // Half a beat inside the crouch; on a swung grid that half-beat is off the lattice, so
-      // the head (a hit) and tail land on the nearest third instead. Straight: unchanged.
-      const sqStart = swungAt(sq.beat) ? snapToGrid(sq.beat + 0.5) : sq.beat + 0.5;
-      const sqEnd   = swungAt(sq.beat) ? snapToGrid(sq.beat + sq.duration - 0.5) : sq.beat + sq.duration - 0.5;
+      const _sw   = buildSwoopRail(sq, 0, _lattice.sizeAt(sq.beat), { maxBeats: 4 * bpm / 60 });
+      const sqStart = _sw.beat, sqEnd = _sw.railEndBeat;
       if (sqEnd - sqStart < 1.5) continue;
       // Skip if a rail already covers most of this window
       const hasRail = result.some(n =>
@@ -7856,30 +7856,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         n.beat < sqEnd && n.railEndBeat > sqStart
       );
       const sqHand    = rightBusy ? 1 : 0;
-      const xStartCol = sqHand === 0 ? 10 : 4; // start in mid-zone, not extreme
-      const xStartVal = COL_X[xStartCol];
-      const rowSq    = 5 + Math.floor(Math.random() * 2); // rows 5-6 (under squat barrier)
-      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, _lattice.sizeAt(sqStart), xStartVal, sqHand, true, 1.0, bpm, null, autoWalls);
-      // Remove any same-hand orbs inside this window — they'd violate C1 once the rail exists
-      for (let j = result.length - 1; j >= 0; j--) {
-        const m = result[j];
-        if (m.railEndBeat !== undefined) continue;
-        if (m.type !== sqHand) continue;
-        if (m.beat > sqStart && m.beat < sqEnd) {
-          result.splice(j, 1);
-        }
-      }
-      result.push({
-        beat:        sqStart,
-        row:         rowSq,
-        type:        sqHand,
-        _x:          xStartVal,
-        railEndBeat: sqEnd,
-        railEndRow:  _sqArc.rowEnd,
-        railEnd_x:   _sqArc.xEnd,
-        railSegments: _sqArc.waypoints,
-        _underSquatRail: true,
-      });
+      result.push(buildSwoopRail(sq, sqHand, _lattice.sizeAt(sq.beat), { maxBeats: 4 * bpm / 60 }));
       beatOccupied.add(Math.round(sqStart * 100));
       added++;
     }
@@ -10835,6 +10812,26 @@ function fixC1(notes, { beatOccupied = null, clampFn = (r => Math.max(0, Math.mi
 // in binary: 50/3 − 47/3 = 1.0000000000000018, so a note exactly 1 beat after a gold slipped a
 // `<= 1.0` test, and the export's 6-dp times then read 0.999999999 in validate (HARD C2-GOLD,
 // Electric Love 2026-11-22). Quarter-grid differences are exact, so straight maps are unaffected.
+const SWOOP_RAIL_MIN_BEATS = 2;
+function buildSwoopRail(wall, hand, snapSz, { lead = 1, tail = 1, maxBeats = Infinity } = {}) {
+  const band = { minRow: 4, maxRow: 7 };
+  const top = Math.max(1, band.minRow), bot = Math.min(8, band.maxRow);
+  const D = Math.round(1 / snapSz);
+  const dur = wall.duration || 0, over = Math.max(0, dur + lead + tail - maxBeats) / 2;
+  const start = Math.round((wall.beat - lead + over) * D) / D;
+  const end   = Math.round((wall.beat + dur + tail - over) * D) / D;
+  const c0 = hand === 0 ? 10 : 4, inward = hand === 0 ? -1 : 1;
+  const n = Math.min(11, Math.max(3, Math.round((end - start) * 2) - 1));
+  const railSegments = [];
+  for (let i = 1; i <= n; i++) {
+    const t = i / (n + 1), beat = Math.round((start + (end - start) * t) * D) / D;
+    if (beat <= start || beat >= end || (railSegments.length && beat <= railSegments[railSegments.length - 1].beat)) continue;
+    const sn = Math.sin(Math.PI * t);
+    railSegments.push({ beat, row: Math.round(top + (bot - top) * sn), _x: COL_X[c0 + inward * Math.round(1.5 * sn)] });
+  }
+  return { beat: start, row: top, type: hand, _x: COL_X[c0], railEndBeat: end, railEndRow: top,
+           railEnd_x: COL_X[c0], railSegments, _underSquatRail: true, _swoop: true };
+}
 const C2_BEAT_EPS = 1e-6;
 function clearGoldC2(notes, beatOccupied = null) {
   let cleared = 0;
@@ -10855,12 +10852,26 @@ function clearGoldC2(notes, beatOccupied = null) {
       notes.splice(i, 1); cleared++; continue;
     }
     if (m.railEndBeat != null) {
-      if (goldOrbs.some(g => g.beat > m.beat - 1.0 && g.beat < m.railEndBeat + 1.0)) {
+      const near = goldOrbs.filter(g => g.type === 3 && g.beat > m.beat - 1.0 && g.beat < m.railEndBeat + 1.0);
+      if (near.length && m._underSquatRail) {
+        const h = 1 - m.type, z = handZoneCols(h);
+        for (const g of near) {
+          if (notes.some(o => o !== g && o.type === h && Math.abs(o.beat - g.beat) < C2_BEAT_EPS)) {
+            const j = notes.indexOf(g);
+            if (beatOccupied) beatOccupied.delete(Math.round(g.beat * 100));
+            notes.splice(j, 1); if (j < i) i--;
+          } else {
+            g.type = h;
+            g._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, Math.round(((g._x ?? 0) + 0.9555) / 0.1365)))];
+          }
+          cleared++;
+        }
+      } else if (near.length) {
         delete m.railEndBeat; delete m.railEndRow; delete m.railEnd_x; delete m.railSegments;
         cleared++;
       }
     } else {
-      if (goldOrbs.some(g => Math.abs(g.beat - m.beat) <= 1.0 + C2_BEAT_EPS)) {
+      if (goldOrbs.some(g => g.type === 3 && Math.abs(g.beat - m.beat) <= 1.0 + C2_BEAT_EPS)) {
         if (beatOccupied) beatOccupied.delete(Math.round(m.beat * 100));
         notes.splice(i, 1); cleared++;
       }
@@ -13150,48 +13161,24 @@ Rules:
       // Runs unconditionally — mirrors the BlackBlazon generation-time pass.
       {
         const snapSz = diff >= 8 ? 0.25 : diff >= 5 ? 0.5 : 1.0;
-        const longSquats = resultWalls.filter(w =>
-          w.wallType === 'crouch' && (w.duration * 60 / bpm) >= 4
-        );
+        const longSquats = resultWalls.filter(w => w.wallType === 'crouch' && w.duration >= SWOOP_RAIL_MIN_BEATS);
         for (const squat of longSquats) {
-          const sqStart = squat.beat + 0.5;
-          const sqEnd   = squat.beat + squat.duration - 0.5;
+          const _sw0 = buildSwoopRail(squat, 0, snapSz, { maxBeats: 4 * bpm / 60 });
+          const sqStart = _sw0.beat, sqEnd = _sw0.railEndBeat;
           if (sqEnd - sqStart < 1.5) continue;
-          // Skip if a rail already covers most of this window
           const hasRail = result.some(n =>
             n.railEndBeat !== undefined &&
             n.beat <= sqStart + 1 && n.railEndBeat >= sqEnd - 1
           );
           if (hasRail) continue;
-          // Prefer the hand not already busy with a rail in this window
           const rightBusy = result.some(n =>
             n.type === 0 && n.railEndBeat !== undefined &&
             n.beat < sqEnd && n.railEndBeat > sqStart
           );
           const sqHand    = rightBusy ? 1 : 0;
-          const rowSq    = 4 + Math.floor(Math.random() * 3);
-          const rowSqEnd = Math.max(0, Math.min(10, rowSq + (Math.random() < 0.5 ? -2 : 2)));
-          // Head starts at the zone extreme, which is precisely where an obstacle sits — and
-          // this is the one rail path that never reaches [RailObstacle] (that pass lives in
-          // onsetsToNotes; the splice route finishes through runFinalSweep instead). Clamp the
-          // head against the real walls here, and shape the arc around them too.
-          const _sqBand   = obstacleBandAt(resultWalls, sqStart, sqEnd, rowSq,
-                                           OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
-          const xStartCol = Math.max(_sqBand.minCol, Math.min(_sqBand.maxCol, sqHand === 0 ? 14 : 0));
-          const xStartVal = COL_X[xStartCol];
-          const _sqArc2 = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSz, xStartVal, sqHand, true, 1.0, bpm, null, resultWalls);
-          result.push({
-            beat:        sqStart,
-            row:         rowSq,
-            type:        sqHand,
-            _x:          xStartVal,
-            railEndBeat: sqEnd,
-            railEndRow:  _sqArc2.rowEnd,
-            railEnd_x:   _sqArc2.xEnd,
-            railSegments: _sqArc2.waypoints,
-          });
+          result.push(buildSwoopRail(squat, sqHand, snapSz, { maxBeats: 4 * bpm / 60 }));
           result.sort((a, b) => a.beat - b.beat);
-          console.log('[Mutate] Added underrail arc for long squat obstacle');
+          console.log('[Mutate] Added swoop rail under a crouch hold');
         }
       }
 
