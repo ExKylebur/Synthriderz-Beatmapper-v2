@@ -212,7 +212,13 @@ function closure(src, roots) {
 // again everything except the comfort-reach rule.
 // Re-pinned c0777cb -> e421a8e (rail shape fidelity, 2026-11-24): c0777cb plus the 1f535b0 rail
 // geometry, nothing else.
-const BASE = 'e421a8e';
+// Re-pinned -> b6f1f66 (obstacle choreography, 2026-11-24), shared by tests/swing and tests/obstacles:
+// c0777cb (everything before the comfort-reach rule) + the rail-shape fidelity + the parts of d75efb1 that
+// act in aerobic mode (swoop rails, the orbit same-cell nudge, the gold-C2 swoop priority) + e7f5dfa
+// (dedup-removed rails release companions). e7f5dfa was a no-op for these songs until swoop rails
+// existed; without it the random band picks in a lean window diverged. [ObstacleChoreo] and
+// fitRailToReach are no-ops for aerobic walls, so they are not in the base.
+const BASE = 'b6f1f66';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);
