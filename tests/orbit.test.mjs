@@ -10,7 +10,7 @@ const O = load(['COL_X', 'OBSTACLE_BUFFER_BEATS', 'OBSTACLE_LEAD_BEATS', 'CROSS_
   'OBS_AEROBIC_REACH', 'OBS_REACH', 'obstacleSide', 'obstacleReachBand',
   'isPattern', 'smoothPatternBoundaries', 'ORBIT_VARIANTS', 'ORBIT_GEOM', 'ORBIT_PERIODS', 'ORBIT_NPR',
   'ORBIT_NPR_MIN', 'ORBIT_NPR_MAX', 'ORBIT_TURN_SEC_MIN', 'ORBIT_TURN_SEC_MAX', 'ORBIT_MIN_TURNS',
-  'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE',
+  'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE', 'ORBIT_PREF_EXTRA',
   'railPosAt', '_htCol', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast', 'buildRailsByHand', 'c3Pos', 'c3Movable', 'c3Jump',
   'orbitPoint', 'orbitPeriods', 'applyOrbitPhrases']);
 

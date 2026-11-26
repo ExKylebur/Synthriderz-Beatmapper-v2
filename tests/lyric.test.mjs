@@ -158,9 +158,10 @@ const O = load(['COL_X', 'OBSTACLE_BUFFER_BEATS', 'OBSTACLE_LEAD_BEATS', 'CROSS_
   'OBS_AEROBIC_REACH', 'OBS_REACH', 'obstacleSide', 'obstacleReachBand',
   'isPattern', 'smoothPatternBoundaries', 'ORBIT_VARIANTS', 'ORBIT_GEOM', 'ORBIT_PERIODS', 'ORBIT_NPR',
   'ORBIT_NPR_MIN', 'ORBIT_NPR_MAX', 'ORBIT_TURN_SEC_MIN', 'ORBIT_TURN_SEC_MAX', 'ORBIT_MIN_TURNS',
-  'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE',
+  'ORBIT_MAX_TURNS', 'ORBIT_MIN_NOTES', 'ORBIT_JOIN_GAP', 'ORBIT_SPACING', 'ORBIT_MAX_SHARE', 'ORBIT_PREF_EXTRA',
   'railPosAt', '_htCol', 'handTrajectory', 'C3_MIN_GAP_SEC', 'c3TooFast', 'buildRailsByHand', 'c3Pos', 'c3Movable', 'c3Jump',
-  'orbitPoint', 'orbitPeriods', 'applyOrbitPhrases']);
+  'orbitPoint', 'orbitPeriods', 'applyOrbitPhrases', 'SPIN_FILL_MIN_SEC', 'SPIN_FILL_MIN_BEATS', 'SPIN_FILL_MAX_NPS',
+  'fillSpinWindows', 'restoreSpinFill']);
 
 // Two phrases: a long one at beats 0-15.5 and a shorter one at 40-47.5. With a budget that fits
 // only one, the fuller phrase wins — unless the singer is circling over the shorter one.
@@ -186,4 +187,41 @@ test('orbit: no circle covers an avoided (sung rise) span', () => {
   const notes = stream();
   O.applyOrbitPhrases(notes, { bps: 2, maxShare: 1, avoid: [[4, 8]] });
   assert.ok(notes.filter(n => n._orbit).every(n => n.beat < 4 || n.beat > 8));
+});
+
+// ── [SpinFill] ───────────────────────────────────────────────────────────────────────────
+test('spin fill: a sparse sung line gets a steady stream, the circle takes it, a lone gold becomes a pair', () => {
+  // 3 notes + a lone gold in a 6-beat sung window at 1.7 bps (half-beat step = 0.29 s >= 0.25 s)
+  const notes = [{ beat: 100, type: 0, row: 5, _x: O.COL_X[10] }, { beat: 101.5, type: 1, row: 5, _x: O.COL_X[4] },
+                 { beat: 103, type: 0, row: 5, _x: O.COL_X[10] }, { beat: 104, type: 3, row: 5, _x: 0 }];
+  const fill = O.fillSpinWindows(notes, [{ beat: 100, endBeat: 106, action: 'spin' }], { bps: 1.7 });
+  assert.equal(fill.demoted.length, 1);
+  assert.ok(!notes.some(n => n.type === 3));
+  for (const h of [0, 1]) {
+    const hb = notes.filter(n => n.type === h).map(n => n.beat).sort((a, b) => a - b);
+    for (let i = 1; i < hb.length; i++) assert.ok(hb[i] - hb[i - 1] <= 0.5 + 1e-9, `hand ${h} gap at ${hb[i]}`);
+  }
+  const orb = O.applyOrbitPhrases(notes, { bps: 1.7, maxShare: 1, prefer: [[100, 106]] });
+  assert.equal(orb.preferred, 1);
+  const r = O.restoreSpinFill(notes, fill);
+  assert.ok(r.kept > 10);
+  assert.ok(notes.every(n => !n._spinFill || n._orbit), 'no stray fill notes');
+  assert.equal(r.demoted + r.restored, 1);
+});
+
+test('spin fill: nothing is left behind when no circle forms; the gold comes back', () => {
+  const notes = [{ beat: 100, type: 0, row: 5, _x: O.COL_X[10] }, { beat: 104, type: 3, row: 4, _x: 0 }];
+  const before = JSON.stringify(notes);
+  const fill = O.fillSpinWindows(notes, [{ beat: 100, endBeat: 106, action: 'spin' }], { bps: 1.7 });
+  assert.ok(fill.added.length > 0);
+  O.restoreSpinFill(notes, fill);                                // [Orbit] never ran: nothing on a circle
+  assert.equal(JSON.stringify(notes.sort((a, b) => a.beat - b.beat)), before);
+  // a rail or a side wall in the window: no fill at all
+  const railed = [{ beat: 99.5, type: 0, row: 5, railEndBeat: 102 }];
+  assert.equal(O.fillSpinWindows(railed, [{ beat: 100, endBeat: 106, action: 'spin' }], { bps: 1.7 }).added.length, 0);
+  assert.equal(O.fillSpinWindows([], [{ beat: 100, endBeat: 106, action: 'spin' }],
+    { bps: 1.7, walls: [{ beat: 102, duration: 1, wallType: 'leanLeft' }] }).added.length, 0);
+  // fast songs step a whole beat (half a beat would be < 0.25 s apart)
+  const fast = O.fillSpinWindows([], [{ beat: 0, endBeat: 6, action: 'spin' }], { bps: 2.9 });
+  assert.deepEqual([...new Set(fast.added.map(n => n.beat))], [0, 1, 2, 3, 4, 5, 6]);
 });

@@ -915,6 +915,11 @@
             <span>Aerobic reach (deep crouches &amp; leans)</span>
           </label>
           <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;"
+            title="Experimental (off by default). On a sung 'circle / spin / loop' line that has too few notes for a circle, add in-between notes on a steady half-beat grid so both hands can draw one. Fill notes the circle does not use are removed again.">
+            <input type="checkbox" id="settSpinFill" style="accent-color:var(--accent);" />
+            <span>Spin fill: extra notes so sung circles form (experimental)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;"
             title="Disables gold (both-hand simultaneous) notes.">
             <input type="checkbox" id="settNoGold" style="accent-color:var(--accent);" />
             <span>No gold (both-hand) notes</span>
@@ -1678,6 +1683,7 @@ const ORBIT_JOIN_GAP = 3;            // beats between consecutive orbs (any hand
                                      // the per-hand quarter-turn rule does the real cutting
 const ORBIT_SPACING = 8;             // min beats between two phrases
 const ORBIT_MAX_SHARE = 0.15;        // orbit notes as a share of all notes
+const ORBIT_PREF_EXTRA = 0.10;       // extra share for circles on sung spin lines (prefer spans)
 // The point (unrounded col, row) a hand sits at, angle theta, on a circle centred on row cy
 // with vertical radius rr. theta grows counter-clockwise as the player sees it (col 14 is the
 // player's right, row 0 the top).
@@ -1695,6 +1701,75 @@ function orbitPeriods(gap, bps) {
     const npr = P / gap, sec = P / bps;
     return npr >= ORBIT_NPR_MIN && npr <= ORBIT_NPR_MAX && sec >= ORBIT_TURN_SEC_MIN && sec <= ORBIT_TURN_SEC_MAX;
   }).sort((a, b) => Math.abs(a / gap - ORBIT_NPR) - Math.abs(b / gap - ORBIT_NPR) || a - b);
+}
+// ── [SpinFill] flair notes so a sparse sung "circle" line can still draw one (2026-11-26) ──
+// A circle needs a steady stream on both hands (>= ORBIT_MIN_NOTES on the busier hand, a gap
+// under a quarter turn); a quiet sung line often has 3-5 notes, so no circle formed (Circle With
+// Me 82 s / 173 s). Not every beat needs a note: in a sung spin window each hand gets a note on
+// every step of a steady grid (half a beat while that is >= SPIN_FILL_MIN_SEC apart, else a
+// beat) wherever it has none within half a step. [Orbit] then sees a full phrase there, and the
+// caller REMOVES every fill note the circle did not take, so a failed circle leaves no stray notes.
+// Skipped where a circle could not hold anyway: a rail within ±1 beat or a lean/slide window.
+// A LONE gold inside the window (not a [GoldSweep] run, not a gold rail) becomes a red + blue
+// pair on its beat: both hands still hit together, now on the circle. Single golds were what
+// kept the two remaining "Circle with me" lines from ever circling (each needs ±1 beat clear).
+// The caller restores the gold if the circle does not take that pair (restoreSpinFill).
+// Green, gold runs and rail companions keep their ±1-beat clearance: only the longest stretch
+// clear of them is filled, and only if it still gives a turn (SPIN_FILL_MIN_BEATS).
+// Flair, not a wall of notes: a fill note keeps 3/4 of a step from that hand's own notes and is
+// skipped where the surrounding second already holds SPIN_FILL_MAX_NPS notes (the first live
+// fill pushed the bridge to 12 NPS, above the song's own 11 peak and Master's soft 10).
+const SPIN_FILL_MIN_SEC = 0.25;
+const SPIN_FILL_MIN_BEATS = 4;
+const SPIN_FILL_MAX_NPS = 8;
+function fillSpinWindows(result, spins, { bps = 2, walls = [], snap = b => b, step = null } = {}) {
+  const g = step ?? (0.5 / bps >= SPIN_FILL_MIN_SEC ? 0.5 : 1);
+  const added = [], demoted = [];
+  for (const c of spins || []) {
+    const b0 = c.beat, b1 = Math.max(c.endBeat ?? c.beat, c.beat + SPIN_FILL_MIN_BEATS);
+    if (result.some(n => n.railEndBeat !== undefined && n.beat <= b1 + 1 && n.railEndBeat >= b0 - 1)) continue;
+    if ((walls || []).some(w => w.wallType !== 'crouch'
+      && w.beat - OBSTACLE_LEAD_BEATS < b1 && w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS > b0)) continue;
+    for (const gold of result.filter(n => n.type === 3 && n.railEndBeat === undefined && !n._goldSweep
+                                          && n.beat >= b0 - 1e-9 && n.beat <= b1 + 1e-9)) {
+      result.splice(result.indexOf(gold), 1);
+      const pair = [0, 1].map(h => ({ beat: gold.beat, row: gold.row ?? 5, type: h, _x: COL_X[h === 0 ? 10 : 4],
+                                       stemSource: gold.stemSource ?? null, _spinFill: true, _fromGold: true }));
+      result.push(...pair); added.push(...pair); demoted.push({ gold, pair });
+    }
+    const anchors = result.filter(n => (n.type === 2 || n.type === 3 || n._comp) && n.beat >= b0 - 1 && n.beat <= b1 + 1)
+      .map(n => n.beat).sort((x, y) => x - y);
+    const cuts = [b0 - 1, ...anchors, b1 + 1];
+    let s = 0, e = -1;
+    for (let k = 1; k < cuts.length; k++) {
+      const ps = Math.max(b0, cuts[k - 1] + 1), pe = Math.min(b1, cuts[k] - 1);
+      if (pe - ps > e - s) { s = ps; e = pe; }
+    }
+    if (e - s < SPIN_FILL_MIN_BEATS - g - 1e-9) continue;
+    for (let b = Math.ceil(s / g - 1e-9) * g; b <= e + 1e-9; b += g) {
+      const bb = snap(b);
+      for (const h of [0, 1]) {
+        if (result.some(n => n.type === h && Math.abs(n.beat - bb) < 0.75 * g - 1e-9)) continue;
+        if (result.filter(n => Math.abs(n.beat - bb) <= 0.5 * bps).length >= SPIN_FILL_MAX_NPS) continue;
+        const n = { beat: bb, row: 5, type: h, _x: COL_X[h === 0 ? 10 : 4], stemSource: null, _spinFill: true };
+        result.push(n); added.push(n);
+      }
+    }
+  }
+  return { added, demoted };
+}
+// After [Orbit]: drop every fill note the circles did not take, and put back each gold whose
+// pair is not on a circle. Returns the counts for the log.
+function restoreSpinFill(result, fill) {
+  let restored = 0;
+  for (const { gold, pair } of fill.demoted) {
+    if (pair.every(n => n._orbit)) continue;
+    for (const n of pair) { const i = result.indexOf(n); if (i >= 0) result.splice(i, 1); }
+    result.push(gold); restored++;
+  }
+  let removed = 0;
+  for (let i = result.length - 1; i >= 0; i--) if (result[i]._spinFill && !result[i]._orbit) { result.splice(i, 1); removed++; }
+  return { kept: fill.added.filter(n => n._orbit).length, removed, demoted: fill.demoted.length - restored, restored };
 }
 function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, sectionAt = () => null,
                                      pickVariant = (_sec, k) => ORBIT_VARIANTS[k % ORBIT_VARIANTS.length],
@@ -1777,13 +1852,19 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
   // 2. Choose: fullest phrases first (turns capped at 2, times notes), >= ORBIT_SPACING beats
   //    apart, within the note budget.
   const budget = Math.floor(maxShare * result.length);
+  // Circles on sung spin lines get ORBIT_PREF_EXTRA on top, so they don't starve each other (or
+  // the other circles) of the budget once [SpinFill] makes them fuller.
+  const prefBudget = Math.floor((maxShare + ORBIT_PREF_EXTRA) * result.length);
   const chosen = [];
   let used = 0;
   for (const c of cands) c._pref = (prefer || []).some(([s, e]) => c.t0 <= e + 1e-9 && c.t1 >= s - 1e-9);
   for (const c of cands.sort((a, b) => (b._pref - a._pref)
                               || Math.min(2, b.turns) * b.notes.length - Math.min(2, a.turns) * a.notes.length)) {
-    if (used + c.notes.length > budget) continue;
-    if (chosen.some(o => c.t0 < o.t1 + ORBIT_SPACING && o.t0 < c.t1 + ORBIT_SPACING)) continue;
+    if (used + c.notes.length > (c._pref ? prefBudget : budget)) continue;
+    // Two circles on sung spin lines may run back to back ("Circle with me" sung twice): they need
+    // only not to overlap. Every other pair keeps ORBIT_SPACING.
+    if (chosen.some(o => { const gap = c._pref && o._pref ? 0.5 : ORBIT_SPACING;
+                           return c.t0 < o.t1 + gap && o.t0 < c.t1 + gap; })) continue;
     chosen.push(c); used += c.notes.length;
   }
   chosen.sort((a, b) => a.t0 - b.t0);
@@ -8672,6 +8753,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // Runs BEFORE DenseSweep/SparseSweep (both skip _orbit notes) so a circle owns its whole
   // window, and after GoldSweep and wall generation, whose golds and walls it steers around.
   {
+    // [SpinFill] (hints.spinFill, Hard+): flair notes in sparse sung spin windows — see fillSpinWindows.
+    const _fill = hints.spinFill && diff >= 6
+      ? fillSpinWindows(result, lyricCues.filter(c => c.action === 'spin'),
+                        { bps, walls: autoWalls, snap: b => _lattice.snap(b), step: diff >= 8 ? null : 1 })
+      : null;
     const _orb = applyOrbitPhrases(result, {
       walls: autoWalls, rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), bps, sectionAt,
       prefer: lyricCues.filter(c => c.action === 'spin').map(c => [c.beat, c.endBeat]),   // [LyricMotion]
@@ -8684,6 +8770,11 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     });
     if (_orb.phrases) console.log(`[Orbit] ${_orb.phrases} circular phrase(s), ${_orb.tagged} orbs, ${_orb.turns} turn(s) in all; boundary-smoothed ${_orb.smoothed}${_orb.preferred ? `; ${_orb.preferred} on a sung "spin" line` : ''}`);
     _lyrStat.orbit = _orb.preferred || 0;
+    if (_fill?.added.length) {
+      const _sf = restoreSpinFill(result, _fill);
+      for (const n of result) if (n._spinFill) beatOccupied.add(Math.round(n.beat * 100));
+      console.log(`[SpinFill] ${_fill.added.length} fill note(s) offered in sung spin windows; ${_sf.kept} kept on circles, ${_sf.removed} removed; ${_sf.demoted} lone gold(s) now a two-hand pair on a circle, ${_sf.restored} restored`);
+    }
   }
 
   // ── [DenseSweep] flowing groups for dense runs (v2) ───────────────────────────────────
@@ -13978,6 +14069,7 @@ Rules:
         noRails:        document.getElementById('settNoRails')?.checked        || false,
         noObstacles:    document.getElementById('settNoObstacles')?.checked    || false,
         aerobicReach:   document.getElementById('settAerobicReach')?.checked   || OBS_AEROBIC_REACH,
+        spinFill:       document.getElementById('settSpinFill')?.checked       || false,   // [SpinFill]
         noGold:         document.getElementById('settNoGold')?.checked         || false,
         noGreen:        document.getElementById('settNoGreen')?.checked        || false,
         noSingleArm:    document.getElementById('settNoSingleArm')?.checked    || false,
