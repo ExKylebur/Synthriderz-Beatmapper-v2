@@ -8,7 +8,7 @@ const L = load(['LYRIC_CUE_VERSION', 'LYRIC_WALL_ACTIONS', 'LYRIC_MOTION_ACTIONS
   'LYRIC_WORD_EST_SEC', 'LYRIC_LINE_SLOP_SEC', 'LYRIC_SNAP_SEC', 'LYRIC_MOTION_DEFAULT_BEATS',
   'LYRIC_RAIL_SHAPE', 'LYRIC_GOLD_SHAPE', 'LYRIC_ACTION_RULES', 'isLyricWallCue', 'isLyricMotionCue',
   'libraryLyricCues', 'lyricSyllables', 'lyricCuesFromLines', 'spaceLyricCues', 'alignLyricCues',
-  'lyricMotionAt']);
+  'lyricMotionAt', 'LYRIC_REPORT_MAX', 'lyricCueReport']);
 
 const actionOf = text => L.lyricCuesFromLines([{ t: 10, text }, { t: 14, text: 'x' }], 2, 1000).map(c => c.action);
 
@@ -85,6 +85,38 @@ test('library caches from the old vocabulary are re-fetched', () => {
   assert.equal(L.libraryLyricCues({ lyricCues: null }), null);
   const cur = [{ beat: 1, action: 'spin', endBeat: 9 }];
   assert.equal(L.libraryLyricCues({ lyricCues: cur, lyricCuesVer: L.LYRIC_CUE_VERSION }), cur);
+});
+
+test('critic report: honored flags come from the full map', () => {
+  const bps = 2;
+  const cues = [
+    { beat: 20, action: 'crouch', lyric: 'Cut down the altar' },
+    { beat: 60, action: 'leanLeft', lyric: 'to the left' },
+    { beat: 80, action: 'elevate', lyric: 'I climb the altar and I claim my place' },
+    { beat: 100, endBeat: 110, action: 'spin', lyric: 'Circle with me' },
+    { beat: 130, endBeat: 136, action: 'wave', lyric: 'sway' },
+  ];
+  const walls = [{ beat: 20.5, wallType: 'crouch', duration: 2 }, { beat: 64, wallType: 'leanLeft', duration: 1 }];
+  const notes = [
+    { beat: 79, type: 0, row: 5, railEndBeat: 84, railEndRow: 2 },               // high rail → elevate honored
+    { beat: 102, type: 0, row: 5, _orbit: 'parallel', _lyricMotion: 'spin', _lyricBy: 'orbit' },
+    { beat: 97, type: 1, row: 4, railEndBeat: 101, _lyricMotion: 'spin', _lyricBy: 'rail' },   // overlaps the window
+    { beat: 131, type: 1, row: 4, _lyricMotion: 'spin', _lyricBy: 'orbit' },      // wrong action for the wave cue
+  ];
+  const r = L.lyricCueReport(cues, notes, walls, bps);
+  assert.equal(r.total, 5);
+  assert.equal(r.honored, 3);
+  assert.deepEqual(r.missed_sec, [30, 65]);                     // lean wall 2 s late; wave never drawn
+  const spin = r.cues.find(c => c.action === 'spin');
+  assert.equal(spin.kind, 'motion');
+  assert.equal(spin.endSec, 55);
+  assert.equal(spin.by, 'orbit+rail');
+  assert.equal(r.cues.find(c => c.action === 'elevate').lyric, 'I climb the altar and…');
+  assert.equal(L.lyricCueReport([], notes, walls, bps).total, 0);
+  // the cue's own injected wall, slot-shifted 2 beats, counts; an auto wall that far does not
+  const shifted = [{ beat: 40, action: 'crouch', lyric: 'get down' }];
+  assert.equal(L.lyricCueReport(shifted, [], [{ beat: 42, wallType: 'crouch', fromLyric: 'get down' }], bps).honored, 1);
+  assert.equal(L.lyricCueReport(shifted, [], [{ beat: 42, wallType: 'crouch' }], bps).honored, 0);
 });
 
 // ── [Orbit] prefers a sung spin window ─────────────────────────────────────────────────────

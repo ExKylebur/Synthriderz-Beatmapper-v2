@@ -15,6 +15,7 @@ These are correct by design. Never penalize them:
 - **Green = sweeps only:** greens come in dedicated runs of 6–10 with ±1-beat clearance; never scattered singles. Don't suggest scattering greens.
 - **Energy-driven obstacles:** durations vary 2–6 beats with the energy curve; long holds (crouch ≤12 beats, lean ≤6) are intentional. Merged consecutive same-type walls = correct.
 - **Elevate lyric cues:** rails biased to high rows (1–3) near "up/rise/climb" words — correct.
+- **Lyric motion windows:** a sung spin/wave/zigzag line (see `lyric_cues`) gets circles or shaped rails and NO lean/slide walls — fewer obstacles there is intentional, not under-mapping.
 - **Downbeat/chorus emphasis:** ~25% of bar-1 downbeats reinforced with a parallel companion; each chorus adds one more gold than the last — intentional escalation.
 - **Pre-chorus drop:** ~40% of notes removed in the 4 beats before a chorus/drop — intentional "calm before storm".
 - **Overmap thinning:** sustained runs of 6+ same-stem orbs at ≤0.5-beat spacing are thinned (every other removed) — represents one sustained tone, not under-mapping.
@@ -145,18 +146,31 @@ Scoring: drum window rails >10% = −2; guitar window rails <5% = −2, 5–10% 
 
 ## LYRIC CUES (bonus only — never penalize if absent)
 
-When `lyric_cues` present, check the mapper honored them:
+`lyric_cues` (when present) is computed by the mapper against the FULL map: `{ total, honored, missed_sec, cues: [{ sec, endSec?, action, kind, lyric, honored, by? }] }`. **Trust the `honored` flags — do not re-derive them from `note_sample`.** Copy `total` → `lyric_cues_total`, `honored` → `lyric_cues_honored`, `missed_sec` → `lyric_cues_missed`.
 
-| Trigger | Response |
+**Body cues** (`kind: "body"`) → obstacles / lift:
+
+| action | Expected response |
 |---|---|
-| down/drop/fall/low/below | low full-width wall (squat) |
-| duck/dodge/hide/under | high ceiling wall (crouch) |
-| slide/glide/through/across | central mid wall (side-lean) |
-| lean/sway/tilt/bend | diagonal wall |
-| left / right | wall on named side |
-| up/rise/climb/ascend/lift/soar | elevated rail (rows 1–3) |
+| crouch (down/drop/fall/under) | crouch wall at the cue (±0.5 s) |
+| leanLeft / leanRight | wall on the named side |
+| slide (slide/glide/rush) | slide wall |
+| elevate (rise/climb/soar/escalate) | rail reaching rows 1–3 within ±2 beats |
 
-+2 genre-fit per honored cue (obstacle within ±0.5 s), cap +10; +2 per elevate cue with high rail within ±2 beats, cap +5. Cue with no match → issue "missed lyric cue at Xs".
+**Motion cues** (`kind: "motion"`, window `sec`–`endSec`) shape ARM MOTION while the line is sung — they never call for a wall:
+
+| action | Expected response in the window (`by`) |
+|---|---|
+| spin (circle/spin/spiral/loop) | circular two-hand phrase (`orbit`), spiral/ellipse rail (`rail`), or gold circle (`gold`) |
+| wave (wave/sway/swing/tide) | wave / pendulum rail or gold wave |
+| zigzag (lightning/shake) | zigzag rail or gold diagonal |
+| figure8 (infinity) | figure-8 rail or gold pendulum |
+| stairs (stairs/ladder) | staircase rail |
+
+Rules:
+- Bonus: +2 genre-fit per honored body cue (cap +10); +2 per honored motion cue (cap +6). A map with no `lyric_cues` scores exactly as before.
+- A sung **spin** window with no lean/slide wall is INTENTIONAL (side walls block circles) — never flag missing obstacles there, and never suggest adding walls for a motion cue.
+- An unhonored cue → one non-critical issue "missed lyric cue at Xs (action)" (list at most 3). Never CRITICAL, never a reason to fail the map or to suggest a full regen.
 
 ---
 

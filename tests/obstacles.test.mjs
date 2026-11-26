@@ -314,7 +314,10 @@ for (const [i, s] of SONGS.entries()) {
   test(`onsetsToNotes song ${i}: aerobic reach reproduces the pre-rule placement exactly (${BASE})`, () => {
     const a = run(NOW, s, 5, { aerobicReach: true }), b = run(OLD, s, 5);
     assert.ok(a.walls.length > 0 && a.walls.every(w => w.aerobic === true));
-    assert.deepEqual({ ...a, walls: a.walls.map(({ aerobic, ...w }) => w) }, b);
+    // lyricCues (the aligned cues returned for the critic's lyric report) postdates BASE.
+    const { lyricCues, ...rest } = a;
+    assert.equal(lyricCues?.length, 12);
+    assert.deepEqual({ ...rest, walls: rest.walls.map(({ aerobic, ...w }) => w) }, b);
   });
 }
 

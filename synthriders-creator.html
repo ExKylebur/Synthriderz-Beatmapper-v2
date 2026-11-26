@@ -1862,6 +1862,7 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
       n._x = p._x;
       n.row = p.row;
       n._orbit = variant;
+      if (c._pref) { n._lyricMotion = 'spin'; n._lyricBy = 'orbit'; }   // sung circle — the critic's lyric report reads this
       tagged++;
     }
     turns += c.turns;
@@ -1977,6 +1978,7 @@ let lastGenScore  = null; // score from most recent generation — read by expor
 // Lyric cue data — set by fetchLyricCues(), consumed by onsetsToNotes wall placement.
 // Each entry: { beat: number, action: 'crouch'|'leanLeft'|'leanRight'|'slide', lyric: string }
 let lastLyricCues     = null;
+let lastAlignedLyricCues = null; // lastLyricCues as the generator used them (map beats, onset-aligned, motion endBeat); read by critiqueMap
 let lastLyricSections = null; // [{name, startBeat}] anchors from lyric structure fetch; null = not yet fetched
 let stemBeatData    = null;  // per-beat stem energy built from Demucs analysis; null = no data
 let _previewSections = []; // sections from last generation — drawn as color bands on play bar
@@ -2657,6 +2659,7 @@ function newSong(skipConfirm = false) {
   document.getElementById('genreSource').textContent = '';
   // Reset lyric cues
   lastLyricCues     = null;
+  lastAlignedLyricCues = null;
   lastLyricSections = null;
   document.getElementById('lyricStatus').textContent = '';
   document.getElementById('lyricBtn').textContent = '🎤 Fetch Lyrics & Sync Obstacles';
@@ -2955,6 +2958,48 @@ function lyricMotionAt(cues, b0, b1 = b0) {
     if (ov >= -0.5 && ov > bestOv) { best = c; bestOv = ov; }
   }
   return best ? best.action : null;
+}
+// The critic's `lyric_cues` block: did the map do what each sung cue asked? Checked here
+// against the full map, because the critic model only sees a note sample.
+//   body cue  — a wall of the same type within ±0.5 s (its own injected wall: ±3 beats);
+//   elevate   — a rail starting within ±2 beats that reaches rows 0-3;
+//   motion    — a note the generator tagged _lyricMotion = that action (orbit / rail / gold)
+//               overlapping the cue's window (±1 beat).
+// Seconds are on the map clock, like every other critic field.
+const LYRIC_REPORT_MAX = 24;
+function lyricCueReport(cues, notes, walls, bps) {
+  const all = (cues || []).map(c => {
+    let by = null;
+    if (isLyricWallCue(c)) {
+      // A wall the cue injected may sit up to 3 beats off (the injector's slot search).
+      if ((walls || []).some(w => w.wallType === c.action
+        && (Math.abs(w.beat - c.beat) <= 0.5 * bps || (w.fromLyric && Math.abs(w.beat - c.beat) <= 3)))) by = 'wall';
+    } else if (c.action === 'elevate') {
+      const high = n => [n.row, n.railEndRow, ...(n.railSegments || []).map(s => s.row)].some(x => typeof x === 'number' && x <= 3);
+      if ((notes || []).some(n => n.railEndBeat !== undefined && Math.abs(n.beat - c.beat) <= 2 && high(n))) by = 'rail';
+    } else if (isLyricMotionCue(c)) {
+      const end = c.endBeat ?? c.beat;
+      const kinds = [...new Set((notes || []).filter(n => n._lyricMotion === c.action
+        && n.beat <= end + 1 && (n.railEndBeat ?? n.beat) >= c.beat - 1).map(n => n._lyricBy || 'note'))];
+      if (kinds.length) by = kinds.join('+');
+    }
+    const words = String(c.lyric || '').split(/\s+/).filter(Boolean);
+    return {
+      sec: +(c.beat / bps).toFixed(1),
+      ...(isLyricMotionCue(c) && c.endBeat != null ? { endSec: +(c.endBeat / bps).toFixed(1) } : {}),
+      action: c.action,
+      kind: isLyricMotionCue(c) ? 'motion' : 'body',
+      lyric: words.slice(0, 5).join(' ') + (words.length > 5 ? '…' : ''),
+      honored: !!by,
+      ...(by ? { by } : {}),
+    };
+  });
+  return {
+    total: all.length,
+    honored: all.filter(c => c.honored).length,
+    missed_sec: all.filter(c => !c.honored).map(c => c.sec),
+    cues: all.slice(0, LYRIC_REPORT_MAX),
+  };
 }
 
 // ── Lyric Cue Fetcher ─────────────────────────────────────────────────────────
@@ -5809,6 +5854,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         stemSource: ev.stemSource || null,
         railEndBeat: endBeat, railEndRow: _arc.rowEnd, railEnd_x: _arc.xEnd,
         railSegments: _arc.waypoints,
+        ...(_railMo ? { _lyricMotion: _railMo, _lyricBy: 'rail' } : {}),
       });
       beatOccupied.add(bk);
     } else {
@@ -8552,6 +8598,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           g._x = COL_X[c];
           if (rHi > rLo) g.row = r;
           g._goldSweep = true;                               // tag choreographed gold so the critic can distinguish pattern vs loose placement
+          if (_gMo) { g._lyricMotion = _gMo; g._lyricBy = 'gold'; }
         }
         gReshaped++;
       }
@@ -8869,6 +8916,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     notes: result.sort((a, b) => a.beat - b.beat),
     walls: autoWalls,
     singleArmSections,
+    // aligned (map-beat) cues — the critic's lyric report checks the map against these. Only
+    // when present, so a cue-free result stays identical to the equivalence-test baselines.
+    ...(lyricCues.length ? { lyricCues } : {}),
   };
 }
 
@@ -12423,10 +12473,16 @@ async function critiqueMap(apiKey, audioMeta, currentNotes, currentWalls,
       })()
     : undefined;
 
+  // lyric_cues: what the sung words asked for and whether this map delivered it (lyricCueReport).
+  const lyricReport = lastAlignedLyricCues?.length
+    ? lyricCueReport(lastAlignedLyricCues, currentNotes, currentWalls, bps) : null;
+  if (lyricReport) console.log(`[LyricReport] ${lyricReport.honored}/${lyricReport.total} lyric cue(s) honored; missed at ${lyricReport.missed_sec.join(', ') || '—'} s`);
+
   const input = JSON.stringify({
     audio_metadata: audioMeta,
     map: mapSummary,
     ...(sectionIntent ? { section_intent: sectionIntent } : {}),
+    ...(lyricReport ? { lyric_cues: lyricReport } : {}),
   });
 
   const data = await callAnthropic(apiKey, {
@@ -13410,6 +13466,8 @@ Rules:
       }
 
       let iterNotes, iterWalls, iterSingleArmSections = [];
+      // Unaligned fallback for the audio-free paths; onsetsToNotes replaces it with aligned cues.
+      lastAlignedLyricCues = hints.lyricCues?.length ? alignLyricCues(hints.lyricCues, null, bpm / 60) : null;
       if (audioBuffer) {
         status.textContent = _cachedAnalysis
           ? 'Re-mapping notes with updated hints…'
@@ -13441,6 +13499,7 @@ Rules:
           }
 
           const audioResult = onsetsToNotes(_cachedAnalysis, bpm, diff, sections, hints);
+          if (audioResult.lyricCues) lastAlignedLyricCues = audioResult.lyricCues;
           if (audioResult.notes.length > 10) {
             iterNotes = audioResult.notes;
             iterWalls = audioResult.walls;
