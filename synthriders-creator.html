@@ -6970,7 +6970,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const prev = autoWalls[i - 1];
       const gap  = cur.beat - prev.beat;
       if (gap < minWallGap) {
-        autoWalls.splice(i, 1); // drop the later wall (no more BB3 pair exception)
+        if (cur.fromLyric && prev.fromLyric) continue;
+        autoWalls.splice(cur.fromLyric ? i - 1 : i, 1);   // else drop the later wall (no more BB3 pair exception)
       }
     }
   }
@@ -7021,7 +7022,9 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           next.beat <= cur.beat + cur.duration + HOLD_GAP) {
         // Extend cur to cover next, then remove next
         const cap = cur.wallType === 'crouch' ? CROUCH_CAP : LEAN_CAP;
+        if (next.fromLyric && cur.beat + cap < next.beat + 1) { i++; continue; }
         cur.duration = Math.min(cap, next.beat + next.duration - cur.beat);
+        if (next.fromLyric && !cur.fromLyric) cur.fromLyric = next.fromLyric;
         autoWalls.splice(i + 1, 1); // remove next (cur now covers it)
         // Don't advance i — check if the new extended cur can absorb the one after
       } else {
