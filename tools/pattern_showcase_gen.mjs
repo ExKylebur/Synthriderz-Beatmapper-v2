@@ -58,7 +58,8 @@ function slice(startMarker, endMarker) {
 const GOLD_SRC  = slice('// ── [GoldSweep] choreograph clustered gold runs', '// ── [Orbit] circular two-hand phrases — see applyOrbitPhrases');
 const DENSE_SRC = slice('// ── [DenseSweep] flowing groups for dense runs (v2)', '// ── [SparseSweep] choreograph loose runs');
 const CTX = ['result', 'hints', 'diffRowMin', 'diffRowMax', 'sectionAt', 'motifMemory', 'swungAt',
-             'DENSE_SWEEP', 'DANCE_MOVES', 'smoothPatternBoundaries', 'COL_X', 'console'];
+             'DENSE_SWEEP', 'DANCE_MOVES', 'smoothPatternBoundaries', 'COL_X', 'console',
+             'lyricCues', 'lyricMotionAt', 'LYRIC_GOLD_SHAPE', '_lyrStat'];   // [LyricMotion]: no sung cues here
 const goldBlock  = new Function(...CTX, GOLD_SRC);
 const denseBlock = new Function(...CTX, DENSE_SRC);
 const DIFF = 9;                                               // Master
@@ -67,7 +68,8 @@ const quiet = { log() {}, warn() {}, error() {} };
 function runBlock(fn, result, forced) {
   const motifMemory = { replay: (_s, kind) => forced[kind] ?? null, record() {} };
   fn(result, {}, diffRowMin, diffRowMax, () => ({ name: 'showcase' }), motifMemory, () => false,
-     true, DANCE_MOVES, G.smoothPatternBoundaries, COL_X, quiet);
+     true, DANCE_MOVES, G.smoothPatternBoundaries, COL_X, quiet,
+     [], () => null, {}, { rails: 0, gold: 0, orbit: 0 });
 }
 
 const rowsOf = n => n.row;

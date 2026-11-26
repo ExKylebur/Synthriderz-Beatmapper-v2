@@ -1698,7 +1698,10 @@ function orbitPeriods(gap, bps) {
 }
 function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, sectionAt = () => null,
                                      pickVariant = (_sec, k) => ORBIT_VARIANTS[k % ORBIT_VARIANTS.length],
-                                     maxShare = ORBIT_MAX_SHARE } = {}) {
+                                     maxShare = ORBIT_MAX_SHARE, prefer = [] } = {}) {
+  // prefer: [[startBeat, endBeat]] windows where the singer is circling ([LyricMotion] "spin"
+  // cues). A phrase overlapping one is chosen before any other, so the budget and the spacing
+  // rule go to the sung circle first; every geometry / reach guard below still applies.
   const isFree = n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined && !n._comp && !n._underSquatRail;
   const orbs = result.filter(isFree).sort((a, b) => a.beat - b.beat);
   const block = [], low = [];                                   // low: [start, end, rowLo, rowHi]
@@ -1773,7 +1776,9 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
   const budget = Math.floor(maxShare * result.length);
   const chosen = [];
   let used = 0;
-  for (const c of cands.sort((a, b) => Math.min(2, b.turns) * b.notes.length - Math.min(2, a.turns) * a.notes.length)) {
+  for (const c of cands) c._pref = (prefer || []).some(([s, e]) => c.t0 <= e + 1e-9 && c.t1 >= s - 1e-9);
+  for (const c of cands.sort((a, b) => (b._pref - a._pref)
+                              || Math.min(2, b.turns) * b.notes.length - Math.min(2, a.turns) * a.notes.length)) {
     if (used + c.notes.length > budget) continue;
     if (chosen.some(o => c.t0 < o.t1 + ORBIT_SPACING && o.t0 < c.t1 + ORBIT_SPACING)) continue;
     chosen.push(c); used += c.notes.length;
@@ -1794,13 +1799,14 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     if (!m || c3Movable(m, h, railsByHand) || !c3TooFast(Math.abs(n.beat - m.beat), bps)) return null;
     return { h, n, pos: c3Pos(m, before) };
   };
-  let tagged = 0, turns = 0;
+  let tagged = 0, turns = 0, preferred = 0;
   chosen.forEach((c, k) => {
     let lo = rowLo, hi = rowHi;
     for (const [s, e, l, h] of low)                                     // under a crouch bar
       if (c.notes.some(n => n.beat >= s - 1e-9 && n.beat <= e + 1e-9)) { lo = Math.max(lo, l); hi = Math.min(hi, h); }
     const rr = Math.min(3, (hi - lo) / 2), cy = (lo + hi) / 2;
     if (rr < 1.5) return;
+    if (c._pref) preferred++;
     const variant = pickVariant(sectionAt(c.t0), k);
     const dir = k % 2 === 0 ? 1 : -1;
     const ang = t => dir * 2 * Math.PI * (t - c.t0) / c.P;
@@ -1860,7 +1866,7 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     }
     turns += c.turns;
   });
-  return { phrases: chosen.length, tagged, turns: Math.round(turns * 10) / 10,
+  return { phrases: chosen.length, tagged, turns: Math.round(turns * 10) / 10, preferred,
            smoothed: tagged ? smoothPatternBoundaries(orbs) : 0 };
 }
 
@@ -2794,6 +2800,163 @@ function applyBPM(bpm) {
   toast(`BPM set to ${bpm}`, 'success');
 }
 
+// ── Lyric movement vocabulary (2026-11-26) ───────────────────────────────────
+// Two kinds of cue come out of a lyric line:
+//   BODY cues  — crouch / leanLeft / leanRight / slide become WALLS; elevate lifts a rail.
+//   MOTION cues — spin / wave / zigzag / figure8 / stairs place NO wall. They carry a window
+//     (the lyric line from the trigger word to the line's end) and steer the choreography
+//     that already exists inside that window: [Orbit] circles, rail shapes and [GoldSweep]
+//     paths. "Circle with me" → a circular two-hand phrase / spiral rail / gold circle.
+// A line yields at most one body cue AND one motion cue ("spinning down" → crouch + spin).
+// Bump LYRIC_CUE_VERSION when the vocabulary changes: library entries cached with an older
+// version are re-fetched at the next generation, so old songs pick up the new words.
+const LYRIC_CUE_VERSION = 2;
+const LYRIC_WALL_ACTIONS = new Set(['crouch', 'leanLeft', 'leanRight', 'slide']);
+const LYRIC_MOTION_ACTIONS = new Set(['spin', 'wave', 'zigzag', 'figure8', 'stairs']);
+const LYRIC_LINE_MAX_SEC = 6.0;          // a sung line's window never runs past this (held notes, gaps)
+const LYRIC_WORD_EST_SEC = 4.5;          // span the syllable-position estimate spreads a line over
+const LYRIC_LINE_SLOP_SEC = 0.3;         // LRC stamps run a little late: look this far before a line
+const LYRIC_SNAP_SEC = 0.4;              // no line info: snap to the nearest vocal onset within this
+const LYRIC_MOTION_DEFAULT_BEATS = 8;    // window for a motion cue with no line timing (LLM path)
+const LYRIC_RAIL_SHAPE = { spin: 'spiral', wave: 'wave', zigzag: 'zigzag', figure8: 'figure8', stairs: 'staircase' };
+const LYRIC_GOLD_SHAPE = { spin: 1, wave: 3, zigzag: 0, figure8: 2, stairs: 0 };   // [GoldSweep] shape index
+// First match wins within a slot (body / motion); strong rules outrank thematic ones.
+// HIGH-PRECISION: bare "up"/"left"/"right" are dropped — they match non-directional words
+// constantly ("tearin' UP my heart", "can't be RIGHT", "giving UP").
+const LYRIC_ACTION_RULES = [
+  { a: 'crouch',    slot: 'body',   strong: true,  re: /\b(get down|down low|down on|fall(in'?|ing)? down|drop(ping)? down|on (my|your|the) knees|to the (floor|ground)|kneel|crouch|duck)\b/i },
+  { a: 'elevate',   slot: 'body',   strong: true,  re: /\b(rise|rising|risen|climb(ing)?|ascend(ing)?|soar(ing)?|escalat(e|es|ed|ing)|higher|skyward|lift off|up high|up above|up to the sky|reach(ing)? (for the sky|higher))\b/i },
+  { a: 'slide',     slot: 'body',   strong: true,  re: /\b(slide|slidin'?|glide|glidin'?|slip(pin'?|ping)?)\b/i },
+  { a: 'leanLeft',  slot: 'body',   strong: true,  re: /\b((to|on) (the|my) left|turn(ing)? left|look(ing)? left|left side|lean(ing)? (left|away))\b/i },
+  { a: 'leanRight', slot: 'body',   strong: true,  re: /\b((to|on) (the|my) right|turn(ing)? right|look(ing)? right|right side|lean(ing)? right)\b/i },
+  { a: 'crouch',    slot: 'body',   strong: false, re: /\b(down|beneath|below|under(neath)?|floor|ground)\b/i },
+  { a: 'slide',     slot: 'body',   strong: false, re: /\b(rush(in'?|ing)?|sweep(in'?|ing)?)\b/i },
+  { a: 'spin',      slot: 'motion', strong: true,  re: /\b(circl(e|es|ed|in'?|ing)|spin(s|nin'?|ning)?|spun|spiral(s|ing|ling|led)?|twirl(s|ed|in'?|ing)?|swirl(s|ed|in'?|ing)?|whirl(s|ed|in'?|ing|wind|pool)?|orbit(s|ed|ing)?|revolv(e|es|ed|ing)|round and round|around and around|turn(in'?|ing)? around|in circles|loop(s|ed|in'?|ing)?|tornado|cyclone|vortex|carousel|merry-go-round)\b/i },
+  { a: 'figure8',   slot: 'motion', strong: true,  re: /\b(infinity|infinite|figure (of )?eight|figure 8|forever and ever|intertwin(e|ed|ing)|entwin(e|ed|ing))\b/i },
+  { a: 'wave',      slot: 'motion', strong: true,  re: /\b(waves?|wavin'?|waving|sway(s|ed|in'?|ing)?|swing(s|in'?|ing)?|back and forth|side to side|ocean|tides?|ripples?|float(s|ed|in'?|ing)?|drift(s|ed|in'?|ing)?)\b/i },
+  { a: 'zigzag',    slot: 'motion', strong: true,  re: /\b(zig-?zag(s|ging)?|lightning|shak(e|es|in'?|ing)|shiver(s|ed|ing)?|trembl(e|es|ed|ing)|shatter(s|ed|ing)?|jagged)\b/i },
+  { a: 'stairs',    slot: 'motion', strong: true,  re: /\b(stairs?|staircase|stairway|step by step|ladder|steps? (up|down))\b/i },
+];
+function isLyricWallCue(c)   { return !!c && LYRIC_WALL_ACTIONS.has(c.action); }
+function isLyricMotionCue(c) { return !!c && LYRIC_MOTION_ACTIONS.has(c.action); }
+// A library entry's cached cues, or null (→ auto-fetch at generation) when they were cached by
+// an older vocabulary.
+function libraryLyricCues(entry) {
+  if (!entry || entry.lyricCues == null) return null;
+  return (entry.lyricCuesVer || 1) < LYRIC_CUE_VERSION ? null : entry.lyricCues;
+}
+function lyricSyllables(word) {
+  const w = String(word || '').toLowerCase().replace(/[^a-z]/g, '');
+  if (!w) return 0;
+  const groups = w.replace(/(?:[^laeiouy]es|ed|[^laeiouy]e)$/, '').match(/[aeiouy]+/g);
+  return Math.max(1, groups ? groups.length : 1);
+}
+// LRC lines [{t, text}] (seconds, sorted) → raw cues [{beat, t, action, lyric, strong, lineT,
+// lineEnd, frac, endT?, endBeat?}]. `frac` is the trigger word's SYLLABLE position in its line
+// (alignLyricCues maps it onto the line's vocal onsets); `t` is the estimate without onsets.
+function lyricCuesFromLines(lines, bps, totalBeats) {
+  const raw = [];
+  for (let li = 0; li < (lines || []).length; li++) {
+    const line = lines[li], text = line.text || '';
+    const next = lines[li + 1]?.t;
+    const lineEnd = Math.min(next ?? line.t + 4, line.t + LYRIC_LINE_MAX_SEC);
+    const words = [...text.matchAll(/[A-Za-z']+/g)];
+    const sylTotal = words.reduce((s, m) => s + lyricSyllables(m[0]), 0) || 1;
+    const done = new Set();
+    for (const rule of LYRIC_ACTION_RULES) {
+      if (done.has(rule.slot)) continue;
+      const mi = text.search(rule.re);
+      if (mi < 0) continue;
+      done.add(rule.slot);
+      const sylBefore = words.filter(m => m.index < mi).reduce((s, m) => s + lyricSyllables(m[0]), 0);
+      const frac = sylBefore / sylTotal;
+      const t = line.t + frac * Math.max(0, Math.min(lineEnd - line.t, LYRIC_WORD_EST_SEC));
+      const beat = Math.round(t * bps * 4) / 4;
+      if (beat < 0 || beat > totalBeats - 4) continue;
+      const cue = { beat, t, action: rule.a, lyric: text.slice(0, 60), strong: rule.strong,
+                    lineT: line.t, lineEnd, frac };
+      if (rule.slot === 'motion') { cue.endT = lineEnd; cue.endBeat = Math.round(lineEnd * bps * 4) / 4; }
+      raw.push(cue);
+    }
+  }
+  return raw.sort((a, b) => a.t - b.t);
+}
+// Raw cues → the kept set. Body cues: min spacing 4 beats (strong) / 8 (thematic), capped.
+// Motion cues: same-action windows that overlap or sit within 4 beats merge into one window
+// (a chorus of "circle with me" lines is ONE long spin, not four), capped separately so they
+// never crowd out walls.
+function spaceLyricCues(raw, { maxBody = 20, maxMotion = 16 } = {}) {
+  const sorted = [...(raw || [])].sort((a, b) => a.beat - b.beat);
+  const body = [], motion = [];
+  let last = -Infinity;
+  for (const c of sorted.filter(c => !isLyricMotionCue(c))) {
+    if (c.beat - last >= (c.strong ? 4 : 8)) { body.push(c); last = c.beat; }
+  }
+  for (const c of sorted.filter(isLyricMotionCue)) {
+    const end = c.endBeat ?? c.beat + LYRIC_MOTION_DEFAULT_BEATS;
+    const p = motion[motion.length - 1];
+    if (p && p.action === c.action && c.beat - p.endBeat <= 4) {
+      p.endBeat = Math.max(p.endBeat, end);
+      if (typeof c.endT === 'number') p.endT = Math.max(p.endT ?? c.endT, c.endT);
+      continue;
+    }
+    motion.push({ ...c, endBeat: end });
+  }
+  const cap = (a, n) => a.length > n ? a.filter((_, i) => i % Math.ceil(a.length / n) === 0) : a;
+  return [...cap(body, maxBody), ...cap(motion, maxMotion)]
+    .sort((a, b) => a.beat - b.beat)
+    .map(({ strong, ...c }) => c);
+}
+// Word-level alignment at generation time. Every time field (t, lineT, lineEnd, endT) is in the
+// MAP clock here (song time + audioPadSecs), the same clock as the stem onsets. A cue whose line
+// holds >= 2 vocal onsets takes the onset at its syllable position (word k of a line sung as N
+// onsets → onset round(frac·N)): LRC stamps mark only the line START, so this moves the cue from
+// "somewhere in the line" onto the sung syllable. Otherwise the nearest vocal onset within
+// LYRIC_SNAP_SEC; otherwise the estimate stands. Beats keep quarter-beat precision.
+function alignLyricCues(cues, vocalOnsets, bps) {
+  const vt = (vocalOnsets || []).map(o => typeof o === 'number' ? o : o?.time)
+    .filter(Number.isFinite).sort((a, b) => a - b);
+  let snapped = 0, shift = 0;
+  const out = (cues || []).map(c => {
+    const o = { ...c };
+    if (typeof c.t === 'number' && vt.length) {
+      let t = null;
+      if (typeof c.lineT === 'number' && typeof c.lineEnd === 'number') {
+        const inLine = vt.filter(x => x >= c.lineT - LYRIC_LINE_SLOP_SEC && x < c.lineEnd);
+        if (inLine.length >= 2) t = inLine[Math.min(inLine.length - 1, Math.round((c.frac || 0) * inLine.length))];
+      }
+      if (t === null) {
+        let best = null;
+        for (const x of vt) if (Math.abs(x - c.t) <= LYRIC_SNAP_SEC && (best === null || Math.abs(x - c.t) < Math.abs(best - c.t))) best = x;
+        t = best;
+      }
+      if (t !== null) {
+        shift += Math.abs(t - c.t) * bps; snapped++;
+        o.t = t; o.beat = Math.round(t * bps * 4) / 4; o._aligned = true;
+      }
+    }
+    if (isLyricMotionCue(o)) {
+      o.endBeat = typeof o.endT === 'number' ? Math.round(o.endT * bps * 4) / 4
+                : (o.endBeat ?? o.beat + LYRIC_MOTION_DEFAULT_BEATS);
+      if (o.endBeat < o.beat + 1) o.endBeat = o.beat + 1;
+    }
+    return o;
+  });
+  out.stats = { snapped, total: out.length, meanShiftBeats: snapped ? shift / snapped : 0 };
+  return out;
+}
+// The motion cue whose window overlaps [b0, b1] the most, or null. Used by the rail, gold and
+// orbit passes to ask "is the singer circling / waving / … right here?"
+function lyricMotionAt(cues, b0, b1 = b0) {
+  let best = null, bestOv = -Infinity;
+  for (const c of cues || []) {
+    if (!isLyricMotionCue(c)) continue;
+    const ov = Math.min(b1, c.endBeat ?? c.beat) - Math.max(b0, c.beat);
+    if (ov >= -0.5 && ov > bestOv) { best = c; bestOv = ov; }
+  }
+  return best ? best.action : null;
+}
+
 // ── Lyric Cue Fetcher ─────────────────────────────────────────────────────────
 // Calls Claude Haiku with web_search to retrieve the actual lyrics of the song,
 // then maps lyric phrases to movement actions (crouch / leanLeft / leanRight / slide / elevate).
@@ -2871,57 +3034,15 @@ async function fetchLyricCues() {
       const synced = await fetchSyncedLyrics(title, artist, durationSec);
       if (synced && synced.length) {
         const bps = bpm / 60;
-        // First match wins per line; strong (explicit direction) rules take priority over thematic.
-        // HIGH-PRECISION: bare "up"/"left"/"right" are dropped — they match non-directional words
-        // constantly ("tearin' UP my heart", "can't be RIGHT", "giving UP"). Strong rules require
-        // directional phrasing; "down" is kept only as a lower-priority thematic match.
-        const ACTION_RULES = [
-          { a: 'crouch',    strong: true,  re: /\b(get down|down low|down on|fall(in'?|ing)? down|drop(ping)? down|on (my|your|the) knees|to the (floor|ground)|kneel|crouch|duck)\b/i },
-          { a: 'elevate',   strong: true,  re: /\b(rise|rising|risen|climb(ing)?|ascend(ing)?|soar(ing)?|higher|skyward|lift off|up high|up above|up to the sky|reach(ing)? (for the sky|higher))\b/i },
-          { a: 'slide',     strong: true,  re: /\b(slide|slidin'?|glide|glidin'?|slip(pin'?|ping)?)\b/i },
-          { a: 'leanLeft',  strong: true,  re: /\b((to|on) (the|my) left|turn(ing)? left|look(ing)? left|left side|lean(ing)? (left|away))\b/i },
-          { a: 'leanRight', strong: true,  re: /\b((to|on) (the|my) right|turn(ing)? right|look(ing)? right|right side|lean(ing)? right)\b/i },
-          { a: 'crouch',    strong: false, re: /\b(down|beneath|below|under(neath)?|floor|ground)\b/i },
-          { a: 'slide',     strong: false, re: /\b(rush(in'?|ing)?|sweep(in'?|ing)?)\b/i },
-        ];
-        const raw = [];
-        for (let li = 0; li < synced.length; li++) {
-          const line = synced[li];
-          for (const rule of ACTION_RULES) {
-            const mi = line.text.search(rule.re);
-            if (mi < 0) continue;
-            // LRC timestamps mark the LINE START, but the trigger word (e.g. "down") is often
-            // the LAST word — placing the cue at the line start lands it ~5-7 beats early.
-            // Estimate when the word is actually sung by interpolating its character position
-            // across the line's duration (gap-capped at 4.5 s so a trailing instrumental gap
-            // before the next line doesn't overshoot the estimate).
-            const lineDur = Math.min((synced[li + 1]?.t ?? line.t + 3) - line.t, 4.5);
-            const cueT = line.t + (mi / Math.max(line.text.length, 1)) * Math.max(0, lineDur);
-            const beat = Math.round(cueT * bps);
-            if (beat < 0 || beat > beats - 4) break;
-            raw.push({ beat, t: cueT, action: rule.a, lyric: line.text.slice(0, 60), strong: rule.strong });
-            break;
-          }
-        }
-        raw.sort((a, b) => a.beat - b.beat);
-        // Min spacing: 4 beats for strong/literal cues, 8 for thematic (matches the LLM path).
-        const spaced = [];
-        let lastBeat = -Infinity;
-        for (const c of raw) {
-          if (c.beat - lastBeat >= (c.strong ? 4 : 8)) {
-            spaced.push({ beat: c.beat, t: c.t, action: c.action, lyric: c.lyric });
-            lastBeat = c.beat;
-          }
-        }
-        // Cap to ~20 cues, evenly sampled, so obstacle-dense songs don't get overloaded.
-        const MAX_CUES = 20;
-        const final = spaced.length > MAX_CUES
-          ? spaced.filter((_, i) => i % Math.ceil(spaced.length / MAX_CUES) === 0)
-          : spaced;
+        // Shared vocabulary + syllable-position word timing (lyricCuesFromLines), then body cues
+        // spaced/capped and motion windows merged (spaceLyricCues). alignLyricCues refines each
+        // cue onto the vocal-stem onsets at generation time.
+        const final = spaceLyricCues(lyricCuesFromLines(synced, bps, beats));
         if (final.length) {
           lastLyricCues = final;
+          const _nMo = final.filter(isLyricMotionCue).length;
           status.style.color = 'var(--green)';
-          status.textContent = `✓ ${final.length} synced lyric cue${final.length !== 1 ? 's' : ''} (LRCLIB) — regenerate to apply.`;
+          status.textContent = `✓ ${final.length} synced lyric cue${final.length !== 1 ? 's' : ''} (LRCLIB${_nMo ? `, ${_nMo} motion` : ''}) — regenerate to apply.`;
           console.log('[LyricCues] synced via LRCLIB:', final);
           return;   // outer finally re-enables the button
         }
@@ -2942,13 +3063,19 @@ Then identify moments where words or meaning suggest a VR player body movement:
 - "leanRight": right, toward, turn right, lean in
 - "slide": slide, glide, rush, through, across, fast
 - "elevate": [FEAT-6] up, rise, rising, climb, ascend, elevate, lift, soar, higher
+Choreography cues (no obstacle — they shape the arm motion while the line is sung; give endBeat = when the line ends):
+- "spin": circle, circling, spin, spiral, twirl, swirl, whirl, orbit, loop, round and round, turn around
+- "wave": wave, sway, swing, back and forth, side to side, ocean, tide, float, drift
+- "zigzag": zigzag, lightning, shake, shiver, tremble, shatter
+- "figure8": infinity, forever and ever, intertwined
+- "stairs": stairs, steps, ladder, step by step
 
 PRIORITY RULE: Explicit direction words ("down", "left", "right", "slide", "up", "rise") always qualify — include ALL occurrences.
 
 Song: ${durationSec.toFixed(0)}s, ${bpm} BPM, ${beats} beats total. Each beat = ${(60/bpm).toFixed(3)}s.
 
 Return ONLY a JSON array, no markdown:
-{"beat": <number>, "action": "crouch"|"leanLeft"|"leanRight"|"slide"|"elevate", "lyric": "<phrase, max 6 words>"}
+{"beat": <number>, "endBeat": <number, choreography cues only>, "action": "crouch"|"leanLeft"|"leanRight"|"slide"|"elevate"|"spin"|"wave"|"zigzag"|"figure8"|"stairs", "lyric": "<phrase, max 6 words>"}
 
 Aim for 4–16 cues. beat must be 0–${beats}. If no cues, return [].`;
 
@@ -2959,11 +3086,17 @@ Aim for 4–16 cues. beat must be 0–${beats}. If no cues, return [].`;
 - "leanRight": words like "right", "toward", "turn around"
 - "slide": words like "slide", "glide", "rush", "through", "across"
 - "elevate": [FEAT-6] words like "up", "rise", "rising", "climb", "ascend", "lift", "soar"
+Choreography cues (no obstacle — they shape the arm motion while the line is sung; give endBeat = when the line ends):
+- "spin": words like "circle", "spin", "spiral", "twirl", "whirl", "loop", "round and round"
+- "wave": words like "wave", "sway", "swing", "back and forth", "ocean", "float"
+- "zigzag": words like "zigzag", "lightning", "shake", "tremble"
+- "figure8": words like "infinity", "forever and ever", "intertwined"
+- "stairs": words like "stairs", "steps", "ladder"
 
 Song: ${durationSec.toFixed(0)}s, ${bpm} BPM, ${beats} beats total. Each beat = ${(60/bpm).toFixed(3)}s.
 
 Return ONLY a JSON array, no markdown:
-{"beat": <number>, "action": "crouch"|"leanLeft"|"leanRight"|"slide"|"elevate", "lyric": "<brief description, max 6 words>"}
+{"beat": <number>, "endBeat": <number, choreography cues only>, "action": "crouch"|"leanLeft"|"leanRight"|"slide"|"elevate"|"spin"|"wave"|"zigzag"|"figure8"|"stairs", "lyric": "<brief description, max 6 words>"}
 
 Aim for 4–16 cues. beat must be 0–${beats}. If unfamiliar with this song, return [].`;
 
@@ -3021,34 +3154,23 @@ Aim for 4–16 cues. beat must be 0–${beats}. If unfamiliar with this song, re
     }
 
     // Validate and clamp each cue
-    const VALID_ACTIONS = new Set(['crouch', 'leanLeft', 'leanRight', 'slide', 'elevate']);  // [FEAT-6] added 'elevate'
+    const VALID_ACTIONS = new Set([...LYRIC_WALL_ACTIONS, 'elevate', ...LYRIC_MOTION_ACTIONS]);
+    // A cue counts as literal (strong → 4-beat spacing) when the vocabulary rule for its action
+    // matches its own lyric text; thematic guesses keep the 8-beat gap.
+    const isLiteral = c => LYRIC_ACTION_RULES.some(r => r.a === c.action && r.strong && r.re.test(c.lyric));
     const cleaned = cues
       .filter(c => c && typeof c.beat === 'number' && VALID_ACTIONS.has(c.action))
-      .map(c => ({
-        beat:   Math.max(0, Math.min(beats - 4, Math.round(c.beat))),
-        action: c.action,
-        lyric:  (c.lyric || '').slice(0, 60),
-      }))
-      .sort((a, b) => a.beat - b.beat);
-
-    // Enforce minimum spacing between cues.
-    // Explicit literal-word cues (the word "down", "left", "right", "slide", "up", "rise" appears
-    // verbatim in the lyric) get a tighter 4-beat minimum so repeated chorus phrases survive.
-    // Thematic cues keep the 8-beat gap.
-    const LITERAL_WORDS = {
-      crouch: /\bdown\b/i, leanLeft: /\bleft\b/i, leanRight: /\bright\b/i, slide: /\bslide\b/i,
-      elevate: /\b(up|rise|rising|climb|ascend|elevate|lift|soar)\b/i  // [FEAT-6] upward movement keywords
-    };
-    const isLiteral = c => LITERAL_WORDS[c.action]?.test(c.lyric) ?? false;
-    const spaced = [];
-    let lastCueBeat = -Infinity;
-    for (const c of cleaned) {
-      const minGap = isLiteral(c) ? 4 : 8;
-      if (c.beat - lastCueBeat >= minGap) {
-        spaced.push(c);
-        lastCueBeat = c.beat;
-      }
-    }
+      .map(c => {
+        const beat = Math.max(0, Math.min(beats - 4, Math.round(c.beat)));
+        const o = { beat, action: c.action, lyric: (c.lyric || '').slice(0, 60) };
+        if (LYRIC_MOTION_ACTIONS.has(c.action)) {
+          const e = typeof c.endBeat === 'number' ? Math.round(c.endBeat) : beat + LYRIC_MOTION_DEFAULT_BEATS;
+          o.endBeat = Math.max(beat + 2, Math.min(beats, e, beat + 16));
+        }
+        o.strong = isLiteral(o) || LYRIC_MOTION_ACTIONS.has(c.action);
+        return o;
+      });
+    const spaced = spaceLyricCues(cleaned);
 
     lastLyricCues = spaced;
 
@@ -5098,10 +5220,17 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // lyric-cue obstacles from hints which are pre-seeded before generation starts.
   let autoWalls = [];
 
+  // [LyricAlign] Snap each lyric cue onto the sung syllable (vocal-stem onsets) — see alignLyricCues.
+  const lyricCues = alignLyricCues(hints.lyricCues, analysis.stemData?.vocals?.onsets, bps);
+  if (lyricCues.length) {
+    const _la = lyricCues.stats;
+    console.log(`[LyricAlign] ${_la.snapped}/${_la.total} cue(s) snapped to vocal onsets (mean shift ${_la.meanShiftBeats.toFixed(2)} beat); ${lyricCues.filter(isLyricMotionCue).length} motion window(s): ${lyricCues.filter(isLyricMotionCue).map(c => `${c.action}@${c.beat}-${c.endBeat}`).join(', ')}`);
+  }
+  const _lyrStat = { rails: 0, gold: 0, orbit: 0 };   // [LyricMotion] what the motion cues steered
   // [FEAT-6] elevateCues/nonElevateCues declared early so the placement loop can reference them.
-  // Derived from hints.lyricCues which is set before generation starts.
-  const elevateCues    = hints.lyricCues?.filter(c => c.action === 'elevate') ?? [];
-  const nonElevateCues = hints.lyricCues?.filter(c => c.action !== 'elevate') ?? [];
+  // nonElevateCues = the WALL cues only (motion cues place no wall).
+  const elevateCues    = lyricCues.filter(c => c.action === 'elevate');
+  const nonElevateCues = lyricCues.filter(isLyricWallCue);
 
   let _evIdx = -1;                       // index of ev in events (the stream mirror looks ahead)
   for (let ev of events) {
@@ -5625,8 +5754,8 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       // lyric-cue walls (hints.lyricCues) which ARE known before generation starts.
       // Auto-walls are handled in a post-pass: rails already placed are adjusted if needed.
       const obsConstraint = (() => {
-        const lyricWalls = (hints.lyricCues || []).filter(c =>
-          c.action !== 'elevate' &&
+        const lyricWalls = lyricCues.filter(c =>
+          isLyricWallCue(c) &&
           (c.beat + 2) > beat && c.beat < endBeat  // ±2 beat window around rail
         );
         // leanLeft = obstacle on the RIGHT (player leans left to dodge it) → constrain the
@@ -5652,7 +5781,13 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       }
 
       const _motifSec = sectionAt(beat);
-      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, _lattice.sizeAt(beat), xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, motifMemory.replay(_motifSec, 'rails'));
+      // [LyricMotion] a rail sung under "circle / wave / zigzag / …" takes that word's shape
+      // (fitRailPlan downgrades it to the rail's length tier: a mid-length spiral is an ellipse).
+      // replay() still runs so a repeated chorus's motif cursor stays in step.
+      let _railPlan = motifMemory.replay(_motifSec, 'rails');
+      const _railMo = lyricMotionAt(lyricCues, beat, endBeat);
+      if (_railMo) { _railPlan = [{ frac: 1, shape: LYRIC_RAIL_SHAPE[_railMo] }]; _lyrStat.rails++; }
+      const _arc = generateRailArc(beat, arcRowStart, endBeat, arcRowEnd, _lattice.sizeAt(beat), xStart, hand, isOtherHandResting, swayBoost, bpm, obsConstraint, null, _railPlan);
       motifMemory.record(_motifSec, 'rails', _arc.plan);
 
       // [FEAT-6] For elevate rails, blend the circular arc waypoints with a linear
@@ -7063,6 +7198,25 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     console.log(`[Obstacles] After hold-merge: ${autoWalls.length} wall(s) total`);
   }
 
+  // ── [LyricMotion] a sung "spin" line claims its window from side walls ──────────────
+  // [Orbit] never draws a circle where a lean/slide occlusion window lands (a side wall squeezes
+  // a hand into 3-4 columns, a slide moves rows ±3). On Circle With Me (2026-11-26) every spin
+  // line had an AUTO lean/slide in it, so no sung circle formed. Like a lyric wall cue owning
+  // ±3 beats, a spin window drops the auto lean/slide walls whose occlusion window overlaps it.
+  // Lyric-cued walls stay (the words asked for them) and so do crouches (circles fit under one).
+  // Runs after HoldStreak + hold-merge, which can grow a wall into the window.
+  if (!hints.noObstacles) {
+    const spinWins = lyricCues.filter(c => c.action === 'spin');
+    let cleared = 0;
+    for (let i = autoWalls.length - 1; i >= 0; i--) {
+      const w = autoWalls[i];
+      if (w.fromLyric || w.wallType === 'crouch') continue;
+      const s0 = w.beat - OBSTACLE_LEAD_BEATS, s1 = w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS;
+      if (spinWins.some(c => s0 < c.endBeat && s1 > c.beat)) { autoWalls.splice(i, 1); cleared++; }
+    }
+    if (cleared) console.log(`[LyricMotion] cleared ${cleared} auto lean/slide wall(s) from ${spinWins.length} sung spin window(s)`);
+  }
+
   // ── Final zone enforcement ───────────────────────────────────────────────
   // Hard clamp: any non-companion single-hand note (orb OR rail head) that ended
   // up on the wrong side is snapped to the nearest column in its hand zone.
@@ -8355,7 +8509,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       const run = golds.slice(gi, gj + 1);
       if (run.length >= 3) {
         const _gSec = sectionAt(run[0].beat);
-        const shape = motifMemory.replay(_gSec, 'gold') ?? (gReshaped % GOLD_SHAPES);
+        const _gReplay = motifMemory.replay(_gSec, 'gold');
+        const _gMo = lyricMotionAt(lyricCues, run[0].beat, run[run.length - 1].beat);   // [LyricMotion]
+        if (_gMo) _lyrStat.gold++;
+        const shape = _gMo ? LYRIC_GOLD_SHAPE[_gMo] : (_gReplay ?? (gReshaped % GOLD_SHAPES));
         motifMemory.record(_gSec, 'gold', shape);
         const flip  = gReshaped % 2 === 0 ? 0 : 4;          // alternate start side per run
         let prevC = null, prevR = null;
@@ -8409,13 +8566,15 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   {
     const _orb = applyOrbitPhrases(result, {
       walls: autoWalls, rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), bps, sectionAt,
+      prefer: lyricCues.filter(c => c.action === 'spin').map(c => [c.beat, c.endBeat]),   // [LyricMotion]
       pickVariant: (sec, k) => {
         const v = motifMemory.replay(sec, 'orbit') ?? ORBIT_VARIANTS[k % ORBIT_VARIANTS.length];
         motifMemory.record(sec, 'orbit', v);
         return v;
       },
     });
-    if (_orb.phrases) console.log(`[Orbit] ${_orb.phrases} circular phrase(s), ${_orb.tagged} orbs, ${_orb.turns} turn(s) in all; boundary-smoothed ${_orb.smoothed}`);
+    if (_orb.phrases) console.log(`[Orbit] ${_orb.phrases} circular phrase(s), ${_orb.tagged} orbs, ${_orb.turns} turn(s) in all; boundary-smoothed ${_orb.smoothed}${_orb.preferred ? `; ${_orb.preferred} on a sung "spin" line` : ''}`);
+    _lyrStat.orbit = _orb.preferred || 0;
   }
 
   // ── [DenseSweep] flowing groups for dense runs (v2) ───────────────────────────────────
@@ -8681,6 +8840,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     console.log(`[RowLift] Shifted all rows up ${ROW_LIFT} (clamped at row ${diffRowMin})`);
   }
   { const _ms = motifMemory.stats(); if (_ms.roots) console.log(`[MotifMemory] roots=${_ms.roots} recorded=${_ms.recorded} replayed=${_ms.replayed}`); }
+  if (lyricCues.some(isLyricMotionCue)) console.log(`[LyricMotion] sung motion steered ${_lyrStat.rails} rail(s), ${_lyrStat.gold} gold run(s), ${_lyrStat.orbit} orbit phrase(s)`);
 
   // ── [Phase2Probe] skeleton diff — what the spatial zone did to the population ─────────
   // Compares the note population at FINAL against the skeleton locked at phase-boundary.
@@ -11030,9 +11190,11 @@ function expandSections(sections, totalBeats, diff, hints = {}, bpm) {
   // ── Lyric-cue obstacle injection (expandSections / audio-free path) ────────
   // Same logic as in onsetsToNotes — lyric cues replace nearby auto-walls so that
   // obstacles are choreographed to the actual lyrics even without Demucs data.
-  if (!hints.noObstacles && hints.lyricCues?.length) {
+  // Only WALL cues: elevate and motion cues used to fall through here as walls with an
+  // invalid wallType ('elevate'), so filter them out.
+  if (!hints.noObstacles && hints.lyricCues?.some(isLyricWallCue)) {
     const occupiedWallBeats = new Set(autoWalls.map(w => Math.round(w.beat * 4)));
-    for (const cue of hints.lyricCues) {
+    for (const cue of hints.lyricCues.filter(isLyricWallCue)) {
       let placeBeat = cue.beat;
       let placed = false;
       for (let delta = 0; delta <= 3 && !placed; delta++) {
@@ -13723,8 +13885,13 @@ Rules:
           if (!lastLyricCues || !lastLyricCues.length) return lastLyricCues || null;
           // `t` is in the song's own time; the map clock starts audioPadSecs earlier.
           const _bps = (parseFloat(document.getElementById('bpm')?.value) || 120) / 60;
+          // Every time field moves onto the map clock (the clock of the stem onsets that
+          // alignLyricCues snaps to inside onsetsToNotes); beats keep quarter-beat precision.
+          const _m = x => (typeof x === 'number') ? x + audioPadSecs : x;
           return lastLyricCues.map(c => (typeof c.t === 'number')
-            ? { ...c, beat: Math.max(0, Math.round((c.t + audioPadSecs) * _bps)) }
+            ? { ...c, t: _m(c.t), lineT: _m(c.lineT), lineEnd: _m(c.lineEnd), endT: _m(c.endT),
+                beat: Math.max(0, Math.round((c.t + audioPadSecs) * _bps * 4) / 4),
+                ...(typeof c.endT === 'number' ? { endBeat: Math.round((c.endT + audioPadSecs) * _bps * 4) / 4 } : {}) }
             : c);
         })(),
         // Stem enable flags — null means all enabled (default, no hint overhead)
@@ -15612,6 +15779,7 @@ async function saveToLibrary() {
     // Persist lyric cues so they're auto-applied on next load without re-fetching.
     // null = cues never fetched; [] = fetched but none found; array = cues ready.
     lyricCues:    lastLyricCues ?? null,
+    lyricCuesVer: LYRIC_CUE_VERSION,   // older caches are re-fetched (new movement words)
     // Persist lyric section structure too — re-generating this song then skips the
     // fetchLyricSections web_search call, a heavy input-token consumer (rate-limit relief).
     lyricSections: lastLyricSections ?? null,
@@ -15700,7 +15868,7 @@ async function loadLibraryEntry(entry) {
   // null means cues were never fetched for this song (auto-fetch will run at generate time).
   // [] means they were fetched and none were found (skip auto-fetch, no cues to apply).
   // array means cues are ready — update status label so user sees them without re-fetching.
-  lastLyricCues = entry.lyricCues ?? null;
+  lastLyricCues = libraryLyricCues(entry);
   lastLyricSections = entry.lyricSections ?? null;   // cached structure → skip the web_search fetch at generation time
   const lyricStatusEl = document.getElementById('lyricStatus');
   const lyricBtnEl    = document.getElementById('lyricBtn');
@@ -16120,7 +16288,7 @@ async function _processBatchItem(file, i) {
       }
       // Restore lyric cues so they're injected at generation time without re-fetching.
       // null = never fetched (auto-fetch will run); [] = fetched, none found (skip).
-      lastLyricCues = entry.lyricCues ?? null;
+      lastLyricCues = libraryLyricCues(entry);
       lastLyricSections = entry.lyricSections ?? null;   // cached structure → skip web_search fetch
       if (lastLyricCues?.length)
         console.log(`[Batch] Restored ${lastLyricCues.length} lyric cue(s) from library for "${entry.title}"`);

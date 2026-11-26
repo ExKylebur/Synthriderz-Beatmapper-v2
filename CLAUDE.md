@@ -27,5 +27,5 @@ Based on lessons learned building this program, use models strategically:
 ## Testing & verification
 
 - **validate.py:** Regression harness for exported `.synth` files. Run before claiming a generation fix is complete.
-- **Console logs:** Watch for `[C3Clamp]`, `[FinalSweep]`, `[GreenClamp]`, `[Crossover]`, `[FlowProbe]` — these are instrumentation for the complex passes.
+- **Console logs:** Watch for `[C3Clamp]`, `[FinalSweep]`, `[GreenClamp]`, `[Crossover]`, `[FlowProbe]` — these are instrumentation for the complex passes. Lyric choreography logs `[LyricAlign]` (cues snapped to vocal onsets, motion windows) and `[LyricMotion]` (rails / gold runs / orbit phrases steered, auto side walls cleared from sung spin windows).
 - **Real play-test:** After spatial/flow changes, test in VR or the 3D preview. Console logs prove the code ran; play-test proves it feels right.
