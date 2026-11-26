@@ -239,6 +239,10 @@ def main():
             extra = f"  R{' ' + rs.get('turn', '') if spiral else ''} r={rs.get('radiusMin')}-{rs.get('radiusMax')} span {rs.get('colSpan')}c x {rs.get('rowSpan')}r"
             if info.get('left') and spiral:
                 extra += f" | L {ls.get('turn', '')}"
+        elif 'choreo' in info:
+            st = info['choreo']
+            extra = (f"  moved {info.get('moved')}/{info.get('of')}: swoop {st['swoop']}, tilt {st['tilt']}, "
+                     f"sway {st['sway']} in the window, {st['ramp']} on the approach/release")
         elif 'stats' in info:
             st = info['stats']; extra = f"  span {st.get('colSpan')}c x {st.get('rowSpan')}r"
         if info.get('plan'):

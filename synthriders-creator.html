@@ -1842,8 +1842,16 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     const drop = new Set(misses(th0).map(a => a.n));
     const keep = c.notes.filter(n => !drop.has(n));
     if (Math.max(...[0, 1].map(h => keep.filter(n => n.type === h).length)) < ORBIT_MIN_NOTES) return;
+    const lastCell = [null, null];
     for (const n of keep) {
-      const p = at(n, th0);
+      let p = at(n, th0);
+      // Two notes a quarter beat apart can round onto ONE cell of a small circle; the second then
+      // reads as a stop, not a turn (an orbit test caught a (9,6),(9,6) pair on a mirrored arc
+      // once the swoop rails changed its input). Nudge it on along the circle, same direction,
+      // until it reaches the next cell (at most 45 degrees).
+      const lc = lastCell[n.type];
+      for (let q = 1; q <= 8 && lc && p._x === lc._x && p.row === lc.row; q++) p = at(n, th0 + dir * q * Math.PI / 32);
+      lastCell[n.type] = p;
       n._preSweep = n._preSweep || { x: n._x, row: n.row };   // [PatternCoverage] snapshot contract
       n._x = p._x;
       n.row = p.row;
@@ -7857,20 +7865,17 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   }
 
   // ── Squat underrail enforcement (initial generation) ─────────────────────────
-  // Long crouch obstacles (≥3 seconds) need a rail underneath so the player has
-  // something to track with their hands while squatting. Mirrors the mutateMap
-  // pass at iter 2+ — previously this only ran on subsequent iterations, which
-  // is why the critic kept flagging 0% squat-underrail on every generation.
+  // Crouch holds get a SWOOP rail (buildSwoopRail): it enters during the lead-in at the comfort
+  // band's top row, dips under the bar and climbs back out, so the hand traces the duck itself.
+  // Was: crouches >= 3 s only, with a random rail shape held at rows 5-6 inside the crouch.
+  // Now every crouch HOLD (>= 2 beats) qualifies (2026-11-24 play-test request: "rails that swoop
+  // under duck obstacles"). Mirrors the mutateMap pass, which uses the same builder.
   if (!hints.noRails) {
-    const longSquats = autoWalls.filter(w =>
-      w.wallType === 'crouch' && (w.duration * 60 / bpm) >= 3
-    );
+    const longSquats = autoWalls.filter(w => w.wallType === 'crouch' && w.duration >= SWOOP_RAIL_MIN_BEATS);
     let added = 0;
     for (const sq of longSquats) {
-      // Half a beat inside the crouch; on a swung grid that half-beat is off the lattice, so
-      // the head (a hit) and tail land on the nearest third instead. Straight: unchanged.
-      const sqStart = swungAt(sq.beat) ? snapToGrid(sq.beat + 0.5) : sq.beat + 0.5;
-      const sqEnd   = swungAt(sq.beat) ? snapToGrid(sq.beat + sq.duration - 0.5) : sq.beat + sq.duration - 0.5;
+      const _sw   = buildSwoopRail(sq, 0, _lattice.sizeAt(sq.beat), { maxBeats: 4 * bpm / 60 });
+      const sqStart = _sw.beat, sqEnd = _sw.railEndBeat;
       if (sqEnd - sqStart < 1.5) continue;
       // Skip if a rail already covers most of this window
       const hasRail = result.some(n =>
@@ -7884,36 +7889,17 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
         n.beat < sqEnd && n.railEndBeat > sqStart
       );
       const sqHand    = rightBusy ? 1 : 0;
-      const xStartCol = sqHand === 0 ? 10 : 4; // start in mid-zone, not extreme
-      const xStartVal = COL_X[xStartCol];
-      const rowSq    = 5 + Math.floor(Math.random() * 2); // rows 5-6 (under squat barrier)
-      const _sqArc = generateRailArc(sqStart, rowSq, sqEnd, rowSq, _lattice.sizeAt(sqStart), xStartVal, sqHand, true, 1.0, bpm, null, autoWalls);
-      // Remove any same-hand orbs inside this window — they'd violate C1 once the rail exists
-      for (let j = result.length - 1; j >= 0; j--) {
-        const m = result[j];
-        if (m.railEndBeat !== undefined) continue;
-        if (m.type !== sqHand) continue;
-        if (m.beat > sqStart && m.beat < sqEnd) {
-          result.splice(j, 1);
-        }
-      }
-      result.push({
-        beat:        sqStart,
-        row:         rowSq,
-        type:        sqHand,
-        _x:          xStartVal,
-        railEndBeat: sqEnd,
-        railEndRow:  _sqArc.rowEnd,
-        railEnd_x:   _sqArc.xEnd,
-        railSegments: _sqArc.waypoints,
-        _underSquatRail: true,
-      });
+      const _rail     = buildSwoopRail(sq, sqHand, _lattice.sizeAt(sq.beat), { maxBeats: 4 * bpm / 60 });
+      // Same-hand orbs inside the swoop are KEPT: [RailSnap] / the FinalSweep's fixC1 put them on
+      // the rail path as companions, so the hits stay and ride the dip. (They used to be deleted,
+      // which on the longer swoop span cost a double-bass passage ~6% of its tracked hits.)
+      result.push(_rail);
       beatOccupied.add(Math.round(sqStart * 100));
       added++;
     }
     if (added > 0) {
       result.sort((a, b) => a.beat - b.beat);
-      console.log(`[SquatUnderrail] Added ${added} rail(s) under long crouch obstacles`);
+      console.log(`[SquatUnderrail] Added ${added} swoop rail(s) under crouch holds`);
     }
   }
 
@@ -8532,6 +8518,16 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       promote: () => applySparseSweep(result, { ..._sswOpts, minRun: 3, minSpan: 3, maxGap: 2.0 }),
     });
     console.log(`[PatternCoverage] before=${(100 * _pc.before).toFixed(0)}% after=${(100 * _pc.after).toFixed(0)}% promoted=${_pc.promoted} demoted=${_pc.demoted}`);
+  }
+
+  // ── [ObstacleChoreo] swoop / tilt / sway each wall window as a group — see applyObstacleChoreo ──
+  // After every pattern pass (their moves are what it reshapes), before the FinalSweep (whose
+  // fixC1 / C2 / C3 stages then see the final positions) and before [ObstacleFinal].
+  if (!hints.noObstacles && !hints.noObstacleChoreo) {
+    _markAerobicWalls();
+    const _oc = applyObstacleChoreo(result, autoWalls);
+    if (_oc.notes || _oc.ramp)
+      console.log(`[ObstacleChoreo] ${_oc.walls} wall window(s), ${_oc.notes} note(s): swoop ${_oc.swoop}, tilt ${_oc.tilt}, sway ${_oc.sway}; ${_oc.ramp} approach/release note(s) moved part-way`);
   }
 
   // ── FINAL C1/C2 SWEEP — runs last, after every pass that could touch result ──
@@ -10514,6 +10510,163 @@ function fitRailToReach(rail, walls) {
   return moved;
 }
 
+// ── [ObstacleChoreo] choreography shaped by the obstacle, not just clamped around it ───────────
+// The comfort clamps (clampNotesToObstacleReach, applyObstacleOcclusion) move each note on its
+// own to the nearest edge of its band, so inside a wall window a DenseSweep move or a phrase came
+// out pressed against a band edge. On Electric Love Master (2026-11-24) 625 of 935 orbs sit in a
+// wall window, so that was two thirds of the map. This pass moves each window's notes AS A GROUP
+// into a move the wall suggests, already inside the comfort boxes so the later clamps are no-ops:
+//   crouch -> SWOOP: rows dip toward the floor of the band under the bar (deepest at its centre)
+//             and rise again, fitted into rows 4-7 per hand; the notes' own row contour rides on
+//             top at half size (at full size it drowned the dip on a 3-5-7 stream);
+//   lean   -> TILT: each hand's notes become a STRING along a line parallel to the wall: the
+//             column follows the row (higher notes further toward the lean side), fitted into
+//             that hand's band, so both arms reach along the lean. Rows keep the music's contour;
+//             a flat run walks up and down the string instead. (Shearing the existing columns
+//             was tried first: a formation already sloped the other way cancelled it out.)
+//   slide  -> SWAY: every note (both hands) shifts together, a rigid full-body move to the free
+//             side, scaled in only when the formation is wider than the room.
+// Notes within OBS_CHOREO_RAMP_BEATS outside a window move part of the way (linear in distance),
+// so the body leans into the pose before the wall arrives and eases out after it.
+// Rails, rail companions and [Orbit] circles are left alone (fitRailToReach / the orbit fit own
+// them). Aerobic walls and centre slides set no comfort box: their notes keep the old clamps, as
+// do notes in two windows at once. Fitting is fitAxisToBounds (largest scale <= 1, then smallest
+// shift), so a move keeps its shape whenever the room allows.
+const OBS_CHOREO_RAMP_BEATS  = 2;
+const OBS_TILT_COLS_PER_ROW  = 0.75;  // lean string slope: 3 cols toward the lean side per 4 rows up
+const OBS_SWOOP_DEPTH        = 3;     // rows added at the bar's centre before fitting into the band
+const OBS_SWOOP_CONTOUR      = 0.5;   // the music's own row contour is kept at half size under a crouch
+function applyObstacleChoreo(notes, walls, { rampBeats = OBS_CHOREO_RAMP_BEATS } = {}) {
+  const stats = { walls: 0, notes: 0, ramp: 0, swoop: 0, tilt: 0, sway: 0 };
+  if (!walls || !walls.length) return stats;
+  const _col = x => Math.max(0, Math.min(14, Math.round(((x ?? 0) + 0.9555) / 0.1365)));
+  const win  = w => [w.beat - OBSTACLE_LEAD_BEATS, w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS];
+  const inW  = (b, w) => { const [a, e] = win(w); return b >= a && b < e; };   // = obstacleReachAt
+  const comfort = w => !!(obstacleReachBand(w, 0) || obstacleReachBand(w, 1));
+  const kindOf = w => w.wallType === 'crouch' ? 'swoop'
+                    : (w.wallType === 'leanLeft' || w.wallType === 'leanRight') ? 'tilt' : 'sway';
+  const free = n => n.railEndBeat === undefined && !n._comp && !n._orbit;
+  const grp  = n => n.type >= 2 ? 2 : n.type;                    // gold + green share a band
+  const zone = n => n.type <= 1 ? handZoneCols(n.type, true) : { colMin: 0, colMax: 14 };
+  const groups = new Map();                                       // wall -> notes it governs
+  for (const n of notes) {
+    if (!free(n)) continue;
+    const ws = walls.filter(w => inW(n.beat, w));
+    if (ws.length !== 1 || !comfort(ws[0])) continue;
+    if (!groups.has(ws[0])) groups.set(ws[0], []);
+    groups.get(ws[0]).push(n);
+  }
+  const shifts = new Map();                                       // wall -> {grp: {dc, dr, k}}
+  for (const [w, G] of groups) {
+    if (G.length < 2) continue;
+    const kind = kindOf(w), [a, e] = win(w);
+    const box = n => obstacleReachAt(walls, n.beat, n.type) || { minCol: 0, maxCol: 14, minRow: 0, maxRow: 10 };
+    const old = G.map(n => ({ col: _col(n._x), row: n.row }));
+    const rowsNew = new Array(G.length), colsNew = new Array(G.length);
+    const fitRows = (idx, vals) => {
+      const r = fitAxisToBounds(vals, idx.map(i => Math.max(1, box(G[i]).minRow)),
+                                      idx.map(i => Math.min(9, box(G[i]).maxRow)));
+      idx.forEach((i, k) => { rowsNew[i] = r ? r[k] : old[i].row; });
+    };
+    const colBounds = idx => {
+      const lo = [], hi = [];
+      for (const i of idx) {
+        const n = G[i], b = box(n), z = zone(n);
+        const g = obstacleBandAt(walls, n.beat, n.beat, rowsNew[i], OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
+        lo.push(Math.max(b.minCol, g.minCol, z.colMin)); hi.push(Math.min(b.maxCol, g.maxCol, z.colMax));
+      }
+      return [lo, hi];
+    };
+    const byGrp = [0, 1, 2].map(g => G.map((n, i) => grp(n) === g ? i : -1).filter(i => i >= 0)).filter(x => x.length);
+    const fitCols = (idx, vals) => {
+      const [lo, hi] = colBounds(idx);
+      const c = fitAxisToBounds(vals, lo, hi);
+      idx.forEach((i, k) => { colsNew[i] = c ? c[k] : old[i].col; });
+    };
+    if (kind === 'swoop') {
+      for (const idx of byGrp) {
+        const rMean = idx.reduce((t, i) => t + old[i].row, 0) / idx.length;
+        fitRows(idx, idx.map(i => OBS_SWOOP_CONTOUR * (old[i].row - rMean)
+                                 + OBS_SWOOP_DEPTH * Math.sin(Math.PI * (G[i].beat - a) / (e - a))));
+      }
+      for (const idx of byGrp) fitCols(idx, idx.map(i => old[i].col));     // a no-op unless geometry says otherwise
+    } else {
+      for (const idx of byGrp) fitRows(idx, idx.map(i => old[i].row));
+      if (kind === 'tilt') {
+        const sgn = w.wallType === 'leanLeft' ? 1 : -1;          // leanLeft: higher (smaller row) -> left
+        for (const idx of byGrp) {
+          const rs = idx.map(i => rowsNew[i]);
+          if (Math.max(...rs) - Math.min(...rs) < 2) {            // flat run: walk the string
+            const top = Math.max(3, ...idx.map(i => Math.max(1, box(G[i]).minRow)));
+            const bot = Math.min(7, ...idx.map(i => Math.min(9, box(G[i]).maxRow)));
+            if (bot - top >= 2) idx.forEach((i, k) => { rowsNew[i] = [bot, Math.round((top + bot) / 2), top, Math.round((top + bot) / 2)][k % 4]; });
+          }
+          const rMid = idx.reduce((t, i) => t + rowsNew[i], 0) / idx.length;
+          const cMid = idx.reduce((t, i) => t + old[i].col, 0) / idx.length;
+          fitCols(idx, idx.map(i => cMid + sgn * OBS_TILT_COLS_PER_ROW * (rowsNew[i] - rMid)));
+        }
+      } else {
+        const idx = G.map((_, i) => i);                           // all hands together: one body
+        fitCols(idx, idx.map(i => old[i].col));
+      }
+    }
+    const sh = {};
+    G.forEach((n, i) => {
+      if (colsNew[i] !== old[i].col) n._x = COL_X[colsNew[i]];
+      n.row = rowsNew[i];
+      n._obsChoreo = kind;
+      const t = (sh[grp(n)] ??= { dc: 0, dr: 0, k: 0 });
+      t.dc += colsNew[i] - old[i].col; t.dr += rowsNew[i] - old[i].row; t.k++;
+    });
+    shifts.set(w, sh);
+    stats.walls++; stats.notes += G.length; stats[kind] += G.length;
+  }
+  // Approach / release ramps: the nearest transformed window within rampBeats, part of its mean move.
+  if (rampBeats > 0) for (const n of notes) {
+    if (!free(n) || n._obsChoreo || walls.some(w => inW(n.beat, w))) continue;
+    let best = null;
+    for (const [w, sh] of shifts) {
+      const [a, e] = win(w), d = n.beat < a ? a - n.beat : n.beat - e + 1e-9;
+      if (d > 0 && d <= rampBeats && sh[grp(n)] && (!best || d < best.d)) best = { d, s: sh[grp(n)] };
+    }
+    if (!best) continue;
+    const p = 1 - best.d / (rampBeats + 1e-9), z = zone(n);
+    const dc = Math.round(p * best.s.dc / best.s.k), dr = Math.round(p * best.s.dr / best.s.k);
+    if (!dc && !dr) continue;
+    n._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, _col(n._x) + dc))];
+    n.row = Math.max(1, Math.min(9, n.row + dr));
+    stats.ramp++;
+  }
+  return stats;
+}
+
+const SWOOP_RAIL_MIN_BEATS = 2;      // crouch holds (>= 2 beats) get a swoop rail
+// Swoop rail under a crouch: enters during the lead-in at the comfort band's top row, dips to its
+// floor row under the bar (deepest at the bar's centre) and climbs back out after it, with the
+// arm drawing in a column or two toward the body at the bottom. One shared builder for
+// [SquatUnderrail] in onsetsToNotes and its mutateMap twin. Beats land on the caller's grid.
+// maxBeats (rails are hard-capped at 4 s by mutateMap) trims lead and tail evenly, so the dip
+// stays centred on the bar.
+function buildSwoopRail(wall, hand, snapSz, { lead = 1, tail = 1, maxBeats = Infinity } = {}) {
+  const band = obstacleReachBand(wall, hand) || { minRow: 4, maxRow: 7 };
+  const top = Math.max(1, band.minRow), bot = Math.min(8, band.maxRow);
+  const D = Math.round(1 / snapSz);
+  const dur = wall.duration || 0, over = Math.max(0, dur + lead + tail - maxBeats) / 2;
+  const start = Math.round((wall.beat - lead + over) * D) / D;
+  const end   = Math.round((wall.beat + dur + tail - over) * D) / D;
+  const c0 = hand === 0 ? 10 : 4, inward = hand === 0 ? -1 : 1;
+  const n = Math.min(11, Math.max(3, Math.round((end - start) * 2) - 1));
+  const railSegments = [];
+  for (let i = 1; i <= n; i++) {
+    const t = i / (n + 1), beat = Math.round((start + (end - start) * t) * D) / D;
+    if (beat <= start || beat >= end || (railSegments.length && beat <= railSegments[railSegments.length - 1].beat)) continue;
+    const sn = Math.sin(Math.PI * t);
+    railSegments.push({ beat, row: Math.round(top + (bot - top) * sn), _x: COL_X[c0 + inward * Math.round(1.5 * sn)] });
+  }
+  return { beat: start, row: top, type: hand, _x: COL_X[c0], railEndBeat: end, railEndRow: top,
+           railEnd_x: COL_X[c0], railSegments, _underSquatRail: true, _swoop: true };
+}
+
 function clampRailsToObstacles(notes, walls) {
   let clamped = 0;
   if (!walls || !walls.length) return { clamped };
@@ -11104,12 +11257,30 @@ function clearGoldC2(notes, beatOccupied = null) {
       notes.splice(i, 1); cleared++; continue;
     }
     if (m.railEndBeat != null) {
-      if (goldOrbs.some(g => g.beat > m.beat - 1.0 && g.beat < m.railEndBeat + 1.0)) {
+      const near = goldOrbs.filter(g => g.type === 3 && g.beat > m.beat - 1.0 && g.beat < m.railEndBeat + 1.0);
+      if (near.length && m._underSquatRail) {
+        // A crouch hold's swoop rail outranks a gold orb (as in [SightRead-F]): stripping it left a
+        // stray orb tagged _swoop on Electric Love (2026-11-24). The gold becomes a plain orb for
+        // the OTHER hand, which a rail never conflicts with, in that hand's zone; if that hand
+        // already has a note on the beat, the gold is dropped instead.
+        const h = 1 - m.type, z = handZoneCols(h);
+        for (const g of near) {
+          if (notes.some(o => o !== g && o.type === h && Math.abs(o.beat - g.beat) < C2_BEAT_EPS)) {
+            const j = notes.indexOf(g);
+            if (beatOccupied) beatOccupied.delete(Math.round(g.beat * 100));
+            notes.splice(j, 1); if (j < i) i--;
+          } else {
+            g.type = h;
+            g._x = COL_X[Math.max(z.colMin, Math.min(z.colMax, Math.round(((g._x ?? 0) + 0.9555) / 0.1365)))];
+          }
+          cleared++;
+        }
+      } else if (near.length) {
         delete m.railEndBeat; delete m.railEndRow; delete m.railEnd_x; delete m.railSegments;
         cleared++;
       }
     } else {
-      if (goldOrbs.some(g => Math.abs(g.beat - m.beat) <= 1.0 + C2_BEAT_EPS)) {
+      if (goldOrbs.some(g => g.type === 3 && Math.abs(g.beat - m.beat) <= 1.0 + C2_BEAT_EPS)) {
         if (beatOccupied) beatOccupied.delete(Math.round(m.beat * 100));
         notes.splice(i, 1); cleared++;
       }
@@ -13397,17 +13568,14 @@ Rules:
         }
       }
 
-      // ── Always: add underrail to long squat obstacles ─────────────────
-      // Every crouch wall ≥4 seconds that lacks a rail underneath gets one.
-      // Runs unconditionally — mirrors the BlackBlazon generation-time pass.
+      // ── Always: a swoop rail under every crouch hold ──────────────────
+      // Same builder and eligibility as [SquatUnderrail] in onsetsToNotes (buildSwoopRail).
       {
         const snapSz = diff >= 8 ? 0.25 : diff >= 5 ? 0.5 : 1.0;
-        const longSquats = resultWalls.filter(w =>
-          w.wallType === 'crouch' && (w.duration * 60 / bpm) >= 4
-        );
+        const longSquats = resultWalls.filter(w => w.wallType === 'crouch' && w.duration >= SWOOP_RAIL_MIN_BEATS);
         for (const squat of longSquats) {
-          const sqStart = squat.beat + 0.5;
-          const sqEnd   = squat.beat + squat.duration - 0.5;
+          const _sw0 = buildSwoopRail(squat, 0, snapSz, { maxBeats: 4 * bpm / 60 });
+          const sqStart = _sw0.beat, sqEnd = _sw0.railEndBeat;
           if (sqEnd - sqStart < 1.5) continue;
           // Skip if a rail already covers most of this window
           const hasRail = result.some(n =>
@@ -13421,29 +13589,11 @@ Rules:
             n.beat < sqEnd && n.railEndBeat > sqStart
           );
           const sqHand    = rightBusy ? 1 : 0;
-          const rowSq    = 4 + Math.floor(Math.random() * 3);
-          const rowSqEnd = Math.max(0, Math.min(10, rowSq + (Math.random() < 0.5 ? -2 : 2)));
-          // Head starts at the zone extreme, which is precisely where an obstacle sits — and
-          // this is the one rail path that never reaches [RailObstacle] (that pass lives in
-          // onsetsToNotes; the splice route finishes through runFinalSweep instead). Clamp the
-          // head against the real walls here, and shape the arc around them too.
-          const _sqBand   = obstacleBandAt(resultWalls, sqStart, sqEnd, rowSq,
-                                           OBSTACLE_LEAD_BEATS, OBSTACLE_BUFFER_BEATS);
-          const xStartCol = Math.max(_sqBand.minCol, Math.min(_sqBand.maxCol, sqHand === 0 ? 14 : 0));
-          const xStartVal = COL_X[xStartCol];
-          const _sqArc2 = generateRailArc(sqStart, rowSq, sqEnd, rowSq, snapSz, xStartVal, sqHand, true, 1.0, bpm, null, resultWalls);
-          result.push({
-            beat:        sqStart,
-            row:         rowSq,
-            type:        sqHand,
-            _x:          xStartVal,
-            railEndBeat: sqEnd,
-            railEndRow:  _sqArc2.rowEnd,
-            railEnd_x:   _sqArc2.xEnd,
-            railSegments: _sqArc2.waypoints,
-          });
+          // A crouch has no side, so the swoop's mid-zone columns are outside every wall;
+          // the splice route still finishes through runFinalSweep, whose rail clamp backs it up.
+          result.push(buildSwoopRail(squat, sqHand, snapSz, { maxBeats: 4 * bpm / 60 }));
           result.sort((a, b) => a.beat - b.beat);
-          console.log('[Mutate] Added underrail arc for long squat obstacle');
+          console.log('[Mutate] Added swoop rail under a crouch hold');
         }
       }
 

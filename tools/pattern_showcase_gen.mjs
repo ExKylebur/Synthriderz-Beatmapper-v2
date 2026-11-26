@@ -14,6 +14,8 @@
 //   * sparse moves -> applySparseSweep (module-level)
 //   * circles      -> applyOrbitPhrases (module-level), the [Orbit] pass, variant forced via pickVariant
 //   * gold shapes  -> the literal text of the [GoldSweep] block of onsetsToNotes (shape forced the same way)
+//   * obstacle moves -> applyObstacleChoreo (module-level), the [ObstacleChoreo] pass, on a two-hand
+//                     stream through each wall type; the crouch-hold swoop rail is buildSwoopRail
 // What is a faithful re-statement, NOT shipped code (the logic is inline in onsetsToNotes and bound
 // to its local state, so it cannot be evaluated in isolation): [GoldAccent] cross-field sweep,
 // [GreenSweep] path, [Crossover] target columns. Each carries `mirrors` in its info.
@@ -42,7 +44,8 @@ function closure(src, roots) {
 }
 
 const G = closure(SRC, ['generateRailArc', 'planRailSegments', 'fitRailPlan', 'applySparseSweep',
-  'DANCE_MOVES', 'COL_X', 'smoothPatternBoundaries', 'RAIL_SHAPE_TIERS', 'railTierOf', 'applyOrbitPhrases']);
+  'DANCE_MOVES', 'COL_X', 'smoothPatternBoundaries', 'RAIL_SHAPE_TIERS', 'railTierOf', 'applyOrbitPhrases',
+  'applyObstacleChoreo', 'buildSwoopRail', 'obstacleReachAt']);
 const { COL_X, DANCE_MOVES } = G;
 
 // ── slice a block of onsetsToNotes by its marker comments ──────────────────────────────
@@ -274,6 +277,48 @@ for (const dirSign of [1, -1]) {
   add({ group: 'Crossovers', name: 'Crossover accents (right hand then left hand)', say: 'Crossover. Right hand reaches left, then left hand reaches right',
         beats: 8, notes, walls: [],
         info: { fn: '[Crossover] (re-stated, not shipped text)', mirrors: 'targets: right hand cols 5-6, left hand cols 8-9; Master only; ~90% of eligible orbs' } });
+}
+
+// Obstacle moves via the real [ObstacleChoreo] pass (applyObstacleChoreo) ------------------------
+// A two-hand stream (right: an up/down step at cols 9-12, left: its mirror at cols 2-5, a note every
+// half beat, hands a quarter beat apart) runs from 4 beats before the wall to 4 after it, so the
+// approach ramp, the window and the release ramp all show. The wall is at beat 4 of each pattern.
+function obstacleStream(len) {
+  const out = [];
+  for (let b = 0, k = 0; b < len; b += 0.5, k++) {
+    const row = [3, 5, 7, 5][k % 4];
+    out.push({ beat: b, row, type: 0, _x: COL_X[9 + (k % 4)] });
+    out.push({ beat: b + 0.25, row: 10 - row, type: 1, _x: COL_X[5 - (k % 4)] });
+  }
+  return out;
+}
+for (const [wall, name, say] of [
+  [{ beat: 4, duration: 2, wallType: 'crouch' }, 'Crouch swoop: notes dip under the bar', 'Crouch. Notes swoop down under the bar and back up'],
+  [{ beat: 4, duration: 2, wallType: 'leanLeft' }, 'Lean left: notes tilt along the wall', 'Lean left. Notes tilt to the left, along the wall'],
+  [{ beat: 4, duration: 2, wallType: 'leanRight' }, 'Lean right: notes tilt along the wall', 'Lean right. Notes tilt to the right, along the wall'],
+  [{ beat: 4, duration: 2, wallType: 'slide', slideType: 0 }, 'Slide, type 0: full-body sway left', 'Slide. Whole body sways left, then back'],
+  [{ beat: 4, duration: 2, wallType: 'slide', slideType: 4 }, 'Slide, type 4: full-body sway right', 'Slide. Whole body sways right, then back'],
+]) {
+  const len = wall.beat + wall.duration + 4;
+  const notes = obstacleStream(len);
+  const before = notes.map(n => [colOf(n._x), n.row]);
+  const st = G.applyObstacleChoreo(notes, [wall]);
+  const perHand = h => notes.filter(n => n.type === h).map(pt);
+  add({ group: 'Obstacle moves (ObstacleChoreo)', name: `Obstacle: ${name}`, say, beats: len,
+        notes: notes.map(({ beat, row, type, _x }) => ({ beat, row, type, _x })), walls: [wall],
+        info: { fn: 'applyObstacleChoreo', wall, choreo: st, right: perHand(0), left: perHand(1),
+                moved: notes.filter((n, i) => colOf(n._x) !== before[i][0] || n.row !== before[i][1]).length, of: notes.length } });
+}
+{ // Crouch hold with a swoop rail on the right hand; the left hand's stream swoops as orbs.
+  const wall = { beat: 4, duration: 3, wallType: 'crouch' }, len = wall.beat + wall.duration + 4;
+  const rail = G.buildSwoopRail(wall, 0, 0.25);
+  const left = obstacleStream(len).filter(n => n.type === 1);
+  G.applyObstacleChoreo(left, [wall]);
+  add({ group: 'Obstacle moves (ObstacleChoreo)', name: 'Obstacle: swoop rail under a crouch hold', say: 'Crouch hold. Rail swoops under the bar',
+        beats: len, notes: [rail, ...left.map(({ beat, row, type, _x }) => ({ beat, row, type, _x }))], walls: [wall],
+        info: { fn: 'buildSwoopRail + applyObstacleChoreo', wall,
+                path: [{ col: colOf(rail._x), row: rail.row }, ...rail.railSegments.map(w => ({ col: colOf(w._x), row: w.row })),
+                       { col: colOf(rail.railEnd_x), row: rail.railEndRow }] } });
 }
 
 // Walls -----------------------------------------------------------------------------------------
