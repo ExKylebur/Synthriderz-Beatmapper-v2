@@ -1698,7 +1698,9 @@ function orbitPeriods(gap, bps) {
 }
 function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, sectionAt = () => null,
                                      pickVariant = (_sec, k) => ORBIT_VARIANTS[k % ORBIT_VARIANTS.length],
-                                     maxShare = ORBIT_MAX_SHARE, prefer = [] } = {}) {
+                                     maxShare = ORBIT_MAX_SHARE, prefer = [], avoid = [] } = {}) {
+  // avoid: [[startBeat, endBeat]] spans no circle may cover — the sung "rise" windows, which
+  // [LyricLift] answers by lifting the notes there (it never moves an orbit note).
   // prefer: [[startBeat, endBeat]] windows where the singer is circling ([LyricMotion] "spin"
   // cues). A phrase overlapping one is chosen before any other, so the budget and the spacing
   // rule go to the sung circle first; every geometry / reach guard below still applies.
@@ -1712,6 +1714,7 @@ function applyOrbitPhrases(result, { walls = [], rowLo = 2, rowHi = 8, bps = 2, 
     const lo = Math.max(rowLo, 4, band ? band.minRow : 0), hi = Math.min(rowHi, band ? band.maxRow : 10);
     if (hi - lo >= 3) low.push([...span, lo, hi]); else block.push(span);
   }
+  for (const sp of avoid || []) block.push(sp);
   for (const n of result) {
     if (n.railEndBeat !== undefined) block.push([n.beat - 1, n.railEndBeat + 1]);
     else if (!isFree(n)) block.push([n.beat - 1, n.beat + 1]);   // gold, green, rail companions
@@ -2959,10 +2962,56 @@ function lyricMotionAt(cues, b0, b1 = b0) {
   }
   return best ? best.action : null;
 }
+// [LyricLift] An "elevate" cue (rise / climb / escalate…) only bent a rail that happened to start
+// within ±2 beats, so with no rail there nothing rose (Circle With Me 60.6 s: 0 of 5 seeds). Now,
+// when no rail reaching rows 0-3 answers the cue, each hand's free orbs over the next
+// LYRIC_LIFT_BEATS ramp from where the hand is up to LYRIC_LIFT_TOP: the arms reach up as the
+// word is sung. Dense/sparse sweep notes are lifted too (they cover most free orbs) and lose their
+// pattern tag, so C3 and the boundary smoothing treat them as loose; [Orbit] circles, rails,
+// companions, gold and green are never moved. A lifted note in the face zone (cols 6-8) steps one
+// or two columns out to its hand's side instead of rising in front of the eyes. Runs before
+// [ObstacleChoreo] and the FinalSweep, whose C1/C2/C3 stages see the lifted rows.
+const LYRIC_LIFT_BEATS = 4;
+const LYRIC_LIFT_TOP = 2;
+function applyLyricLift(result, cues) {
+  const xCol = x => Math.round((parseFloat(x ?? 0) + 0.9555) / 0.1365);
+  const high = n => [n.row, n.railEndRow, ...(n.railSegments || []).map(s => s.row)].some(x => typeof x === 'number' && x <= 3);
+  const liftable = n => (n.type === 0 || n.type === 1) && n.railEndBeat === undefined
+    && !n._comp && !n._underSquatRail && !n._orbit && !n._lyricMotion;
+  let lifted = 0, moved = 0;
+  for (const c of cues || []) {
+    if (c.action !== 'elevate') continue;
+    if (result.some(n => n.railEndBeat !== undefined && Math.abs(n.beat - c.beat) <= 2 && high(n))) continue;
+    let any = false;
+    for (const h of [0, 1]) {
+      const run = result.filter(n => n.type === h && liftable(n) && n.beat >= c.beat - 0.5 && n.beat <= c.beat + LYRIC_LIFT_BEATS)
+        .sort((a, b) => a.beat - b.beat);
+      if (run.length < 2) continue;
+      const r0 = Math.max(LYRIC_LIFT_TOP, run[0].row ?? 5);
+      run.forEach((n, k) => {
+        const row = Math.round(r0 + (LYRIC_LIFT_TOP - r0) * (k + 1) / run.length);
+        if (row < 4) {                                     // face zone: step out to the hand's side
+          const col = xCol(n._x);
+          if (h === 0 && col < 9 && col >= 6) n._x = COL_X[9];
+          if (h === 1 && col > 5 && col <= 8) n._x = COL_X[5];
+        }
+        if (row !== n.row) moved++;
+        n.row = Math.min(n.row ?? row, row);
+        delete n._denseSweep; delete n._sparseSweep;
+        n._lyricMotion = 'elevate'; n._lyricBy = 'lift';
+      });
+      any = true;
+    }
+    if (any) lifted++;
+  }
+  return { lifted, moved };
+}
 // The critic's `lyric_cues` block: did the map do what each sung cue asked? Checked here
 // against the full map, because the critic model only sees a note sample.
-//   body cue  — a wall of the same type within ±0.5 s (its own injected wall: ±3 beats);
-//   elevate   — a rail starting within ±2 beats that reaches rows 0-3;
+//   body cue  — a wall of the same type within ±0.5 s (its own injected wall: ±3 beats), or a
+//               same-type hold that covers the cue;
+//   elevate   — a rail starting within ±2 beats that reaches rows 0-3, or a [LyricLift] note
+//               that still sits in rows 0-3 after every later pass;
 //   motion    — a note the generator tagged _lyricMotion = that action (orbit / rail / gold)
 //               overlapping the cue's window (±1 beat).
 // Seconds are on the map clock, like every other critic field.
@@ -2972,11 +3021,14 @@ function lyricCueReport(cues, notes, walls, bps) {
     let by = null;
     if (isLyricWallCue(c)) {
       // A wall the cue injected may sit up to 3 beats off (the injector's slot search).
+      // A hold covering the cue counts too (hold-merge folds a lyric wall into an earlier one).
       if ((walls || []).some(w => w.wallType === c.action
-        && (Math.abs(w.beat - c.beat) <= 0.5 * bps || (w.fromLyric && Math.abs(w.beat - c.beat) <= 3)))) by = 'wall';
+        && (Math.abs(w.beat - c.beat) <= 0.5 * bps || (w.fromLyric && Math.abs(w.beat - c.beat) <= 3)
+            || (w.beat <= c.beat && c.beat <= w.beat + (w.duration || 0))))) by = 'wall';
     } else if (c.action === 'elevate') {
       const high = n => [n.row, n.railEndRow, ...(n.railSegments || []).map(s => s.row)].some(x => typeof x === 'number' && x <= 3);
       if ((notes || []).some(n => n.railEndBeat !== undefined && Math.abs(n.beat - c.beat) <= 2 && high(n))) by = 'rail';
+      else if ((notes || []).some(n => n._lyricMotion === 'elevate' && n.beat >= c.beat - 1 && n.beat <= c.beat + 5 && n.row <= 3)) by = 'lift';
     } else if (isLyricMotionCue(c)) {
       const end = c.endBeat ?? c.beat;
       const kinds = [...new Set((notes || []).filter(n => n._lyricMotion === c.action
@@ -7178,12 +7230,17 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const wallStep = hints.wallFreqBeats || wallStepDefault;
     const minWallGap = Math.max(wallStep * 0.75, 4); // never closer than 75% of wallStep, floor 4
     autoWalls.sort((a, b) => a.beat - b.beat);
+    // A lyric wall outranks an auto wall: drop the AUTO one of a too-close pair, whichever side
+    // it is on. (Dropping "the later wall" deleted the "Traitor cut down the altar" crouch on
+    // Circle With Me, 2026-11-26.) Two lyric walls are already >= 4 beats apart (spaceLyricCues)
+    // and both stay.
     for (let i = autoWalls.length - 1; i >= 1; i--) {
       const cur  = autoWalls[i];
       const prev = autoWalls[i - 1];
       const gap  = cur.beat - prev.beat;
       if (gap < minWallGap) {
-        autoWalls.splice(i, 1); // drop the later wall (no more BB3 pair exception)
+        if (cur.fromLyric && prev.fromLyric) continue;
+        autoWalls.splice(cur.fromLyric ? i - 1 : i, 1);   // else drop the later wall (no more BB3 pair exception)
       }
     }
   }
@@ -7234,7 +7291,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
           next.beat <= cur.beat + cur.duration + HOLD_GAP) {
         // Extend cur to cover next, then remove next
         const cap = cur.wallType === 'crouch' ? CROUCH_CAP : LEAN_CAP;
+        // A lyric wall the capped hold would not reach stays its own wall (it used to vanish).
+        if (next.fromLyric && cur.beat + cap < next.beat + 1) { i++; continue; }
         cur.duration = Math.min(cap, next.beat + next.duration - cur.beat);
+        if (next.fromLyric && !cur.fromLyric) cur.fromLyric = next.fromLyric;   // the hold now carries the sung cue
         autoWalls.splice(i + 1, 1); // remove next (cur now covers it)
         // Don't advance i — check if the new extended cur can absorb the one after
       } else {
@@ -7248,19 +7308,20 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
   // [Orbit] never draws a circle where a lean/slide occlusion window lands (a side wall squeezes
   // a hand into 3-4 columns, a slide moves rows ±3). On Circle With Me (2026-11-26) every spin
   // line had an AUTO lean/slide in it, so no sung circle formed. Like a lyric wall cue owning
-  // ±3 beats, a spin window drops the auto lean/slide walls whose occlusion window overlaps it.
-  // Lyric-cued walls stay (the words asked for them) and so do crouches (circles fit under one).
+  // ±3 beats, a spin window drops the AUTO walls whose occlusion window overlaps it. That includes
+  // crouches: a crouch hold gets a swoop rail ([SquatUnderrail]), which takes one hand and so
+  // blocks a two-hand circle (Circle With Me 82 s). Lyric-cued walls stay (the words asked for them).
   // Runs after HoldStreak + hold-merge, which can grow a wall into the window.
   if (!hints.noObstacles) {
     const spinWins = lyricCues.filter(c => c.action === 'spin');
     let cleared = 0;
     for (let i = autoWalls.length - 1; i >= 0; i--) {
       const w = autoWalls[i];
-      if (w.fromLyric || w.wallType === 'crouch') continue;
+      if (w.fromLyric) continue;
       const s0 = w.beat - OBSTACLE_LEAD_BEATS, s1 = w.beat + (w.duration || 0) + OBSTACLE_BUFFER_BEATS;
       if (spinWins.some(c => s0 < c.endBeat && s1 > c.beat)) { autoWalls.splice(i, 1); cleared++; }
     }
-    if (cleared) console.log(`[LyricMotion] cleared ${cleared} auto lean/slide wall(s) from ${spinWins.length} sung spin window(s)`);
+    if (cleared) console.log(`[LyricMotion] cleared ${cleared} auto wall(s) from ${spinWins.length} sung spin window(s)`);
   }
 
   // ── Final zone enforcement ───────────────────────────────────────────────
@@ -8614,6 +8675,7 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     const _orb = applyOrbitPhrases(result, {
       walls: autoWalls, rowLo: Math.max(diffRowMin, 2), rowHi: Math.min(diffRowMax, 8), bps, sectionAt,
       prefer: lyricCues.filter(c => c.action === 'spin').map(c => [c.beat, c.endBeat]),   // [LyricMotion]
+      avoid: elevateCues.map(c => [c.beat - 0.5, c.beat + LYRIC_LIFT_BEATS]),            // [LyricLift]
       pickVariant: (sec, k) => {
         const v = motifMemory.replay(sec, 'orbit') ?? ORBIT_VARIANTS[k % ORBIT_VARIANTS.length];
         motifMemory.record(sec, 'orbit', v);
@@ -8724,6 +8786,12 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
       promote: () => applySparseSweep(result, { ..._sswOpts, minRun: 3, minSpan: 3, maxGap: 2.0 }),
     });
     console.log(`[PatternCoverage] before=${(100 * _pc.before).toFixed(0)}% after=${(100 * _pc.after).toFixed(0)}% promoted=${_pc.promoted} demoted=${_pc.demoted}`);
+  }
+
+  // ── [LyricLift] sung "rise / climb" with no rising rail → the arms reach up — see applyLyricLift ──
+  if (elevateCues.length) {
+    const _ll = applyLyricLift(result, elevateCues);
+    if (_ll.lifted) console.log(`[LyricLift] ${_ll.lifted} elevate cue(s) without a rising rail lifted ${_ll.moved} note(s)`);
   }
 
   // ── [ObstacleChoreo] swoop / tilt / sway each wall window as a group — see applyObstacleChoreo ──

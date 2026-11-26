@@ -8,7 +8,9 @@ const L = load(['LYRIC_CUE_VERSION', 'LYRIC_WALL_ACTIONS', 'LYRIC_MOTION_ACTIONS
   'LYRIC_WORD_EST_SEC', 'LYRIC_LINE_SLOP_SEC', 'LYRIC_SNAP_SEC', 'LYRIC_MOTION_DEFAULT_BEATS',
   'LYRIC_RAIL_SHAPE', 'LYRIC_GOLD_SHAPE', 'LYRIC_ACTION_RULES', 'isLyricWallCue', 'isLyricMotionCue',
   'libraryLyricCues', 'lyricSyllables', 'lyricCuesFromLines', 'spaceLyricCues', 'alignLyricCues',
-  'lyricMotionAt', 'LYRIC_REPORT_MAX', 'lyricCueReport']);
+  'lyricMotionAt', 'LYRIC_REPORT_MAX', 'lyricCueReport', 'COL_X', 'LYRIC_LIFT_BEATS', 'LYRIC_LIFT_TOP',
+  'applyLyricLift']);
+const colOfX = x => Math.round((x + 0.9555) / 0.1365);
 
 const actionOf = text => L.lyricCuesFromLines([{ t: 10, text }, { t: 14, text: 'x' }], 2, 1000).map(c => c.action);
 
@@ -119,6 +121,38 @@ test('critic report: honored flags come from the full map', () => {
   assert.equal(L.lyricCueReport(shifted, [], [{ beat: 42, wallType: 'crouch' }], bps).honored, 0);
 });
 
+test('lift: a sung rise with no rising rail ramps each hand up to the top row', () => {
+  const mk = () => [
+    ...[100, 101, 102, 103].map(beat => ({ beat, type: 0, row: 7, _x: L.COL_X[8], _denseSweep: true })),
+    ...[100.5, 101.5, 102.5].map(beat => ({ beat, type: 1, row: 6, _x: L.COL_X[3] })),
+    { beat: 101, type: 1, row: 6, _x: L.COL_X[3], _orbit: 'parallel' },          // circles are never moved
+    { beat: 106, type: 0, row: 7, _x: L.COL_X[10] },                             // outside the window
+  ];
+  const notes = mk();
+  const r = L.applyLyricLift(notes, [{ beat: 100, action: 'elevate' }]);
+  assert.equal(r.lifted, 1);
+  const right = notes.filter(n => n.type === 0 && n.beat <= 103).map(n => n.row);
+  assert.deepEqual(right, [6, 5, 3, 2]);                                         // monotone rise to LYRIC_LIFT_TOP
+  assert.ok(notes.filter(n => n._lyricBy === 'lift').every(n => !n._denseSweep));
+  assert.equal(colOfX(notes[3]._x), 9);                                         // face zone: stepped out to the right
+  assert.equal(notes.find(n => n._orbit).row, 6);
+  assert.equal(notes.find(n => n.beat === 106).row, 7);
+  const rep = L.lyricCueReport([{ beat: 100, action: 'elevate', lyric: 'rise' }], notes, [], 2);
+  assert.equal(rep.cues[0].by, 'lift');
+  // a rising rail already answers the cue: nothing moves
+  const withRail = [...mk(), { beat: 101, type: 1, row: 5, railEndBeat: 104, railEndRow: 2 }];
+  assert.equal(L.applyLyricLift(withRail, [{ beat: 100, action: 'elevate' }]).lifted, 0);
+  assert.ok(withRail.every(n => !n._lyricMotion));
+});
+
+test('generator: lyric walls survive spacing dedup and hold-merge (source checks)', async () => {
+  const { appSource, extract } = await import('./harness.mjs');
+  const src = extract(appSource(), 'onsetsToNotes');
+  assert.match(src, /autoWalls\.splice\(cur\.fromLyric \? i - 1 : i, 1\)/);
+  assert.match(src, /if \(next\.fromLyric && cur\.beat \+ cap < next\.beat \+ 1\) \{ i\+\+; continue; \}/);
+  assert.match(src, /avoid: elevateCues\.map/);
+});
+
 // ── [Orbit] prefers a sung spin window ─────────────────────────────────────────────────────
 const O = load(['COL_X', 'OBSTACLE_BUFFER_BEATS', 'OBSTACLE_LEAD_BEATS', 'CROSS_REACH_COLS', 'handZoneCols',
   'OBS_AEROBIC_REACH', 'OBS_REACH', 'obstacleSide', 'obstacleReachBand',
@@ -147,4 +181,9 @@ test('orbit: a phrase on a sung spin line is chosen before a fuller one', () => 
   const r1 = O.applyOrbitPhrases(sung, { bps: 2, maxShare: share, prefer: [[41, 46]] });
   assert.equal(r1.preferred, 1);
   assert.ok(sung.filter(n => n._orbit && n.beat >= 40).length >= 12, 'the sung window is a circle');
+});
+test('orbit: no circle covers an avoided (sung rise) span', () => {
+  const notes = stream();
+  O.applyOrbitPhrases(notes, { bps: 2, maxShare: 1, avoid: [[4, 8]] });
+  assert.ok(notes.filter(n => n._orbit).every(n => n.beat < 4 || n.beat > 8));
 });
