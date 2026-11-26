@@ -29,7 +29,8 @@ import { ROOT, load, loadAt, withSeed, appSource, extract } from './harness.mjs'
 const OLD_REV = '99ee4f3';
 const X = ['STEM_DENSITY_TIERS', 'stemDensityProfile', 'stemKeepProb', 'PHYS_SAME_HAND_SEC', 'STREAM_GAP_BEATS',
   'DRUM_GAP_JITTER', 'TAPER_MAX_HOLE_SEC', 'RHYTHM_OTHER_WIN', 'RHYTHM_OTHER_MIN', 'RHYTHM_OTHER_LOCK', 'RHYTHM_OTHER_DRUM_FRAC', 'RHYTHM_OTHER_SIG',
-  'beatPhaseLock', 'rhythmOtherMap', 'extractNoteEventsFromStems'];
+  'beatPhaseLock', 'rhythmOtherMap', 'STEM_PRESENCE_FRAC', 'STEM_PRESENCE_WIN_BEATS', 'gateStemBleed',
+  'QUIET_REL_REF', 'QUIET_EXP', 'quietKeepProb', 'extractNoteEventsFromStems'];
 const NEW = load(X);
 const OLD = loadAt(OLD_REV, ['PROB_BASS_SKIP_WHEN_OWNER', 'extractNoteEventsFromStems']);
 const PHYS = NEW.PHYS_SAME_HAND_SEC;
@@ -195,7 +196,9 @@ test('piano under a full drum groove keeps its old role (no rhythm tag, no extra
   assert.equal(evs.filter(e => e.stemSource === 'other').length, 0);
 });
 
-test('taper: Master keeps all, the tiers below keep fewer, and quiet beats give theirs up first', () => {
+// Since 2026-11-26 (Live It Up's quiet intro) Master also thins passages > 6 dB under the song's
+// median beat (quietKeepProb); at or above that it still keeps every hit.
+test('taper: Master keeps all where it is loud, the tiers below keep fewer, and quiet beats give theirs up first', () => {
   const bpm = 100, bps = bpm / 60, beats = 128, dur = beats / bps;
   const drums = Array.from({ length: beats }, (_, b) => ({ time: (b + 0.02) / bps, energy: 0.7, subtype: b % 2 ? 'snare' : 'kick' }));
   const energyCurve = Array.from({ length: beats }, (_, b) => (b < beats / 2 ? 0.2 : 0.9) + (b % 7) * 0.001);
@@ -208,9 +211,12 @@ test('taper: Master keeps all, the tiers below keep fewer, and quiet beats give 
     }
     kept[diff] = { quiet: q / 20 / (beats / 2), loud: l / 20 / (beats / 2) };
   }
-  assert.deepEqual(kept[9], { quiet: 1, loud: 1 });
+  assert.equal(kept[9].loud, 1);
+  // the quiet half is ~9 dB under the median: x0.52 of the hits, but TAPER_MAX_HOLE_SEC still keeps
+  // one at least every second (every 2nd beat at 100 BPM)
+  assert.ok(kept[9].quiet < 0.8 && kept[9].quiet >= 0.5, JSON.stringify(kept[9]));
   const all = d => (kept[d].quiet + kept[d].loud) / 2;
-  assert.ok(all(8) > all(6) && all(6) > all(4) && all(4) > all(2), JSON.stringify(kept));
+  assert.ok(all(9) > all(8) && all(8) > all(6) && all(6) > all(4) && all(4) > all(2), JSON.stringify(kept));
   for (const d of [8, 6, 4, 2]) assert.ok(kept[d].loud > kept[d].quiet + (d >= 8 ? 0.03 : 0.1), `diff ${d}: ${JSON.stringify(kept[d])}`);
 });
 
