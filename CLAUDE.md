@@ -28,4 +28,6 @@ Based on lessons learned building this program, use models strategically:
 
 - **validate.py:** Regression harness for exported `.synth` files. Run before claiming a generation fix is complete.
 - **Console logs:** Watch for `[C3Clamp]`, `[FinalSweep]`, `[GreenClamp]`, `[Crossover]`, `[FlowProbe]` — these are instrumentation for the complex passes. Lyric choreography logs `[LyricAlign]` (cues snapped to vocal onsets, motion windows) and `[LyricMotion]` (rails / gold runs / orbit phrases steered, auto side walls cleared from sung spin windows).
+- **Offline A/B (no API cost):** `..\offline_cache\` (local, outside the repo; holds cached stems and lyrics, never commit it) runs the real `onsetsToNotes` on cached stem analyses — `measure_gen.mjs` for density, `lyric_ab.mjs` for lyric cues (honored %, C1/C2/C3, peak NPS). See its README. Prefer this over live generations for A/Bs.
+- **Equivalence tests** (`tests/swing`, `tests/obstacles`) pin whole-song output to a base commit. When a change MEANS to alter that output, build a new base = old base + only that change, merge it with `-s ours`, re-pin, and explain it in the test's comment.
 - **Real play-test:** After spatial/flow changes, test in VR or the 3D preview. Console logs prove the code ran; play-test proves it feels right.

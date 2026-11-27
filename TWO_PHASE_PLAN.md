@@ -53,7 +53,10 @@ Phase-2 zone (spatial — current order):
 | Pass | Effect | Phase-correct? |
 |---|---|---|
 | [GoldSweep] | MOVES | ✓ |
+| [SpinFill] (2026-11-26, only with the experimental `hints.spinFill`) | **ADDS** fill notes in sung spin windows, **FLIPS** a lone gold into a red+blue pair; `restoreSpinFill` removes unused fill and restores golds after [Orbit] | ⚠ violation (opt-in) |
+| [Orbit] | MOVES | ✓ |
 | [DenseSweep] | MOVES | ✓ |
+| [SparseSweep] / [PatternCoverage] / [LyricLift] / [ObstacleChoreo] | MOVES | ✓ |
 | [FinalSweep] (runFinalSweep) | re-snaps + **REMOVES** (GRC, C1, goldC2, greenC2) | ⚠ violation |
 | [Crossover] | MOVES (same hand, opposite side) | ✓ |
 | [ObstacleFinal] | MOVES + fixC1 **REMOVES** | ⚠ violation |
@@ -66,6 +69,13 @@ beat/type-domain rules. Therefore the set of C2 violations at the boundary is ID
 set at FinalSweep — pre-running those clearers at the end of Phase 1 is provably
 population-neutral. Only `fixC1`'s remove step is genuinely spatial-domain (rail-path
 geometry), because Phase-2 passes can move an orb off its same-hand rail path.
+
+**[SpinFill] exception (2026-11-26):** it has to know whether [Orbit] will take a phrase, and
+[Orbit] is spatial, so it was built as a Phase-2 try-then-undo: offer notes, let [Orbit] place
+them, remove whatever it didn't take. It is off by default. Before making it default-on, either
+accept it as a documented exception or move the decision into Phase 1 (predict circle
+feasibility from rhythm + blockers, add the notes there, and let [Orbit] only place them).
+The `[Phase2Probe]` skeleton diff reports its added notes as `+N`.
 
 ## Roadmap (one step per session, play-test gated)
 

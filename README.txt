@@ -76,7 +76,10 @@ WHAT THIS TOOL DOES
 - AI-assisted note generation with an iterative "style critic" quality loop
 - Two-hand parallel play, arc-based note flow, rails, gold/green sweeps
 - Energy-driven obstacles (crouch/lean/slide) with a mix of quick hits and holds
-- Lyric-cue obstacles (fetch lyrics → sync movement to words, incl. "rise/up" → elevating rails)
+- Lyric-cue choreography (synced lyrics → cues snapped to the sung syllable): "down / lean / slide" place
+  walls, "rise / climb" lift the hands, "circle / spin / loop", "wave / sway", "zigzag / lightning",
+  "infinity", "stairs" shape circles, rails and gold paths while the line is sung
+- Spin fill (Advanced, experimental, off by default): extra in-between notes so sparse sung circles form
 - Song metadata library (auto-saves title/artist/BPM/genre/cover/lyric cues by audio hash)
 - Batch mode — generate a whole folder of songs at a chosen difficulty
 - 3D preview, visual grid editor, BPM/difficulty/NJS/offset configurable
