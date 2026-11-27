@@ -3740,8 +3740,69 @@ function rhythmOtherMap(stemData, bps, totalBeats) {
 // for the SAME hand holding the rail (snapped to the rail path by onsetsToNotes).
 // Drums / bass onsets OUTSIDE any rail window → free orbs for the opposite hand.
 // The two roles no longer compete: rails and their companions are coupled by design.
+// ── Stem bleed gate (2026-11-26, Live It Up play-test: "the intro is a sparse guitar and a distant
+// plane, but the targets were way beyond what the song was doing") ──────────────────────────────
+// Demucs leaks a little of every instrument into every stem. The onset detector normalises against
+// each stem's LOCAL level, so in a passage where a stem is silent its leak still produces onsets.
+// Live It Up's 50 s intro had 1.8 drum, 2.1 bass and 2.0 vocal onsets/s with median strength
+// 0.015 / 0.056 / 0.069, against 0.63 / 0.28 / 0.34 once the band plays. An onset is BLEED when its
+// stem's strongest onset within +-STEM_PRESENCE_WIN_BEATS is below STEM_PRESENCE_FRAC of that
+// stem's normal level (its 90th-percentile onset strength): the stem is not playing there.
+// Calibrated on 9 songs' cached stems: at 0.15 Live It Up loses all 84 intro drum onsets (mix
+// -11 dB) and six of the other eight songs lose 0-0.6% per stem; Tycho Walk ~6% of drums/bass, all
+// in -6/-7 dB passages, and Painkiller 8.6% of vocal-stem onsets in loud instrumental stretches
+// (guitar leaking into the vocal stem). 0.20 cost Fly for Your Life 21% of its bass in LOUD
+// passages, so 0.15 it is. Onsets without an `energy` are kept.
+const STEM_PRESENCE_FRAC      = 0.15;
+const STEM_PRESENCE_WIN_BEATS = 4;
+function gateStemBleed(stemData, bps) {
+  if (!stemData) return stemData;
+  const W = STEM_PRESENCE_WIN_BEATS / bps;
+  const out = { ...stemData };
+  let dropped = 0;
+  for (const k of ['drums', 'bass', 'vocals', 'other']) {
+    const on = stemData[k]?.onsets;
+    if (!on || on.length < 8 || !on.every(o => Number.isFinite(o.energy))) continue;
+    const e = on.map(o => o.energy).sort((a, b) => a - b);
+    const floor = STEM_PRESENCE_FRAC * e[Math.floor(0.9 * (e.length - 1))];
+    const byT = [...on].sort((a, b) => a.time - b.time);
+    const keep = [];
+    let lo = 0, hi = 0;
+    // sliding window max over [t - W, t + W] (two pointers + a monotone deque)
+    const dq = [];
+    for (const o of byT) {
+      while (hi < byT.length && byT[hi].time <= o.time + W) {
+        while (dq.length && byT[dq[dq.length - 1]].energy <= byT[hi].energy) dq.pop();
+        dq.push(hi++);
+      }
+      while (byT[lo].time < o.time - W) lo++;
+      while (dq[0] < lo) dq.shift();
+      if (byT[dq[0]].energy >= floor) keep.push(o); else dropped++;
+    }
+    out[k] = { ...stemData[k], onsets: keep };
+  }
+  out._bleedDropped = dropped;
+  return out;
+}
+
+// ── Quiet passages thin out, at every difficulty (Master included) ────────────────────────────
+// The difficulty taper (stemKeepProb) thins by loudness RANK and Master skips it entirely, so a
+// genuinely quiet passage (Live It Up's intro, ~10 dB under the song) was mapped as densely as the
+// chorus: 5-6.5 notes/s against 2.7 in the played file. In beats more than 6 dB below the song's
+// median loudness (rel < QUIET_REL_REF), the keep chance is multiplied by (rel / QUIET_REL_REF)^2:
+// x0.4 at -10 dB, x0.25 at -12 dB. TAPER_MAX_HOLE_SEC still keeps a hit at least once a second.
+// At or above -6 dB it is exactly 1 and draws no random number, so loud songs are unchanged.
+const QUIET_REL_REF = 0.5;     // linear RMS ratio to the song's median beat (-6 dB)
+const QUIET_EXP     = 2;
+function quietKeepProb(rel) {
+  if (!(rel < QUIET_REL_REF)) return 1;
+  return Math.pow(Math.max(0, rel) / QUIET_REL_REF, QUIET_EXP);
+}
+
 function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   const bps        = bpm / 60;
+  stemData = gateStemBleed(stemData, bps);
+  if (stemData?._bleedDropped) console.log(`[StemBleed] Dropped ${stemData._bleedDropped} onset(s) where their stem is not playing (< ${STEM_PRESENCE_FRAC} of its normal level within ${STEM_PRESENCE_WIN_BEATS} beats)`);
   // Half a beat minimum, scaled to the song's tempo. 0.3s fixed was too short at
   // slow BPM (0.3 beats at 60 BPM) and too restrictive at fast BPM (1.2 beats at 240 BPM).
   const railThresh = (60 / bpm) * 0.5 * (hints.railThreshMultiplier || 1.0);
@@ -3822,6 +3883,12 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   // Loudness percentile per beat for the taper (stemKeepProb). No curve → every beat is median.
   const _eCurve  = Array.isArray(hints._energyCurve) ? hints._energyCurve : null;
   const _eSorted = _eCurve ? [..._eCurve].sort((a, b) => a - b) : null;
+  const _eMedian = _eSorted ? (_eSorted.filter(v => v > 0)[Math.floor(_eSorted.filter(v => v > 0).length / 2)] || 0) : 0;
+  // Loudness of the beat at t over the song's median beat (linear RMS ratio; 1 = no curve).
+  function relLoudAt(t) {
+    if (!_eCurve || !(_eMedian > 0)) return 1;
+    return (_eCurve[Math.max(0, Math.min(_eCurve.length - 1, Math.floor(t * bps)))] ?? 0) / _eMedian;
+  }
   function eRankAt(t) {
     if (!_eCurve || !_eSorted.length) return 0.5;
     const e = _eCurve[Math.max(0, Math.min(_eCurve.length - 1, Math.floor(t * bps)))] ?? 0;
@@ -3837,11 +3904,12 @@ function extractNoteEventsFromStems(stemData, duration, bpm, diff, hints = {}) {
   // kept (taper-dropped hits never reach `events`, so gap-fill cannot refill a hole it made).
   let lastTaperKeptT = -Infinity;
   function taperDrops(ev) {
-    if (!(prof.keep < 1 || prof.bass < 1 || prof.hats < 1)) return false;
+    const q = quietKeepProb(relLoudAt(ev.t));
+    if (!(prof.keep < 1 || prof.bass < 1 || prof.hats < 1 || q < 1)) return false;
     const slot = Math.round(ev.t * bps / snapBeats);
-    let ok = prof.keep < 1 ? slotKeep.get(slot) : true;
+    let ok = (prof.keep < 1 || q < 1) ? slotKeep.get(slot) : true;
     if (ok === undefined) {
-      ok = ev.t - lastTaperKeptT >= TAPER_MAX_HOLE_SEC || Math.random() < stemKeepProb(prof.keep, eRankAt(ev.t));
+      ok = ev.t - lastTaperKeptT >= TAPER_MAX_HOLE_SEC || Math.random() < stemKeepProb(prof.keep, eRankAt(ev.t)) * q;
       slotKeep.set(slot, ok);
     }
     if (!ok) return true;
@@ -4923,6 +4991,10 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     if (!energyCurve?.length) return 0.5;
     return energyCurve[Math.min(Math.floor(beat), energyCurve.length - 1)];
   }
+  // A beat's loudness over the song's median beat (linear RMS ratio; 1 without a curve), for
+  // quietKeepProb: quiet passages thin out at every difficulty.
+  const _eMedianBeat = (() => { const v = (energyCurve || []).filter(x => x > 0).sort((a, b) => a - b); return v[Math.floor(v.length / 2)] || 0; })();
+  function relLoudBeat(beat) { return _eMedianBeat > 0 ? energyAt(beat) / _eMedianBeat : 1; }
   function sectionAt(beat) {
     for (const s of sections) if (beat >= s.startBeat && beat < s.endBeat) return s;
     return sections[sections.length - 1] || { avgRow: 5, rowVariance: 2, startBeat: 0, endBeat: totalBeats };
@@ -5697,9 +5769,12 @@ function onsetsToNotes(analysis, bpm, diff, sections, hints = {}) {
     // Solo sections must respect single-arm intent — companion rate drops to 15% (was 50%).
     // The critic flagged "Solo section intended single-arm but both hands active throughout".
     const _isSoloSection = /solo|instrumental|guitar.solo/i.test(sec.name || '');
-    const _dbCompRate = secHandMode === 'single-arm'
+    // Quiet passages: a two-hand pair is a loud-moment gesture. At Master 90% of notes got a mirror,
+    // which doubled Live It Up's sparse-guitar intro; scale it by the same quiet factor as the stem
+    // taper (1 at or above -6 dB vs the song's median beat, so loud passages are unchanged).
+    const _dbCompRate = (secHandMode === 'single-arm'
       ? (_isSoloSection ? 0.15 : 0.50)
-      : _baseDbComp;
+      : _baseDbComp) * quietKeepProb(relLoudBeat(beat));
     // Stream hits (an alternating L-R drum run, extractNoteEventsFromStems) are already both hands:
     // they get a mirror only ON THE BEAT (a two-hand accent inside the run), and only if that
     // hand's next hit is ≥ PHYS_SAME_HAND_SEC away. Mirroring every stream hit = both hands on

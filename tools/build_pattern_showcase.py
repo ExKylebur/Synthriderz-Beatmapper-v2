@@ -128,8 +128,15 @@ def main():
             if w['wallType'] == 'crouch':
                 crouchs.append({'beat': start + w['beat'], 'duration': w['duration']})
             else:
+                # Same mapping as the app's export (exportBtn): leanLeft = 1, leanRight = 2, else the
+                # slide's own type. Defaulting every lean to 0 exported them as slide BOXES (fixed
+                # 2026-11-26: the 11-24 showcase's 'Obstacle moves' lean demos, which carry no slideType,
+                # played as slides in game; the 'Walls' group passes 1 / 2 explicitly and was right).
+                st = w.get('slideType')
+                if st is None:
+                    st = {'leanLeft': 1, 'leanRight': 2}.get(w['wallType'], 0)
                 slides.append({'beat': start + w['beat'], 'duration': w['duration'], 'wallType': w['wallType'],
-                               'slideType': w.get('slideType', 0)})
+                               'slideType': st})
         legend.append((T(start), T(ann), start, p))
     notes.sort(key=lambda n: n['beat'])
 
