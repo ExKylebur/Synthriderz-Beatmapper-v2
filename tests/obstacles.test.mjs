@@ -218,7 +218,10 @@ function closure(src, roots) {
 // (dedup-removed rails release companions). e7f5dfa was a no-op for these songs until swoop rails
 // existed; without it the random band picks in a lean window diverged. [ObstacleChoreo] and
 // fitRailToReach are no-ops for aerobic walls, so they are not in the base.
-const BASE = 'b6f1f66';
+// Re-pinned b6f1f66 -> 93fca8b (lyric walls, 2026-11-26), tests/obstacles only: b6f1f66 + lyric walls
+// outranking auto walls in the spacing dedup and the hold-merge. This file's fixture carries lyric
+// cues (tests/swing's songs do not, so it keeps b6f1f66). Merged into lyric-choreo with -s ours.
+const BASE = '93fca8b';
 const ROOTS = ['onsetsToNotes', '_detectC1Count', 'clampC3Jumps', 'obstacleReachBand', 'obstacleSide'];
 const NOW = closure(appSource(), ROOTS);
 const OLD = closure(execSync(`git show ${BASE}:synthriders-creator.html`, { cwd: ROOT, maxBuffer: 64 << 20 }).toString(), ['onsetsToNotes']);
@@ -314,7 +317,10 @@ for (const [i, s] of SONGS.entries()) {
   test(`onsetsToNotes song ${i}: aerobic reach reproduces the pre-rule placement exactly (${BASE})`, () => {
     const a = run(NOW, s, 5, { aerobicReach: true }), b = run(OLD, s, 5);
     assert.ok(a.walls.length > 0 && a.walls.every(w => w.aerobic === true));
-    assert.deepEqual({ ...a, walls: a.walls.map(({ aerobic, ...w }) => w) }, b);
+    // lyricCues (the aligned cues returned for the critic's lyric report) is not in BASE.
+    const { lyricCues, ...rest } = a;
+    assert.equal(lyricCues?.length, 12);
+    assert.deepEqual({ ...rest, walls: rest.walls.map(({ aerobic, ...w }) => w) }, b);
   });
 }
 
